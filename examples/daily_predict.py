@@ -8,12 +8,15 @@ Qlib实盘预测脚本 - 基于Qlib内置模块的每日预测流程。
 
 import argparse
 import json
+import shutil
 import sys
+import tarfile
 import warnings
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from urllib.request import urlretrieve
 
 import numpy as np
 import pandas as pd
@@ -151,6 +154,22 @@ class OutputConfig:
 
 
 @dataclass
+class DataUpdateConfig:
+    """数据自动更新配置"""
+    enable_auto_update: bool = True  # 是否启用自动更新
+    update_check_interval_hours: int = 24  # 检查间隔（小时）
+    data_source_url: str = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
+    download_timeout: int = 600  # 下载超时（秒）
+    temp_dir: Optional[Path] = None  # 临时目录，默认使用 ~/.qlib/temp
+
+    def get_temp_dir(self) -> Path:
+        """获取临时目录路径"""
+        if self.temp_dir:
+            return self.temp_dir
+        return Path.home() / ".qlib" / "temp"
+
+
+@dataclass
 class TradingResult:
     orders: pd.DataFrame
     total_buy_amount: float
@@ -195,11 +214,13 @@ class DailyPredictionPipeline:
         prediction_cfg: PredictionConfig,
         trading_cfg: TradingConfig,
         output_cfg: OutputConfig,
+        data_update_cfg: Optional[DataUpdateConfig] = None,
         enable_detailed_logs: bool = True,
     ):
         self.prediction_cfg = prediction_cfg
         self.trading_cfg = trading_cfg
         self.output_cfg = output_cfg
+        self.data_update_cfg = data_update_cfg or DataUpdateConfig()
         self.enable_detailed_logs = enable_detailed_logs
 
         self.recorder = None
@@ -243,6 +264,221 @@ class DailyPredictionPipeline:
             return False
 
     # ------------------------------------------------------------------ #
+    # 数据自动更新
+    # ------------------------------------------------------------------ #
+    def _get_data_path(self) -> Path:
+        """获取数据目录路径"""
+        provider_uri = self.prediction_cfg.provider_uri
+        if provider_uri.startswith("~"):
+            return Path(provider_uri).expanduser()
+        return Path(provider_uri)
+
+    def _should_check_data_update(self) -> bool:
+        """
+        判断是否需要检查数据更新（根据时间间隔）
+
+        Returns:
+            bool: True 表示需要检查，False 表示跳过检查
+        """
+        data_path = self._get_data_path()
+        check_file = data_path / ".last_update_check"
+
+        if not check_file.exists():
+            return True  # 首次运行，需要检查
+
+        try:
+            last_check_time = datetime.fromtimestamp(check_file.stat().st_mtime)
+            time_since_check = datetime.now() - last_check_time
+            interval = timedelta(hours=self.data_update_cfg.update_check_interval_hours)
+
+            if time_since_check >= interval:
+                return True  # 超过间隔时间，需要检查
+            else:
+                hours_left = (interval - time_since_check).total_seconds() / 3600
+                print(f"[数据] 距上次检查不足{self.data_update_cfg.update_check_interval_hours}小时，跳过更新检查")
+                print(f"   还需等待 {hours_left:.1f} 小时")
+                return False
+        except Exception as err:
+            print(f"[警告] 无法读取上次检查时间: {err}")
+            return True
+
+    def _is_data_outdated(self) -> Tuple[bool, Optional[str]]:
+        """
+        判断本地数据是否过时
+
+        Returns:
+            Tuple[bool, Optional[str]]: (是否过时, 本地最新日期)
+        """
+        data_path = self._get_data_path()
+        calendar_file = data_path / "calendars" / "day.txt"
+
+        if not calendar_file.exists():
+            print("[警告] 交易日历文件不存在，需要下载数据")
+            return True, None
+
+        try:
+            with open(calendar_file, 'r') as f:
+                dates = [line.strip() for line in f if line.strip()]
+
+            if not dates:
+                return True, None
+
+            latest_local_date = dates[-1]
+            prediction_date = self.prediction_cfg.prediction_date
+
+            # 简单对比：如果本地最新日期小于预测日期，则可能过时
+            if latest_local_date < prediction_date:
+                return True, latest_local_date
+            else:
+                return False, latest_local_date
+
+        except Exception as err:
+            print(f"[警告] 读取交易日历失败: {err}")
+            return True, None
+
+    def _download_and_update_data(self) -> bool:
+        """
+        下载并更新数据
+
+        Returns:
+            bool: 是否更新成功
+        """
+        try:
+            temp_dir = self.data_update_cfg.get_temp_dir()
+            temp_dir.mkdir(parents=True, exist_ok=True)
+
+            # 下载文件
+            download_path = temp_dir / "qlib_bin.tar.gz"
+            print(f"[下载] 下载最新数据包...")
+            print(f"   来源: {self.data_update_cfg.data_source_url}")
+
+            try:
+                urlretrieve(self.data_update_cfg.data_source_url, download_path)
+                file_size_mb = download_path.stat().st_size / (1024 * 1024)
+                print(f"[成功] 下载完成: {file_size_mb:.1f} MB")
+            except Exception as err:
+                print(f"[错误] 下载失败: {err}")
+                return False
+
+            # 解压文件
+            print(f"[更新] 解压数据包...")
+            extract_dir = temp_dir / "extracted"
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir)
+            extract_dir.mkdir(parents=True)
+
+            try:
+                with tarfile.open(download_path, 'r:gz') as tar:
+                    tar.extractall(extract_dir)
+                print(f"[成功] 解压完成")
+            except Exception as err:
+                print(f"[错误] 解压失败: {err}")
+                return False
+
+            # 验证数据完整性
+            print(f"[验证] 检查数据完整性...")
+            qlib_bin_dir = extract_dir / "qlib_bin"
+            if not qlib_bin_dir.exists():
+                print(f"[错误] 解压后的目录结构不正确")
+                return False
+
+            required_dirs = ["calendars", "features", "instruments"]
+            for dir_name in required_dirs:
+                if not (qlib_bin_dir / dir_name).exists():
+                    print(f"[错误] 缺少必要目录: {dir_name}")
+                    return False
+
+            # 检查交易日历
+            calendar_file = qlib_bin_dir / "calendars" / "day.txt"
+            if not calendar_file.exists():
+                print(f"[错误] 交易日历文件不存在")
+                return False
+
+            with open(calendar_file, 'r') as f:
+                dates = [line.strip() for line in f if line.strip()]
+            if len(dates) < 1000:  # 至少应该有1000个交易日
+                print(f"[错误] 交易日数量异常: {len(dates)}")
+                return False
+
+            print(f"[验证] 数据完整性检查通过")
+            print(f"   交易日数量: {len(dates)}")
+            print(f"   日期范围: {dates[0]} 至 {dates[-1]}")
+
+            # 替换旧数据
+            data_path = self._get_data_path()
+            print(f"[更新] 替换旧数据...")
+            print(f"   目标路径: {data_path}")
+
+            if data_path.exists():
+                shutil.rmtree(data_path)
+
+            shutil.copytree(qlib_bin_dir, data_path)
+            print(f"[成功] 数据更新完成")
+
+            # 更新检查时间戳
+            check_file = data_path / ".last_update_check"
+            check_file.touch()
+
+            # 清理临时文件
+            print(f"[清理] 删除临时文件...")
+            shutil.rmtree(temp_dir)
+
+            return True
+
+        except Exception as err:
+            print(f"[错误] 数据更新失败: {err}")
+            if self.enable_detailed_logs:
+                import traceback
+                traceback.print_exc()
+            return False
+
+    def _check_and_update_data(self) -> None:
+        """
+        检查并更新数据的主控制方法
+        """
+        try:
+            # 判断是否需要检查更新
+            if not self._should_check_data_update():
+                return
+
+            # 检查数据是否过时
+            is_outdated, local_latest_date = self._is_data_outdated()
+
+            if not is_outdated:
+                print(f"[数据] 本地数据已是最新")
+                if local_latest_date:
+                    print(f"   最新交易日: {local_latest_date}")
+                # 更新检查时间戳
+                data_path = self._get_data_path()
+                check_file = data_path / ".last_update_check"
+                check_file.touch()
+                return
+
+            # 数据过时，需要更新
+            print(f"[数据] 检查数据更新...")
+            if local_latest_date:
+                print(f"   本地最新日期: {local_latest_date}")
+            print(f"   预测日期: {self.prediction_cfg.prediction_date}")
+            print(f"   数据需要更新，开始下载...")
+
+            # 下载并更新
+            success = self._download_and_update_data()
+
+            if success:
+                print(f"[成功] 数据更新完成，可以使用最新数据")
+            else:
+                print(f"[警告] 数据更新失败，将使用现有数据继续运行")
+                if local_latest_date:
+                    print(f"   本地数据最新日期: {local_latest_date}")
+
+        except Exception as err:
+            print(f"[警告] 数据更新检查失败: {err}")
+            print(f"   将使用现有数据继续运行")
+            if self.enable_detailed_logs:
+                import traceback
+                traceback.print_exc()
+
+    # ------------------------------------------------------------------ #
     # 初始化与资源加载
     # ------------------------------------------------------------------ #
     def _print_config(self) -> None:
@@ -263,6 +499,11 @@ class DailyPredictionPipeline:
     def _init_environment(self) -> None:
         print("\n[环境] 初始化Qlib环境...")
         self.output_cfg.ensure_directory()
+
+        # 数据自动更新检查（在 qlib.init() 之前）
+        if self.data_update_cfg.enable_auto_update:
+            self._check_and_update_data()
+
         qlib.init(
             provider_uri=self.prediction_cfg.provider_uri,
             region=self.prediction_cfg.region,
