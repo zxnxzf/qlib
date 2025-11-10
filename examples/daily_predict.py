@@ -157,7 +157,6 @@ class OutputConfig:
 class DataUpdateConfig:
     """数据自动更新配置"""
     enable_auto_update: bool = True  # 是否启用自动更新
-    update_check_interval_hours: int = 24  # 检查间隔（小时）
     data_source_url: str = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
     download_timeout: int = 600  # 下载超时（秒）
     temp_dir: Optional[Path] = None  # 临时目录，默认使用 ~/.qlib/temp
@@ -236,7 +235,9 @@ class DailyPredictionPipeline:
         self._print_config()
 
         try:
+            # 初始化运行环境（含数据更新、qlib.init、持仓加载）
             self._init_environment()
+            # 逐步加载实验记录与模型资源
             recorder = self._load_recorder()
             model = self._load_model(recorder)
             if model is None:
@@ -244,14 +245,18 @@ class DailyPredictionPipeline:
 
             self.recorder = recorder
             self.model = model
+            # 构建与模型匹配的数据集输入
             self.dataset = self._build_dataset()
 
+            # 产出原始预测并整理为带权重/时间戳的 DataFrame
             predictions = self._generate_predictions()
             pred_df = self._prepare_predictions(predictions)
             pred_df = self._attach_market_data(pred_df)
 
+            # 基于预测与市场数据生成交易指令
             trading_result = self._generate_trading_orders(pred_df)
 
+            # 保存各类输出文件并打印总结
             self.saved_files, final_pred_df = self._save_outputs(pred_df, trading_result)
             self._log_summary(final_pred_df, trading_result)
             return True
@@ -273,34 +278,22 @@ class DailyPredictionPipeline:
             return Path(provider_uri).expanduser()
         return Path(provider_uri)
 
-    def _should_check_data_update(self) -> bool:
-        """
-        判断是否需要检查数据更新（根据时间间隔）
+    def _missing_required_data(self, data_path: Path) -> List[str]:
+        """检查关键数据是否存在，返回缺失路径列表"""
+        missing: List[str] = []
+        required_dirs = ["features", "instruments", "calendars"]
+        for dirname in required_dirs:
+            path = data_path / dirname
+            if not path.exists():
+                missing.append(str(path))
 
-        Returns:
-            bool: True 表示需要检查，False 表示跳过检查
-        """
-        data_path = self._get_data_path()
-        check_file = data_path / ".last_update_check"
+        instruments = self.prediction_cfg.instruments
+        if isinstance(instruments, str):
+            inst_file = (data_path / "instruments" / f"{instruments}.txt").resolve()
+            if not inst_file.exists():
+                missing.append(str(inst_file))
 
-        if not check_file.exists():
-            return True  # 首次运行，需要检查
-
-        try:
-            last_check_time = datetime.fromtimestamp(check_file.stat().st_mtime)
-            time_since_check = datetime.now() - last_check_time
-            interval = timedelta(hours=self.data_update_cfg.update_check_interval_hours)
-
-            if time_since_check >= interval:
-                return True  # 超过间隔时间，需要检查
-            else:
-                hours_left = (interval - time_since_check).total_seconds() / 3600
-                print(f"[数据] 距上次检查不足{self.data_update_cfg.update_check_interval_hours}小时，跳过更新检查")
-                print(f"   还需等待 {hours_left:.1f} 小时")
-                return False
-        except Exception as err:
-            print(f"[警告] 无法读取上次检查时间: {err}")
-            return True
+        return missing
 
     def _is_data_outdated(self) -> Tuple[bool, Optional[str]]:
         """
@@ -324,10 +317,24 @@ class DailyPredictionPipeline:
                 return True, None
 
             latest_local_date = dates[-1]
-            prediction_date = self.prediction_cfg.prediction_date
+
+            target_date = pd.Timestamp(self.target_prediction_date)
+            effective_target = target_date
+            for date_str in reversed(dates):
+                date_ts = pd.Timestamp(date_str)
+                if date_ts <= target_date:
+                    effective_target = date_ts
+                    break
+            prediction_date = effective_target.strftime("%Y-%m-%d")
 
             # 简单对比：如果本地最新日期小于预测日期，则可能过时
             if latest_local_date < prediction_date:
+                return True, latest_local_date
+            missing_items = self._missing_required_data(data_path)
+            if missing_items:
+                print("[数据] 检测到必要数据缺失，触发重新下载:")
+                for item in missing_items:
+                    print(f"   缺失: {item}")
                 return True, latest_local_date
             else:
                 return False, latest_local_date
@@ -437,10 +444,6 @@ class DailyPredictionPipeline:
         检查并更新数据的主控制方法
         """
         try:
-            # 判断是否需要检查更新
-            if not self._should_check_data_update():
-                return
-
             # 检查数据是否过时
             is_outdated, local_latest_date = self._is_data_outdated()
 
@@ -564,7 +567,15 @@ class DailyPredictionPipeline:
         """
         try:
             # 获取上一交易日
-            prev_date = get_pre_trading_date(self.prediction_cfg.prediction_date)
+            prev_date: Optional[Union[str, pd.Timestamp]] = None
+            try:
+                prev_date = get_pre_trading_date(self.target_prediction_date)
+            except ValueError:
+                freq = self.trading_cfg.trade_freq or "day"
+                calendar = D.calendar(end_time=self.target_prediction_date, freq=freq)
+                historical = [pd.Timestamp(d) for d in calendar if pd.Timestamp(d) < pd.Timestamp(self.target_prediction_date)]
+                prev_date = historical[-1] if historical else None
+
             if not prev_date:
                 print("[警告] 无法获取上一交易日，使用空持仓")
                 return {}
@@ -1276,8 +1287,9 @@ def main(argv: Optional[Sequence[str]] = None) -> bool:
     prediction_cfg = PredictionConfig(
         experiment_id="866149675032491302",
         recorder_id="3d0e78192f384bb881c63b32f743d5f8",
-        prediction_date="2025-10-15",
-        top_k=10,
+        # prediction_date="2025-10-15",
+        prediction_date=datetime.now().strftime("%Y-%m-%d"),
+        top_k=5,
         min_score_threshold=0.0,
         weight_method="equal",
     )
@@ -1285,7 +1297,7 @@ def main(argv: Optional[Sequence[str]] = None) -> bool:
     trading_cfg = TradingConfig(
         enable_trading=True,
         use_exchange_system=True,
-        total_cash=100000,
+        total_cash=10000,
         min_shares=100,
         price_search_days=5,
         current_holdings=current_holdings,
