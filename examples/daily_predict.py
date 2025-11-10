@@ -138,6 +138,7 @@ class TradingConfig:
     trade_freq: str = "day"
     deal_price: str = "close"
     current_holdings: Dict[str, float] = field(default_factory=dict)
+    auto_load_previous: bool = True  # 自动加载上一交易日的目标仓位作为当前持仓
 
 
 @dataclass
@@ -270,6 +271,15 @@ class DailyPredictionPipeline:
             maxtasksperchild=1,
         )
         self._align_prediction_date()
+
+        # 自动加载上一交易日的目标仓位作为当前持仓
+        if self.trading_cfg.auto_load_previous and not self.trading_cfg.current_holdings:
+            print("\n[持仓] 自动加载上一交易日持仓...")
+            loaded_holdings = self._auto_load_previous_holdings()
+            self.trading_cfg.current_holdings = loaded_holdings
+        elif self.trading_cfg.current_holdings:
+            print(f"\n[持仓] 使用手动指定的持仓 ({len(self.trading_cfg.current_holdings)} 只股票)")
+
         print("[成功] Qlib环境初始化成功")
 
     def _align_prediction_date(self) -> None:
@@ -303,6 +313,66 @@ class DailyPredictionPipeline:
         effective_str = effective.strftime("%Y-%m-%d")
         self.effective_prediction_date = effective_str
         self.prediction_cfg.prediction_date = effective_str
+
+    def _auto_load_previous_holdings(self) -> Dict[str, float]:
+        """
+        自动加载上一交易日的目标仓位作为当前持仓。
+
+        Returns:
+            Dict[str, float]: 持仓字典 {股票代码: 股数}，找不到文件时返回空字典
+        """
+        try:
+            # 获取上一交易日
+            prev_date = get_pre_trading_date(self.prediction_cfg.prediction_date)
+            if not prev_date:
+                print("[警告] 无法获取上一交易日，使用空持仓")
+                return {}
+
+            # 转换日期格式 "2025-01-03" -> "20250103"
+            if isinstance(prev_date, pd.Timestamp):
+                prev_date_str = prev_date.strftime("%Y-%m-%d")
+            else:
+                prev_date_str = str(prev_date)
+            prev_date_tag = prev_date_str.replace("-", "")
+
+            # 构造目标仓位文件路径
+            target_position_file = self.output_cfg.output_dir / f"target_position_{prev_date_tag}.csv"
+
+            if not target_position_file.exists():
+                print(f"[警告] 未找到上一交易日 ({prev_date_str}) 的目标仓位文件")
+                print(f"   文件路径: {target_position_file}")
+                print("   使用空持仓继续运行")
+                return {}
+
+            # 读取CSV文件
+            df = pd.read_csv(target_position_file, encoding=self.output_cfg.encoding)
+
+            # 检查必要的列
+            if "instrument" not in df.columns or "target_shares" not in df.columns:
+                print(f"[警告] 目标仓位文件格式不正确，缺少 instrument 或 target_shares 列")
+                print("   使用空持仓继续运行")
+                return {}
+
+            # 过滤有效持仓（股数>0）
+            df = df[df["target_shares"] > 0]
+
+            # 转换为字典
+            holdings = dict(zip(df["instrument"].astype(str), df["target_shares"].astype(float)))
+
+            total_shares = sum(holdings.values())
+            print(f"[成功] 自动加载上一交易日 ({prev_date_str}) 的目标仓位")
+            print(f"   持仓股票数: {len(holdings)}")
+            print(f"   总股数: {total_shares:,.0f}")
+
+            return holdings
+
+        except Exception as err:
+            print(f"[警告] 自动加载上一交易日持仓失败: {err}")
+            print("   使用空持仓继续运行")
+            if self.enable_detailed_logs:
+                import traceback
+                traceback.print_exc()
+            return {}
 
     def _load_recorder(self):
         print("\n[模型] 加载训练记录器...")
@@ -791,6 +861,20 @@ class DailyPredictionPipeline:
         lines.append(f"推荐股票数: {self.prediction_cfg.top_k}")
         lines.append(f"权重方法: {self.prediction_cfg.weight_method}")
         lines.append(f"交易指令: {'启用' if self.trading_cfg.enable_trading else '禁用'}")
+
+        # 持仓信息
+        if self.trading_cfg.current_holdings:
+            total_holdings = sum(self.trading_cfg.current_holdings.values())
+            lines.append(f"当前持仓: {len(self.trading_cfg.current_holdings)} 只股票，共 {total_holdings:,.0f} 股")
+            if self.trading_cfg.auto_load_previous:
+                lines.append("持仓来源: 自动加载上一交易日目标仓位")
+            else:
+                lines.append("持仓来源: 手动指定")
+        else:
+            lines.append("当前持仓: 空仓")
+            if self.trading_cfg.auto_load_previous:
+                lines.append("持仓来源: 自动加载（未找到上一交易日数据）")
+
         lines.append("")
 
         lines.append("[预测结果]")
