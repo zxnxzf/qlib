@@ -1,4 +1,4 @@
-#!/usr/bin/env python3  # 指定解释器
+﻿#!/usr/bin/env python3  # 指定解释器
 """
 live_daily_predict：实盘两阶段入口，复用 daily_predict 但支持实时报价定价。
 Phase1：T-1 特征跑模型+Topk，输出候选 symbols_req。
@@ -7,17 +7,22 @@ Phase2：注入当日 quotes_live，用实时报价算 shares/price，输出 ord
 
 import argparse  # 解析命令行参数（可选 --config）
 import json  # 读取 JSON 配置 / state.json
+import shutil
+import tarfile
 import time  # 等待 state 用
-from dataclasses import replace  # 覆盖配置的便捷方法
+from dataclasses import dataclass, replace  # 覆盖配置的便捷方法
 from pathlib import Path  # 路径处理
 from typing import Dict, Optional  # 类型注解
+from urllib.request import urlretrieve
 import sys  # 修改 sys.path 便于导入
 
 import pandas as pd  # 数据处理
+from pandas.tseries.offsets import BDay
 
 from qlib.utils import get_pre_trading_date  # 获取前一交易日
 from qlib.backtest.decision import OrderDir  # 订单方向枚举
 from qlib.backtest.live_exchange import LiveExchange  # 实时报价 Exchange
+from qlib.data import D
 
 # 调整 sys.path，保证能导入同级 daily_predict（examples 目录）
 _EXAMPLES_DIR = Path(__file__).resolve().parent
@@ -35,6 +40,13 @@ from daily_predict import (  # noqa: E402  # 延迟导入
 
 # ================= 用户可直接在此处配置缺省参数 =================
 DEFAULT_CONFIG = {
+    "qlib_init": {
+        "provider_uri": "~/.qlib/qlib_data/cn_data",  # 数据路径
+        "region": "cn",                                 # 市场区域
+        "kernels": 1,
+        "joblib_backend": "threading",
+        "maxtasksperchild": 1
+    },
     "paths": {
         "positions": "predictions/positions_live.csv",   # 持仓文件
         "quotes": "predictions/quotes_live.csv",         # 当日行情（ask1/bid1/last/limits）
@@ -52,7 +64,15 @@ DEFAULT_CONFIG = {
         "prediction_date": "auto",   # auto=用最新交易日(T-1)
         "top_k": 20,
         "min_score_threshold": 0.0,
-        "weight_method": "equal"
+        "weight_method": "equal",
+        "provider_uri": "~/.qlib/qlib_data/cn_data",
+        "region": "cn",
+        "instruments": "csi300",
+        "dataset_class": "DatasetH",
+        "dataset_module": "qlib.data.dataset",
+        "handler_class": "Alpha158",
+        "handler_module": "qlib.contrib.data.handler",
+        "min_history_days": 120
     },
     "trading": {
         "enable_trading": True,
@@ -63,9 +83,145 @@ DEFAULT_CONFIG = {
         "min_shares": 100,
         "price_search_days": 5,
         "risk_degree": 0.95
-    }
+    },
+    "data_update": {
+        "enable_auto_update": True,
+        "data_source_url": "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",
+        "download_timeout": 600,
+        "temp_dir": None,
+    },
 }
 # ==============================================================
+
+
+@dataclass
+class DataUpdateConfig:
+    enable_auto_update: bool = True
+    data_source_url: str = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
+    download_timeout: int = 600
+    temp_dir: Optional[str] = None
+
+    def get_temp_dir(self) -> Path:
+        if self.temp_dir:
+            return Path(self.temp_dir).expanduser()
+        return Path.home() / ".qlib" / "temp"
+
+
+def _provider_path_from_uri(uri: str) -> Path:
+    if not uri:
+        uri = "~/.qlib/qlib_data/cn_data"
+    path = Path(uri)
+    if uri.startswith("~"):
+        path = path.expanduser()
+    return path
+
+
+def _missing_required_data(data_path: Path, instruments) -> list:
+    missing = []
+    for dirname in ("features", "instruments", "calendars"):
+        if not (data_path / dirname).exists():
+            missing.append(str(data_path / dirname))
+    if isinstance(instruments, str):
+        inst_file = data_path / "instruments" / f"{instruments}.txt"
+        if not inst_file.exists():
+            missing.append(str(inst_file))
+    return missing
+
+
+def _latest_calendar_date(data_path: Path) -> Optional[str]:
+    cal_file = data_path / "calendars" / "day.txt"
+    if not cal_file.exists():
+        return None
+    with cal_file.open("r") as f:
+        dates = [line.strip() for line in f if line.strip()]
+    return dates[-1] if dates else None
+
+
+def _is_data_outdated(data_path: Path, target_date: str, instruments) -> tuple:
+    latest_local = _latest_calendar_date(data_path)
+    if latest_local is None:
+        return True, None
+    target_ts = pd.Timestamp(target_date)
+    required_ts = (target_ts - BDay(1)).normalize()
+    if latest_local < required_ts.strftime("%Y-%m-%d"):
+        return True, latest_local
+    if _missing_required_data(data_path, instruments):
+        return True, latest_local
+    return False, latest_local
+
+
+def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
+    try:
+        temp_dir = cfg.get_temp_dir()
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        download_path = temp_dir / "qlib_bin.tar.gz"
+        print("[数据] 开始下载最新数据包...")
+        print(f"   来源: {cfg.data_source_url}")
+        urlretrieve(cfg.data_source_url, download_path)
+        print(f"[成功] 下载完成，文件大小 {download_path.stat().st_size / (1024 * 1024):.1f} MB")
+        extract_dir = temp_dir / "extracted"
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(download_path, "r:gz") as tar:
+            tar.extractall(extract_dir)
+        qlib_bin_dir = extract_dir / "qlib_bin"
+        if not qlib_bin_dir.exists():
+            print("[错误] 解压后的目录缺少 qlib_bin 目录")
+            return False
+        for dirname in ("features", "instruments", "calendars"):
+            if not (qlib_bin_dir / dirname).exists():
+                print(f"[错误] 缺少必要目录: {dirname}")
+                return False
+        if target_path.exists():
+            shutil.rmtree(target_path)
+        shutil.copytree(qlib_bin_dir, target_path)
+        print("[成功] 数据更新完成")
+        return True
+    except Exception as err:
+        print(f"[错误] 数据更新失败: {err}")
+        return False
+
+
+def _ensure_data_ready(provider_uri: str, instruments, target_date: str, cfg: DataUpdateConfig):
+    data_path = _provider_path_from_uri(provider_uri)
+    missing = _missing_required_data(data_path, instruments)
+    outdated, latest = _is_data_outdated(data_path, target_date, instruments)
+    if not cfg.enable_auto_update:
+        if missing:
+            print("[警告] 检测到数据缺失:", missing)
+        if outdated:
+            print(f"[警告] 本地数据最新日期 {latest} 早于 {target_date}")
+        return
+    if not missing and not outdated:
+        print(f"[数据] 本地数据已是最新（最新交易日 {latest}）")
+        return
+    print("[数据] 触发自动更新...")
+    if not _download_and_update_data(cfg, data_path):
+        raise RuntimeError("自动更新数据失败，请检查网络或手动更新数据。")
+
+
+def _resolve_trading_date(target_ts: pd.Timestamp) -> str:
+    """
+    获取距目标时间最近（含当天）的交易日。
+    """
+    if target_ts.tzinfo is not None:
+        target_ts = target_ts.tz_convert(None)
+    target_ts = target_ts.normalize()
+    date_str = target_ts.strftime("%Y-%m-%d")
+    try:
+        pred = get_pre_trading_date(date_str) or date_str
+        return pd.Timestamp(pred).strftime("%Y-%m-%d")
+    except ValueError:
+        window = 60
+        while window <= 3650:
+            start = (target_ts - pd.Timedelta(days=window)).strftime("%Y-%m-%d")
+            cal = D.calendar(start_time=start, end_time=date_str, future=False, freq="day")
+            cal = [pd.Timestamp(x) for x in cal if pd.Timestamp(x) <= target_ts]
+            if cal:
+                return cal[-1].strftime("%Y-%m-%d")
+            window *= 2
+        raise ValueError(f"无法在 {date_str} 之前找到交易日，请检查数据目录是否完整")
 
 
 def _read_positions(path: Optional[str]) -> Dict[str, float]:
@@ -133,10 +289,24 @@ def _write_state(path: Path, phase: str, version: str, extra: Optional[Dict[str,
 def _wait_for_phase(path: Path, expect_phase: str, expect_version: str, timeout: int) -> None:
     """阻塞等待 state.json 达到期望的 phase+version，超时抛异常。"""
     start = time.time()
+    loop_count = 0
     while True:
+        loop_count += 1
         st = _read_state(path)
-        if st.get("phase") == expect_phase and st.get("version") == expect_version:
+        current_phase = st.get("phase")
+        current_version = st.get("version")
+
+        # 每 5 次循环打印一次调试信息
+        if loop_count % 5 == 1:
+            print(f"[live] 轮询 state.json (第 {loop_count} 次):")
+            print(f"   路径: {path}")
+            print(f"   期待: phase={expect_phase}, version={expect_version}")
+            print(f"   当前: phase={current_phase}, version={current_version}")
+
+        if current_phase == expect_phase and current_version == expect_version:
+            print(f"[live] ✓ 检测到期待的状态: phase={expect_phase}, version={expect_version}")
             return
+
         if time.time() - start > timeout:
             raise TimeoutError(f"等待 {expect_phase} version={expect_version} 超时，当前状态: {st or '无'}")
         time.sleep(2)
@@ -328,6 +498,50 @@ def main(argv=None) -> bool:
         cfg = DEFAULT_CONFIG
         print("[live] 未提供 --config，使用 DEFAULT_CONFIG（请根据需要修改文件顶部配置）")
 
+    qlib_init_cfg = cfg.get("qlib_init", {})
+    pred_cfg_raw = cfg.get("prediction", {})
+    data_update_raw = cfg.get("data_update", {})
+    today_ts = pd.Timestamp.utcnow().normalize()
+    pred_cfg_date = pred_cfg_raw.get("prediction_date")
+    if not pred_cfg_date or str(pred_cfg_date).lower() == "auto":
+        target_pred_date = today_ts.strftime("%Y-%m-%d")
+    else:
+        target_pred_date = pd.Timestamp(pred_cfg_date).strftime("%Y-%m-%d")
+
+    default_update_cfg = DataUpdateConfig()
+    data_update_cfg = DataUpdateConfig(
+        enable_auto_update=bool(
+            data_update_raw.get("enable_auto_update", default_update_cfg.enable_auto_update)
+        ),
+        data_source_url=data_update_raw.get("data_source_url", default_update_cfg.data_source_url),
+        download_timeout=int(data_update_raw.get("download_timeout", default_update_cfg.download_timeout)),
+        temp_dir=data_update_raw.get("temp_dir", default_update_cfg.temp_dir),
+    )
+
+    provider_uri = pred_cfg_raw.get("provider_uri") or qlib_init_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data")
+    region = pred_cfg_raw.get("region") or qlib_init_cfg.get("region", "cn")
+    instruments = pred_cfg_raw.get("instruments", "csi300")
+
+    print(f"[live] 目标预测日: {target_pred_date}")
+    print(f"[live] 检查本地数据: provider={provider_uri}")
+    _ensure_data_ready(provider_uri, instruments, target_pred_date, data_update_cfg)
+
+    # 初始化 qlib（参考 daily_predict.py）
+    import qlib
+    kernels = qlib_init_cfg.get("kernels", 1)
+    joblib_backend = qlib_init_cfg.get("joblib_backend", "threading")
+    maxtasksperchild = qlib_init_cfg.get("maxtasksperchild", 1)
+
+    print(f"[live] 初始化 qlib: provider_uri={provider_uri}, region={region}")
+    qlib.init(
+        provider_uri=provider_uri,
+        region=region,
+        kernels=kernels,
+        joblib_backend=joblib_backend,
+        maxtasksperchild=maxtasksperchild,
+    )
+    print("[live] qlib 初始化完成")
+
     # 读取路径配置
     paths = cfg.get("paths", {})
     positions_path = paths.get("positions")
@@ -341,27 +555,39 @@ def main(argv=None) -> bool:
     wait_secs = int(runtime.get("wait_secs", 300))
     version = runtime.get("version") or pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
 
+    # ===== 启动时重置 state.json =====
+    if state_path.exists():
+        print(f"[live] 检测到旧的 state.json，正在重置...")
+        try:
+            state_path.unlink()  # 删除旧文件
+            print(f"[live] 已删除旧的 state.json")
+        except Exception as e:
+            print(f"[live] [WARN] 无法删除旧的 state.json: {e}")
+
     # ===== Phase0: 请求持仓，等待 positions_ready =====
     print(f"[live] 请求持仓，写 state=positions_needed, version={version}")
     _write_state(state_path, phase="positions_needed", version=version, extra={})
     print(f"[live] 等待 positions_ready (version={version}) ...")
     _wait_for_phase(state_path, expect_phase="positions_ready", expect_version=version, timeout=wait_secs)
     holdings = _read_positions(positions_path)
-    quotes_live = _read_quotes(quotes_path)
+    print(f"[live] 读取到持仓: {len(holdings)} 只股票")
 
     # 预测配置
-    pred_cfg_raw = cfg.get("prediction", {})
-    today = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
-    pred_date = pred_cfg_raw.get("prediction_date")
-    if str(pred_date).lower() == "auto" or not pred_date:
-        pred_date = get_pre_trading_date(today) or today
     base_pred_cfg = PredictionConfig(
         experiment_id=pred_cfg_raw.get("experiment_id", "866149675032491302"),
         recorder_id=pred_cfg_raw.get("recorder_id", "3d0e78192f384bb881c63b32f743d5f8"),
-        prediction_date=pred_date,
+        prediction_date=target_pred_date,
         top_k=pred_cfg_raw.get("top_k", 20),
         min_score_threshold=pred_cfg_raw.get("min_score_threshold", 0.0),
         weight_method=pred_cfg_raw.get("weight_method", "equal"),
+        provider_uri=provider_uri,
+        region=region,
+        instruments=instruments,
+        dataset_class=pred_cfg_raw.get("dataset_class", "DatasetH"),
+        dataset_module=pred_cfg_raw.get("dataset_module", "qlib.data.dataset"),
+        handler_class=pred_cfg_raw.get("handler_class", "Alpha158"),
+        handler_module=pred_cfg_raw.get("handler_module", "qlib.contrib.data.handler"),
+        min_history_days=pred_cfg_raw.get("min_history_days", 120)
     )
 
     # 交易配置
@@ -379,16 +605,17 @@ def main(argv=None) -> bool:
 
     output_cfg = OutputConfig()
 
-    # 构造实盘 Pipeline
+    # 构造实盘 Pipeline（Phase1 不需要 quotes_live）
     pipeline = LiveDailyPredictionPipeline(
         prediction_cfg=base_pred_cfg,
         trading_cfg=base_trading_cfg,
         output_cfg=output_cfg,
-        quotes_live=quotes_live,
+        quotes_live={},  # Phase1 不需要行情，Phase2 再注入
+        data_update_cfg=data_update_cfg,
         enable_detailed_logs=True,
     )
 
-    # Phase1：推理 + Topk 选股（假定 positions 已就绪）
+    # Phase1：推理 + Topk 选股
     pipeline._init_environment()
     pipeline.recorder = pipeline._load_recorder()
     pipeline.model = pipeline._load_model(pipeline.recorder)
@@ -411,14 +638,14 @@ def main(argv=None) -> bool:
 
     # 等待 quotes_ready
     print(f"[live] 等待 quotes_ready (version={version}) ...")
-    _wait_for_phase(state_path, expect_phase="quotes_ready", expect_version=version, timeout=args.wait_secs)
-    quotes_live = _read_quotes(args.quotes)
+    _wait_for_phase(state_path, expect_phase="quotes_ready", expect_version=version, timeout=wait_secs)
+    quotes_live = _read_quotes(quotes_path)
     pipeline.quotes_live = quotes_live
 
     # Phase2：注入 quotes_live，用 LiveExchange 生成订单
     trading_result = pipeline._generate_trading_orders(pred_df)
     orders_df = trading_result.orders if trading_result else pd.DataFrame()
-    orders_path = Path(args.orders_out)
+    orders_path = Path(orders_out)
     orders_path.parent.mkdir(parents=True, exist_ok=True)
     orders_path.write_text(orders_df.to_csv(index=False), encoding="utf-8-sig")
     print(f"[live] orders_to_exec -> {orders_path}")

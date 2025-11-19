@@ -1,4 +1,4 @@
-# CLAUDE.md
+﻿# CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -351,3 +351,35 @@ record:
   - 仓位同步：启动时从券商同步真实现金/持仓，持续用成交回报更新，不使用默认内账本。
   - 随机性与日志：random 模式建议改为确定性或固定 seed；移除/改为日志的调试 print（如 trade_step==0 打印）。
 - 交易日历：`TradeCalendarManager`（`qlib/backtest/utils.py:40-110`）按 `time_per_step` 和 `start_time/end_time` 计算 `trade_len`，初始化 `trade_step=0`；每步执行器推进 `trade_step += 1`。日频（`time_per_step="day"`）时，`trade_step` 取值为 0...`trade_len-1`，对应交易区间内的每个交易日。
+## 实盘 TODO（给 Claude 的指引）
+
+### 当前已实现
+- `examples/live_daily_predict.py`：运行后依次写 `state=positions_needed → positions_ready → symbols_ready → quotes_ready → orders_ready`。Phase1 用 T-1 数据选股，Phase2 读取 iQuant 输送的 quotes_live 生成 `orders_to_exec.csv`。
+- `examples/iquant_qlib.py`（GBK）：同一脚本响应三阶段，并且所有操作仅在 `ContextInfo.is_last_bar()` 为真时执行。
+  - `positions_needed`：调用 `get_trade_detail_data(accountID, ACCOUNT_TYPE, "POSITION", strategyName)` 导出 `positions_live.csv`，之后写 `positions_ready`。
+  - `symbols_ready`：读取 `symbols_req.csv`，优先用 `ContextInfo.get_full_tick(stock_list)` 导出 `quotes_live.csv`（失败时再尝试旧 API）。
+  - `orders_ready`：读取 `orders_to_exec.csv`，支持 DRY_RUN/整手/市价或限价，下单后写 `exec_done/exec_failed`。
+- `qlib/backtest/live_exchange.py`：`LiveExchange` 优先使用 quotes_live 的 bid1/ask1/last (含涨跌停保护)。
+
+完成上述 TODO 后，请在此文档更新“已实现/待完成”列表，以便后续 review。
+## 实盘 Debug 说明（交接给 Claude）
+
+当前已经实现的逻辑：
+- `examples/live_daily_predict.py` 启动后依次写 `state=positions_needed → positions_ready → symbols_ready → quotes_ready → orders_ready`。Phase1 读取 T-1 数据选股，Phase2 读取 iQuant 写入的 `quotes_live.csv` 生成 `orders_to_exec.csv`。
+- `examples/iquant_qlib.py`（GBK）常驻在 iQuant 客户端：
+  - 当 `state.phase = positions_needed` 时调用 `get_trade_detail_data(accountID, ACCOUNT_TYPE, "POSITION", strategyName)` 导出 `positions_live.csv`，写回 `positions_ready`。
+  - 当 `state.phase = symbols_ready` 时读取 `symbols_req.csv`，调用 `ContextInfo.get_full_tick(stock_list)`（失败则尝试其它 API）导出 `quotes_live.csv`，写回 `quotes_ready`。
+  - 当 `state.phase = orders_ready` 且 `ContextInfo.is_last_bar()` 为 True 时读取 `orders_to_exec.csv` 下单，支持 DRY_RUN/整手/市价或限价，最后写 `exec_done/exec_failed`。
+- `qlib/backtest/live_exchange.py` 覆盖 `get_deal_price`，优先使用 quotes_live 的 bid1/ask1/last（含涨跌停保护）。
+
+当前需要你（Claude）调试的问题：
+1. 在实际环境中，运行 `live_daily_predict.py` 时要确保 `state.json` 先写 `positions_needed`，等待 iQuant 导出持仓后再进入 Phase1。请确认脚本在等待阶段没有因为缺少 `positions_live.csv` 抛错。
+2. iQuant 侧脚本在 `positions_needed` / `symbols_ready` 阶段尝试自动导出 CSV。如果 `get_trade_detail_data` 或 `get_full_tick` 返回为空，请补充日志和 fallback（例如提示手动生成文件），并确保 state 不会误写成 ready。
+3. 在 `quotes_ready` → `orders_ready` 之间，确认 `quotes_live.csv` 的列名（last/bid1/ask1/涨跌停）与 qlib Phase2 读取逻辑一致，避免因列缺失导致下单份额计算失败。
+4. 全程使用默认配置（无需外部 config），运行顺序：
+   - 启动 iQuant 脚本（GBK）
+   - 在 qlib 虚拟环境中 `python examples/live_daily_predict.py`（确保 `pip install pandas`、`import qlib` 正常）
+   - 观察 `state.json` 随阶段变化；若某阶段阻塞，请调试对应导出逻辑。
+
+请不要增加新的功能，只需确保上述流程跑通，定位/修复在等待持仓或导出行情时的异常。调试完成后，将修改和关键日志写入本文件的“实盘 Debug 说明”段落，便于 review。
+- 涉及到iquant api接口的，参考file:///D:/%E5%9B%BD%E4%BF%A1iQuant%E7%AD%96%E7%95%A5%E4%BA%A4%E6%98%93%E5%B9%B3%E5%8F%B0/HTML/guosenPythonApiHelp/iQuant_Python_API_Doc.html#id24

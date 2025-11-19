@@ -6,14 +6,15 @@
 
 import os
 import json
+import time
 import pandas as pd
 
 # ===== Paths (edit to your environment) =====
-POSITIONS_CSV_ABS_PATH = r"D:\code\qlib\qlib\predictions\positions_live.csv"
-QUOTES_CSV_ABS_PATH = r"D:\code\qlib\qlib\predictions\quotes_live.csv"
-SYMBOLS_REQ_ABS_PATH = r"D:\code\qlib\qlib\predictions\symbols_req.csv"
-ORDERS_CSV_ABS_PATH = r"D:\code\qlib\qlib\predictions\orders_to_exec.csv"
-STATE_JSON_PATH = r"D:\code\qlib\qlib\predictions\state.json"
+POSITIONS_CSV_ABS_PATH = r"D:\code\qlib\qlib\examples\predictions\positions_live.csv"
+QUOTES_CSV_ABS_PATH = r"D:\code\qlib\qlib\examples\predictions\quotes_live.csv"
+SYMBOLS_REQ_ABS_PATH = r"D:\code\qlib\qlib\examples\predictions\symbols_req.csv"
+ORDERS_CSV_ABS_PATH = r"D:\code\qlib\qlib\examples\predictions\orders_to_exec.csv"
+STATE_JSON_PATH = r"D:\code\qlib\qlib\examples\predictions\state.json"
 # ============================================
 
 # ---------- runtime flags ----------
@@ -26,6 +27,8 @@ ENFORCE_BUY_100_LOT = True
 ROUND_SELL_TO_100 = False
 PRINT_HEAD_ROWS = 10
 TARGET_VERSION = None
+POLL_INTERVAL = 5             # 轮询间隔（秒）
+MAX_POLL_COUNT = 360          # 最大轮询次数（360次 * 5秒 = 30分钟）
 
 # ---------- state ----------
 _ORDER_DF = None
@@ -87,15 +90,22 @@ def _load_orders() -> pd.DataFrame:
 
 
 def _read_state() -> dict:
-    if not STATE_JSON_PATH or not os.path.isfile(STATE_JSON_PATH):
+    if not STATE_JSON_PATH:
+        print("[DEBUG] STATE_JSON_PATH 未配置")
+        return {}
+    print(f"[DEBUG] 尝试读取 state.json: {STATE_JSON_PATH}")
+    if not os.path.isfile(STATE_JSON_PATH):
+        print(f"[DEBUG] state.json 不存在: {STATE_JSON_PATH}")
         return {}
     try:
         with open(STATE_JSON_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        print("[DEBUG] state =", data)
+        print(f"[DEBUG] state.json 读取成功: {data}")
         return data
-    except Exception:
-        print("[WARN] state.json unreadable")
+    except Exception as e:
+        print(f"[WARN] state.json 读取失败: {e}")
+        import traceback
+        traceback.print_exc()
         return {}
 
 
@@ -220,17 +230,20 @@ def _fetch_positions(ContextInfo):
     ✅ 修复：正确调用 iQuant 的 get_trade_detail_data 获取持仓
     """
     acc_id = ACCOUNT_ID or getattr(ContextInfo, "accid", None)
+    print(f"[DEBUG] _fetch_positions: acc_id={acc_id}, ACCOUNT_TYPE={ACCOUNT_TYPE}")
     if not acc_id:
         print("[WARN] ACCOUNT_ID is not set")
         return None
 
     try:
         # ✅ 修复：第三个参数必须是小写的 "position"
+        print(f"[DEBUG] calling get_trade_detail_data(acc_id={acc_id}, account_type={ACCOUNT_TYPE}, data_type='position', strategy_name={POSITION_STRATEGY_NAME or 'None'})")
         if POSITION_STRATEGY_NAME:
             data = get_trade_detail_data(acc_id, ACCOUNT_TYPE, "position", POSITION_STRATEGY_NAME)
         else:
             data = get_trade_detail_data(acc_id, ACCOUNT_TYPE, "position")
 
+        print(f"[DEBUG] get_trade_detail_data returned: type={type(data)}, data={data}")
         if data:
             print(f"[DEBUG] fetch holdings via get_trade_detail_data, count={len(data)}")
             return data
@@ -252,10 +265,14 @@ def _convert_positions(raw):
     """
     ✅ 修复：正确处理 iQuant position 对象的属性
     """
+    print(f"[DEBUG] _convert_positions: raw type={type(raw)}, length={len(raw) if hasattr(raw, '__len__') else 'N/A'}")
+
     if isinstance(raw, pd.DataFrame):
         records = raw.to_dict("records")
+        print(f"[DEBUG] converted DataFrame to {len(records)} records")
     elif isinstance(raw, (list, tuple)):
         records = list(raw)
+        print(f"[DEBUG] raw is list/tuple with {len(records)} items")
     elif isinstance(raw, dict):
         records = []
         for code_key, val in raw.items():
@@ -265,11 +282,14 @@ def _convert_positions(raw):
                 records.append(entry)
             else:
                 records.append({"code": code_key, "value": val})
+        print(f"[DEBUG] converted dict to {len(records)} records")
     else:
         records = []
+        print(f"[DEBUG] unknown type, using empty records")
 
     rows = []
-    for item in records:
+    for idx, item in enumerate(records):
+        print(f"[DEBUG] processing record {idx}: type={type(item)}, hasattr m_strInstrumentID={hasattr(item, 'm_strInstrumentID')}")
         # ✅ 修复：iQuant 返回的是对象，需要用 getattr 访问属性
         if hasattr(item, 'm_strInstrumentID'):
             # 对象属性方式（iQuant position 对象）
@@ -278,6 +298,7 @@ def _convert_positions(raw):
             available = getattr(item, 'm_nCanUseVolume', None)
             cost = getattr(item, 'm_dOpenPrice', None)
             last = getattr(item, 'm_dLastPrice', None) or getattr(item, 'm_dSettlementPrice', None)
+            print(f"[DEBUG]   extracted (object): code={code}, position={position}, available={available}, cost={cost}, last={last}")
         else:
             # 字典方式（兼容其他可能的返回格式）
             code = item.get("code") or item.get("stock") or item.get("symbol") or item.get("m_strInstrumentID")
@@ -285,8 +306,10 @@ def _convert_positions(raw):
             available = item.get("available") or item.get("enable_amount") or item.get("enable_volume") or item.get("m_nCanUseVolume")
             cost = item.get("cost_price") or item.get("avg_price") or item.get("price") or item.get("m_dOpenPrice")
             last = item.get("last") or item.get("last_price") or item.get("m_dLastPrice")
+            print(f"[DEBUG]   extracted (dict): code={code}, position={position}, available={available}, cost={cost}, last={last}")
 
         if code is None or position is None:
+            print(f"[DEBUG]   SKIPPED: code or position is None")
             continue
 
         rows.append(
@@ -299,7 +322,10 @@ def _convert_positions(raw):
             }
         )
 
-    return pd.DataFrame(rows)
+    print(f"[DEBUG] _convert_positions: converted {len(rows)} rows")
+    df = pd.DataFrame(rows)
+    print(f"[DEBUG] resulting DataFrame: shape={df.shape}, columns={list(df.columns) if not df.empty else 'empty'}")
+    return df
 
 
 def _export_positions(ContextInfo, version: str) -> bool:
@@ -322,14 +348,22 @@ def _export_positions(ContextInfo, version: str) -> bool:
 
 
 def _load_symbols() -> list:
+    print(f"[DEBUG] _load_symbols: 读取文件 {SYMBOLS_REQ_ABS_PATH}")
     if not SYMBOLS_REQ_ABS_PATH or not os.path.isfile(SYMBOLS_REQ_ABS_PATH):
+        print(f"[DEBUG] symbols_req 文件不存在")
         return []
     try:
         df = pd.read_csv(SYMBOLS_REQ_ABS_PATH, encoding="utf-8-sig")
+        print(f"[DEBUG] symbols_req 读取成功，行数: {len(df)}, 列: {list(df.columns)}")
         col = "instrument" if "instrument" in df.columns else df.columns[0]
-        return [str(c).strip() for c in df[col].dropna().tolist()]
+        symbols = [str(c).strip() for c in df[col].dropna().tolist()]
+        print(f"[DEBUG] 提取到 {len(symbols)} 个股票代码")
+        print(f"[DEBUG] 前5个代码: {symbols[:5]}")
+        return symbols
     except Exception as err:
         print(f"[WARN] cannot read symbols_req: {err}")
+        import traceback
+        traceback.print_exc()
         return []
 
 
@@ -337,12 +371,33 @@ def _fetch_quotes(ContextInfo, symbols):
     """
     ✅ 修复：使用 ContextInfo.get_full_tick() 获取实时行情
     """
+    print(f"[DEBUG] _fetch_quotes: 尝试获取 {len(symbols)} 个股票的行情")
+    print(f"[DEBUG] 股票列表: {symbols}")
+
+    normalized = []
+    for code in symbols:
+        ncode = _normalize_code(code)
+        if ncode:
+            normalized.append(ncode)
+
+    if not normalized:
+        print("[WARN] 正常化后的股票代码为空，无法获取行情")
+        return None
+
+    print(f"[DEBUG] 规范化后的股票列表: {normalized}")
+
     try:
         # 优先使用 get_full_tick
-        data = ContextInfo.get_full_tick(symbols)
+        print(f"[DEBUG] 调用 ContextInfo.get_full_tick(symbols)...")
+        data = ContextInfo.get_full_tick(normalized)
+        print(f"[DEBUG] get_full_tick 返回值类型: {type(data)}")
+        print(f"[DEBUG] get_full_tick 返回值: {data}")
+
         if data:
             print(f"[DEBUG] fetch quotes via get_full_tick, count={len(data)}")
             return data
+        else:
+            print(f"[WARN] get_full_tick 返回空数据")
     except NameError as err:
         print(f"[ERROR] get_full_tick not found: {err}")
     except Exception as err:
@@ -353,18 +408,25 @@ def _fetch_quotes(ContextInfo, symbols):
     return None
 
 
-def _convert_quotes(raw, symbols):
+def _convert_quotes(raw, symbols, context_info=None):
     """
     ✅ 修复：正确处理 iQuant get_full_tick 返回的字典结构
     """
+    print(f"[DEBUG] _convert_quotes: raw type={type(raw)}, symbols count={len(symbols)}")
     if not raw:
+        print("[DEBUG] raw 为空，返回空 DataFrame")
         return pd.DataFrame()
 
     # get_full_tick 返回 {code: {data}} 格式
     if isinstance(raw, dict):
+        print(f"[DEBUG] raw 是字典，包含 {len(raw)} 个键")
+        print(f"[DEBUG] raw 的键: {list(raw.keys())[:5]}")
         rows = []
-        for code, tick_data in raw.items():
+        for idx, (code, tick_data) in enumerate(raw.items()):
+            if idx == 0:
+                print(f"[DEBUG] 第一个 tick_data 示例: code={code}, type={type(tick_data)}, data={tick_data}")
             if not isinstance(tick_data, dict):
+                print(f"[DEBUG] 跳过非字典的 tick_data: code={code}, type={type(tick_data)}")
                 continue
 
             ncode = _normalize_code(code)
@@ -383,9 +445,9 @@ def _convert_quotes(raw, symbols):
             low_limit = tick_data.get("low_limit") or tick_data.get("DownStopPrice")
 
             # 如果没有涨跌停价格，尝试从 get_instrumentdetail 获取
-            if (high_limit is None or low_limit is None) and hasattr(ContextInfo, 'get_instrumentdetail'):
+            if (high_limit is None or low_limit is None) and context_info and hasattr(context_info, 'get_instrumentdetail'):
                 try:
-                    detail = ContextInfo.get_instrumentdetail(ncode)
+                    detail = context_info.get_instrumentdetail(ncode)
                     if detail:
                         high_limit = detail.get('UpStopPrice')
                         low_limit = detail.get('DownStopPrice')
@@ -401,9 +463,13 @@ def _convert_quotes(raw, symbols):
                 "low_limit": float(low_limit) if low_limit is not None else "",
             })
 
-        return pd.DataFrame(rows)
+        print(f"[DEBUG] 转换完成，生成 {len(rows)} 行数据")
+        df = pd.DataFrame(rows)
+        print(f"[DEBUG] DataFrame shape={df.shape}, columns={list(df.columns) if not df.empty else 'empty'}")
+        return df
 
     # 兼容其他格式
+    print(f"[DEBUG] raw 不是字典类型，返回空 DataFrame")
     return pd.DataFrame()
 
 
@@ -417,7 +483,7 @@ def _export_quotes(ContextInfo, version: str) -> bool:
         if os.path.isfile(QUOTES_CSV_ABS_PATH):
             print("[INFO] quotes file already exists, treated as ready")
             return True
-    df = _convert_quotes(data or {}, symbols)
+    df = _convert_quotes(data or {}, symbols, context_info=ContextInfo)
     if df.empty:
         print("[WARN] quotes dataframe empty")
         return False
@@ -428,11 +494,80 @@ def _export_quotes(ContextInfo, version: str) -> bool:
     return True
 
 
+# ---------- 主动轮询处理函数 ----------
+def _process_state(ContextInfo):
+    """处理当前 state，返回 True 表示需要继续轮询，False 表示已完成"""
+    global _ERROR_ONCE, _FIRED
+
+    state = _read_state()
+    phase = state.get("phase")
+    version = state.get("version")
+    expect_ver = TARGET_VERSION or version
+
+    print(f"[DEBUG] _process_state: phase={phase}, version={version}")
+
+    # 如果 state.json 不存在或 phase 为空，继续等待
+    if not phase:
+        print("[iQuant][INFO] state.json 不存在或 phase 为空，继续等待...")
+        return True  # 继续轮询
+
+    if phase == "positions_needed":
+        print(f"[iQuant] 检测到 phase=positions_needed，开始导出持仓...")
+        if _export_positions(ContextInfo, expect_ver or ""):
+            _write_state("positions_ready", expect_ver or "", {"source": "iquant"})
+            print(f"[iQuant] 持仓导出完成，已写入 positions_ready")
+        else:
+            print("[INFO] 持仓导出失败，等待手动导出")
+        return True  # 继续轮询
+
+    if phase == "symbols_ready":
+        print(f"[iQuant] 检测到 phase=symbols_ready，开始导出行情...")
+        if _export_quotes(ContextInfo, expect_ver or ""):
+            _write_state("quotes_ready", expect_ver or "", {"source": "iquant"})
+            print(f"[iQuant] 行情导出完成，已写入 quotes_ready")
+        else:
+            print("[INFO] 行情导出失败，等待手动导出")
+        return True  # 继续轮询
+
+    if phase == "orders_ready":
+        if TARGET_VERSION and version != TARGET_VERSION:
+            print(f"[iQuant][INFO] state.version={version} 不匹配 {TARGET_VERSION}，跳过")
+            return False  # 停止轮询
+        if _FIRED:
+            print("[DEBUG] 已执行过，停止轮询")
+            return False  # 停止轮询
+
+        try:
+            print(f"[iQuant] 检测到 phase=orders_ready，开始执行订单...")
+            df = getattr(ContextInfo, "_qlib_df", None)
+            if df is None:
+                df = _load_orders()
+            _print_overview(df)
+            _place_orders(df, ContextInfo, expect_ver or "")
+            _FIRED = True
+            _write_state("exec_done", expect_ver or "", {"status": "ok"})
+            print("[iQuant] 订单执行完毕，流程结束")
+            return False  # 停止轮询
+        except Exception as exc:
+            if not _ERROR_ONCE:
+                print(f"[iQuant][ERROR] 执行失败: {exc}")
+                import traceback
+                traceback.print_exc()
+                _ERROR_ONCE = True
+            _write_state("exec_failed", expect_ver or "", {"error": str(exc)})
+            return False  # 停止轮询
+
+    # 其他 phase（positions_ready, quotes_ready, exec_done, exec_failed 等）
+    print(f"[iQuant][INFO] 当前 phase={phase}，继续等待...")
+    return True  # 继续轮询
+
+
 # ---------- QMT lifecycle ----------
 def init(ContextInfo):
     if ACCOUNT_ID:
         ContextInfo.accid = ACCOUNT_ID
     ContextInfo._qlib_df = None
+    ContextInfo._polling_started = False
     try:
         ContextInfo._qlib_df = _load_orders()
     except Exception as exc:
@@ -441,58 +576,32 @@ def init(ContextInfo):
 
 
 def handlebar(ContextInfo):
-    global _ERROR_ONCE, _FIRED
-    ts_func = getattr(ContextInfo, "get_bar_timetag", None)
-    ts = ts_func(ContextInfo.barpos) if callable(ts_func) else None
-    print(f"[DEBUG] handlebar accid={getattr(ContextInfo, 'accid', None)}, barpos={getattr(ContextInfo, 'barpos', None)}, ts={ts}")
-
-    is_last = getattr(ContextInfo, "is_last_bar", lambda: True)
-    if not is_last():
-        print("[DEBUG] 非实时 bar，等待最后一根")
+    """每个 bar 调用一次，首次调用时启动主动轮询"""
+    # 只在首次调用时启动轮询
+    if getattr(ContextInfo, "_polling_started", False):
         return
 
-    state = _read_state()
-    phase = state.get("phase")
-    version = state.get("version")
-    expect_ver = TARGET_VERSION or version
+    ContextInfo._polling_started = True
+    print("[iQuant] ========== 开始主动轮询 state.json ==========")
+    print(f"[iQuant] 轮询间隔: {POLL_INTERVAL} 秒，最大轮询次数: {MAX_POLL_COUNT}")
 
-    if phase == "positions_needed":
-        if _export_positions(ContextInfo, expect_ver or ""):
-            _write_state("positions_ready", expect_ver or "", {"source": "iquant"})
-        else:
-            print("[INFO] 等待手动导出持仓")
-        return
+    poll_count = 0
+    while poll_count < MAX_POLL_COUNT:
+        poll_count += 1
+        print(f"\n[iQuant] ===== 第 {poll_count} 次轮询 =====")
 
-    if phase == "symbols_ready":
-        if _export_quotes(ContextInfo, expect_ver or ""):
-            _write_state("quotes_ready", expect_ver or "", {"source": "iquant"})
-        else:
-            print("[INFO] 等待手动导出行情")
-        return
+        # 处理当前 state
+        should_continue = _process_state(ContextInfo)
 
-    if phase != "orders_ready":
-        print(f"[iQuant][INFO] state.phase={phase}，未到 orders_ready，跳过")
-        return
-    if TARGET_VERSION and version != TARGET_VERSION:
-        print(f"[iQuant][INFO] state.version={version} 不匹配 {TARGET_VERSION}，跳过")
-        return
-    if _FIRED:
-        print("[DEBUG] 已执行过，本次跳过")
-        return
+        if not should_continue:
+            print("[iQuant] 流程完成，停止轮询")
+            break
 
-    try:
-        df = getattr(ContextInfo, "_qlib_df", None)
-        if df is None:
-            df = _load_orders()
-        _print_overview(df)
-        _place_orders(df, ContextInfo, expect_ver or "")
-        _FIRED = True
-        _write_state("exec_done", expect_ver or "", {"status": "ok"})
-        print("[DEBUG] 下单执行完毕")
-    except Exception as exc:
-        if not _ERROR_ONCE:
-            print(f"[iQuant][ERROR] 执行失败: {exc}")
-            import traceback
-            traceback.print_exc()
-            _ERROR_ONCE = True
-        _write_state("exec_failed", expect_ver or "", {"error": str(exc)})
+        # 等待下一次轮询
+        print(f"[iQuant] 等待 {POLL_INTERVAL} 秒后继续...")
+        time.sleep(POLL_INTERVAL)
+
+    if poll_count >= MAX_POLL_COUNT:
+        print(f"[iQuant][WARN] 达到最大轮询次数 {MAX_POLL_COUNT}，停止轮询")
+
+    print("[iQuant] ========== 轮询结束 ==========")
