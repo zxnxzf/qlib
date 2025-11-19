@@ -50,3 +50,11 @@ tags
 ./pretrain
 .idea/
 .aider*
+
+# diagnostic and log files
+test_claude_code/
+pigure_log/
+
+.serena/
+predictions/
+

@@ -1,0 +1,81 @@
+*** Begin Patch
+*** Update File: daily_predict.py
+@@
+-        self.recorder = None
+-        self.model = None
+-        self.dataset = None
+-        self.saved_files: List[Path] = []
++        self.recorder = None
++        self.model = None
++        self.dataset = None
++        self.saved_files: List[Path] = []
++        self.target_prediction_date = prediction_cfg.prediction_date
++        self.effective_prediction_date = prediction_cfg.prediction_date
+@@
+-        print("[配置] 预测配置:")
+-        print(f"   预测日期: {cfg.prediction_date}")
+-        print(f"   实验ID: {cfg.experiment_id}")
+-        print(f"   推荐股票数: {cfg.top_k}")
++        print("[配置] 预测配置:")
++        print(f"   目标预测日: {self.target_prediction_date}")
++        if self.effective_prediction_date != self.target_prediction_date:
++            print(f"   使用数据日: {self.effective_prediction_date}")
++        print(f"   实验ID: {cfg.experiment_id}")
++        print(f"   推荐股票数: {cfg.top_k}")
+@@
+         qlib.init(
+             provider_uri=self.prediction_cfg.provider_uri,
+             region=self.prediction_cfg.region,
+             kernels=1,
+             joblib_backend="threading",
+             maxtasksperchild=1,
+         )
++        self._align_prediction_date()
+         print("[成功] Qlib环境初始化成功")
++
++    def _align_prediction_date(self) -> None:
++        freq = self.trading_cfg.trade_freq or "day"
++        effective = pd.Timestamp(self.target_prediction_date)
++        visited = set()
++        while True:
++            current = effective.strftime("%Y-%m-%d")
++            if current in visited:
++                raise ValueError(
++                    f"无法为 {self.target_prediction_date} 定位可用交易日，请检查数据目录"
++                )
++            visited.add(current)
++            calendar = D.calendar(start_time=current, end_time=current, freq=freq)
++            if calendar:
++                break
++            previous = get_pre_trading_date(current, freq=freq)
++            if not previous:
++                raise ValueError(
++                    f"数据目录中不存在 {self.target_prediction_date} 及之前的交易日，请更新行情"
++                )
++            print(f"[警告] {current} 缺少行情数据，回退使用前一交易日 {previous}")
++            effective = pd.Timestamp(previous)
++        effective_str = effective.strftime("%Y-%m-%d")
++        self.effective_prediction_date = effective_str
++        self.prediction_cfg.prediction_date = effective_str
+@@
+-        df["prediction_date"] = self.prediction_cfg.prediction_date
++        df["prediction_date"] = self.target_prediction_date
+         df["generated_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+         print(f"[成功] 结果处理完成: {len(df)} 只股票")
+         return df.reset_index(drop=True)
+@@
+-        date_tag = self.prediction_cfg.prediction_date.replace("-", "")
++        date_tag = self.target_prediction_date.replace("-", "")
+@@
+-        lines.append(f"预测日期: {self.prediction_cfg.prediction_date}")
++        lines.append(f"目标预测日: {self.target_prediction_date}")
++        lines.append(f"使用数据日: {self.effective_prediction_date}")
+@@
+-        print("[预测摘要]:")
+-        print(f"   预测股票数: {len(pred_df)}")
++        print("[预测摘要]:")
++        print(f"   目标预测日: {self.target_prediction_date}")
++        if self.effective_prediction_date != self.target_prediction_date:
++            print(f"   使用数据日: {self.effective_prediction_date}")
++        print(f"   预测股票数: {len(pred_df)}")
+*** End Patch
