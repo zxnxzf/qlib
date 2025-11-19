@@ -8,6 +8,7 @@ Qlib实盘预测脚本 - 基于Qlib内置模块的每日预测流程。
 
 import argparse
 import json
+import math
 import shutil
 import sys
 import tarfile
@@ -15,11 +16,12 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 from urllib.request import urlretrieve
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import BDay
 
 import qlib
 from qlib.constant import REG_CN
@@ -81,9 +83,9 @@ class PredictionConfig:
     prediction_date: str
     provider_uri: str = "~/.qlib/qlib_data/cn_data"
     region: str = REG_CN
-    top_k: int = 50
-    min_score_threshold: float = 0.0
-    weight_method: str = "equal"
+    top_k: int = 50  # 最多推荐的股票数量（最终会结合约束筛选）
+    min_score_threshold: float = 0.0  # 分数低于该阈值的股票会被剔除
+    weight_method: str = "equal"  # equal/score 等权或按分数占比分配资金
     dataset_start: Optional[str] = "2020-01-01"
     min_history_days: int = 120
     instruments: Union[Sequence[str], str] = "csi300"
@@ -135,18 +137,21 @@ class TradingConfig:
     enable_trading: bool = True
     use_exchange_system: bool = True
     total_cash: float = 100000.0
-    min_shares: int = 100
-    risk_degree: float = 0.95
+    min_shares: int = 100  # 最小下单股数（A股默认 1 手=100 股）
+    max_stock_price: Optional[float] = None  # 价格过滤上限
+    dropout_rate: float = 0.0  # 每次换仓替换的仓位比例（0~1）
+    risk_degree: float = 0.95  # 资金使用比例（可控风险敞口）
     price_search_days: int = 5
     trade_freq: str = "day"
     deal_price: str = "close"
     current_holdings: Dict[str, float] = field(default_factory=dict)
     auto_load_previous: bool = True  # 自动加载上一交易日的目标仓位作为当前持仓
+    holdings_lookup_days: int = 10  # 自动回溯持仓的最大交易日跨度
 
 
 @dataclass
 class OutputConfig:
-    output_dir: Path = field(default_factory=_default_output_dir)
+    output_dir: Path = field(default_factory=_default_output_dir)  # 预测结果输出目录
     encoding: str = "utf-8-sig"
 
     def ensure_directory(self) -> None:
@@ -157,7 +162,7 @@ class OutputConfig:
 class DataUpdateConfig:
     """数据自动更新配置"""
     enable_auto_update: bool = True  # 是否启用自动更新
-    data_source_url: str = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
+    data_source_url: str = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"  # 数据镜像地址
     download_timeout: int = 600  # 下载超时（秒）
     temp_dir: Optional[Path] = None  # 临时目录，默认使用 ~/.qlib/temp
 
@@ -208,6 +213,7 @@ class TradingResult:
 
 
 class DailyPredictionPipeline:
+    """每日实盘流程的总控类，负责串联预测、行情补充、交易生成与结果落地。"""
     def __init__(
         self,
         prediction_cfg: PredictionConfig,
@@ -230,6 +236,7 @@ class DailyPredictionPipeline:
         self.effective_prediction_date = prediction_cfg.prediction_date
 
     def run(self) -> bool:
+        """执行一次端到端的预测+交易流程。"""
         print("[Qlib] Qlib实盘预测系统启动")
         print("=" * 50)
         self._print_config()
@@ -252,6 +259,7 @@ class DailyPredictionPipeline:
             predictions = self._generate_predictions()
             pred_df = self._prepare_predictions(predictions)
             pred_df = self._attach_market_data(pred_df)
+            pred_df = self._select_buyable_topk(pred_df)
 
             # 基于预测与市场数据生成交易指令
             trading_result = self._generate_trading_orders(pred_df)
@@ -318,17 +326,12 @@ class DailyPredictionPipeline:
 
             latest_local_date = dates[-1]
 
-            target_date = pd.Timestamp(self.target_prediction_date)
-            effective_target = target_date
-            for date_str in reversed(dates):
-                date_ts = pd.Timestamp(date_str)
-                if date_ts <= target_date:
-                    effective_target = date_ts
-                    break
-            prediction_date = effective_target.strftime("%Y-%m-%d")
+            target_ts = pd.Timestamp(self.target_prediction_date)
+            required_ts = target_ts - BDay(1)
+            required_date = required_ts.strftime("%Y-%m-%d")
 
-            # 简单对比：如果本地最新日期小于预测日期，则可能过时
-            if latest_local_date < prediction_date:
+            # 如果本地最新日期仍早于所需的数据日，则需要更新
+            if latest_local_date < required_date:
                 return True, latest_local_date
             missing_items = self._missing_required_data(data_path)
             if missing_items:
@@ -559,67 +562,61 @@ class DailyPredictionPipeline:
         self.prediction_cfg.prediction_date = effective_str
 
     def _auto_load_previous_holdings(self) -> Dict[str, float]:
-        """
-        自动加载上一交易日的目标仓位作为当前持仓。
-
-        Returns:
-            Dict[str, float]: 持仓字典 {股票代码: 股数}，找不到文件时返回空字典
-        """
+        """回溯最近若干交易日的目标仓位作为当前持仓。"""
         try:
-            # 获取上一交易日
-            prev_date: Optional[Union[str, pd.Timestamp]] = None
-            try:
-                prev_date = get_pre_trading_date(self.target_prediction_date)
-            except ValueError:
-                freq = self.trading_cfg.trade_freq or "day"
-                calendar = D.calendar(end_time=self.target_prediction_date, freq=freq)
-                historical = [pd.Timestamp(d) for d in calendar if pd.Timestamp(d) < pd.Timestamp(self.target_prediction_date)]
-                prev_date = historical[-1] if historical else None
+            lookup_limit = max(int(getattr(self.trading_cfg, "holdings_lookup_days", 10) or 0), 0)
+            attempts = 0
+            prev_date = pd.Timestamp(self.target_prediction_date)
+            candidate_file: Optional[Path] = None
+            candidate_date: Optional[str] = None
 
-            if not prev_date:
-                print("[警告] 无法获取上一交易日，使用空持仓")
-                return {}
+            while attempts < lookup_limit:
+                try:
+                    prev_date = get_pre_trading_date(prev_date)
+                except ValueError:
+                    freq = self.trading_cfg.trade_freq or "day"
+                    calendar = D.calendar(end_time=prev_date, freq=freq)
+                    history = [pd.Timestamp(d) for d in calendar if pd.Timestamp(d) < pd.Timestamp(prev_date)]
+                    prev_date = history[-1] if history else None
 
-            # 转换日期格式 "2025-01-03" -> "20250103"
-            if isinstance(prev_date, pd.Timestamp):
+                if not prev_date:
+                    break
+
                 prev_date_str = prev_date.strftime("%Y-%m-%d")
-            else:
-                prev_date_str = str(prev_date)
-            prev_date_tag = prev_date_str.replace("-", "")
+                prev_date_tag = prev_date_str.replace("-", "")
+                target_position_file = self.output_cfg.output_dir / f"target_position_{prev_date_tag}.csv"
 
-            # 构造目标仓位文件路径
-            target_position_file = self.output_cfg.output_dir / f"target_position_{prev_date_tag}.csv"
+                if target_position_file.exists():
+                    candidate_file = target_position_file
+                    candidate_date = prev_date_str
+                    break
 
-            if not target_position_file.exists():
-                print(f"[警告] 未找到上一交易日 ({prev_date_str}) 的目标仓位文件")
-                print(f"   文件路径: {target_position_file}")
-                print("   使用空持仓继续运行")
+                attempts += 1
+
+            if not candidate_file:
+                print(f"[警告] 最近 {lookup_limit} 个交易日未找到历史目标仓位，使用空持仓")
                 return {}
 
-            # 读取CSV文件
-            df = pd.read_csv(target_position_file, encoding=self.output_cfg.encoding)
+            df = pd.read_csv(candidate_file, encoding=self.output_cfg.encoding)
 
-            # 检查必要的列
             if "instrument" not in df.columns or "target_shares" not in df.columns:
                 print(f"[警告] 目标仓位文件格式不正确，缺少 instrument 或 target_shares 列")
                 print("   使用空持仓继续运行")
                 return {}
 
-            # 过滤有效持仓（股数>0）
             df = df[df["target_shares"] > 0]
 
-            # 转换为字典
             holdings = dict(zip(df["instrument"].astype(str), df["target_shares"].astype(float)))
 
             total_shares = sum(holdings.values())
-            print(f"[成功] 自动加载上一交易日 ({prev_date_str}) 的目标仓位")
-            print(f"   持仓股票数: {len(holdings)}")
+            print(f"[成功] 自动加载最近交易日 ({candidate_date}) 的目标仓位")
+            print(f"   持股股票数: {len(holdings)}")
             print(f"   总股数: {total_shares:,.0f}")
 
             return holdings
 
         except Exception as err:
-            print(f"[警告] 自动加载上一交易日持仓失败: {err}")
+            print(f"[警告] 自动回溯持仓失败: {err}")
             print("   使用空持仓继续运行")
             if self.enable_detailed_logs:
                 import traceback
@@ -731,8 +728,6 @@ class DailyPredictionPipeline:
             df = df[df["score"] >= self.prediction_cfg.min_score_threshold]
 
         df = df.sort_values("score", ascending=False)
-        if self.prediction_cfg.top_k > 0:
-            df = df.head(self.prediction_cfg.top_k)
 
         df["target_weight"] = self._compute_weights(df["score"], self.prediction_cfg.weight_method)
         df["prediction_date"] = self.target_prediction_date
@@ -769,6 +764,129 @@ class DailyPredictionPipeline:
         merged["price"] = merged["price"].astype(float)
         merged["is_tradable"] = merged["price"].notna() & (merged["price"] > 0)
         return merged
+
+    def _select_buyable_topk(self, pred_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        结合价格上限、预算/最小手数约束与 dropout 机制，对预测列表逐层筛选得到最终可交易的股票。
+
+        处理步骤：
+        1. 根据 `max_stock_price` 过滤高价股票；
+        2. 按得分降序依次检测资金与最小手数，构建可买候选；
+        3. 在候选中优先保留旧持仓（由 `dropout_rate` 决定替换比例），剩余名额由新股票填补；
+        4. 对最终列表重新计算 `target_weight`，供交易模块使用。
+        """
+        top_k = int(self.prediction_cfg.top_k or 0)
+        if top_k <= 0 or pred_df.empty:
+            return pred_df
+
+        # Step 1: apply optional price-cap filter on raw predictions.
+        # 步骤1：依据价格上限先过滤掉不满足条件的股票。
+        price_cap = self.trading_cfg.max_stock_price
+        working_df = pred_df.copy()
+        if price_cap is not None and price_cap > 0:
+            before = len(working_df)
+            working_df = working_df[working_df["price"].notna() & (working_df["price"] <= float(price_cap))]
+            removed = before - len(working_df)
+            if removed > 0:
+                print(f"[交易] 价格超过 {price_cap:g} 元的股票已过滤: {removed} 只")
+        else:
+            working_df = working_df[working_df["price"].notna()]
+
+        if working_df.empty:
+            print("[交易] 价格过滤后无可交易股票")
+            return working_df
+
+        # 步骤2：在预算与最小手数约束下，按得分贪心挑选可买股票。
+        available_cash = max(float(self.trading_cfg.total_cash), 0.0) * max(float(self.trading_cfg.risk_degree), 0.0)
+        if available_cash <= 0:
+            print("[交易] 可用资金不足，无法筛选可买股票")
+            return pred_df.iloc[0:0]
+
+        min_lot = max(int(self.trading_cfg.min_shares or 1), 1)
+        candidates = working_df.sort_values("score", ascending=False).reset_index(drop=True)
+        selected: List[Dict[str, Any]] = []
+
+        for record in candidates.to_dict("records"):
+            if len(selected) >= top_k:
+                break
+            if not record.get("is_tradable", True):
+                continue
+            price = record.get("price")
+            if not (pd.notna(price) and float(price) > 0):
+                continue
+
+            tentative = [rec.copy() for rec in selected]
+            tentative.append(record.copy())
+            scores = pd.Series([float(rec["score"]) for rec in tentative], dtype=float)
+            weights = self._compute_weights(scores, self.prediction_cfg.weight_method)
+
+            affordable = True
+            for idx, temp_record in enumerate(tentative):
+                price_val = temp_record.get("price")
+                if not (pd.notna(price_val) and float(price_val) > 0):
+                    affordable = False
+                    break
+                lot_cost = float(price_val) * min_lot
+                if lot_cost <= 0:
+                    affordable = False
+                    break
+
+                budget = float(weights.iloc[idx]) * available_cash
+                max_shares = math.floor(budget / lot_cost) * min_lot
+                if max_shares < min_lot:
+                    affordable = False
+                    break
+                temp_record["target_weight"] = float(weights.iloc[idx])
+
+            if not affordable:
+                continue
+
+            selected = [rec.copy() for rec in tentative]
+
+        if not selected:
+            print(f"[交易] 在资金与最小股数约束下未找到可买的前 {top_k} 只股票")
+            return pred_df.iloc[0:0]
+
+        # 步骤3：应用 dropout 机制，部分保留原持仓，其余名额由新股票补足。
+        filtered_df = pd.DataFrame(selected).sort_values("score", ascending=False).reset_index(drop=True)
+
+        max_positions = min(top_k, len(filtered_df)) if top_k > 0 else len(filtered_df)
+        dropout_rate = float(getattr(self.trading_cfg, "dropout_rate", 0.0) or 0.0)
+        dropout_rate = min(max(dropout_rate, 0.0), 1.0)
+        if max_positions > 0 and dropout_rate > 0 and self.trading_cfg.current_holdings:
+            drop_count = int(round(max_positions * dropout_rate))
+            drop_count = min(drop_count, max_positions)
+            keep_slots = max_positions - drop_count
+            if keep_slots < 0:
+                keep_slots = 0
+
+            current_codes = set(self.trading_cfg.current_holdings.keys())
+            existing = filtered_df[filtered_df["instrument"].isin(current_codes)].copy()
+            existing = existing.sort_values("score", ascending=False)
+            kept_existing = existing.head(keep_slots)
+            kept_codes = set(kept_existing["instrument"])
+
+            remaining_slots = max_positions - len(kept_existing)
+            new_pool = filtered_df[~filtered_df["instrument"].isin(kept_codes)]
+            buy_selected = new_pool.head(remaining_slots)
+
+            filtered_df = (
+                pd.concat([kept_existing, buy_selected], ignore_index=True)
+                .sort_values("score", ascending=False)
+                .reset_index(drop=True)
+            )
+            dropped_existing = max(0, len(existing) - len(kept_existing))
+            print(
+                f"[交易] Dropout策略: 保留持仓 {len(kept_existing)} 只, "
+                f"替换 {dropped_existing} 只, 新增 {len(buy_selected)} 只"
+            )
+        else:
+            filtered_df = filtered_df.head(max_positions).reset_index(drop=True)
+
+        # 步骤4：对最终列表的权重重新归一化，传递给交易模块。
+        filtered_df["target_weight"] = self._compute_weights(filtered_df["score"], self.prediction_cfg.weight_method)
+        print(f"[交易] 满足买入条件的股票: {len(filtered_df)} / {top_k}")
+        return filtered_df
 
     def _fetch_prices(self, instruments: Sequence[str]) -> pd.DataFrame:
         if not instruments:
@@ -855,6 +973,7 @@ class DailyPredictionPipeline:
                 position.fill_stock_value(start_time=self.prediction_cfg.prediction_date, freq=self.trading_cfg.trade_freq)
             except Exception as err:
                 print(f"   [警告] 无法补全持仓价格信息: {err}")
+            self._ensure_position_prices(position, tradable_df)
 
         order_generator = OrderGenWOInteract()
         target_weight_position = dict(zip(tradable_df["instrument"], tradable_df["target_weight"]))
@@ -880,8 +999,12 @@ class DailyPredictionPipeline:
             trade_start=trade_start,
             trade_end=trade_end,
         )
+        budget = self.trading_cfg.total_cash * self.trading_cfg.risk_degree + total_sell_amount
+        if total_buy_amount > budget and budget > 0:
+            # 若总买入金额超过预算，则按最小手数约束回调订单，确保不超额。
+            orders_df, total_buy_amount = self._cap_buy_orders_to_budget(orders_df, budget)
         target_shares = self._calculate_target_shares(exchange, target_weight_position, trade_start, trade_end)
-        net_amount = total_buy_amount - total_sell_amount
+        net_amount = max(total_buy_amount - total_sell_amount, 0.0)
 
         print(f"   生成买入指令: {len(orders_df[orders_df['action'] == '买入'])} 条")
         print(f"   预计买入金额: {total_buy_amount:,.0f} 元")
@@ -904,6 +1027,61 @@ class DailyPredictionPipeline:
             return 0.0, 0
         return float(pred_df["is_tradable"].mean()), int(pred_df["is_tradable"].sum())
 
+    def _ensure_position_prices(self, position: Position, price_reference: Optional[pd.DataFrame]) -> None:
+        """规范化仓位结构并补齐缺失价格，避免后续估值或下单阶段报错。"""
+        raw_position = getattr(position, "position", {})
+        if not raw_position:
+            return
+
+        normalized: Dict[str, Dict[str, float]] = {}
+        cash_entries: Dict[str, float] = {}
+        for code, entry in raw_position.items():
+            if code.startswith("cash"):
+                cash_entries[code] = entry if isinstance(entry, (int, float)) else float(entry.get("amount", 0.0))
+                continue
+            if isinstance(entry, dict):
+                normalized[code] = entry
+            else:
+                normalized[code] = {"amount": float(entry), "price": 0.0}
+
+        missing_codes = [
+            code
+            for code, data in normalized.items()
+            if data.get("price") is None or float(data.get("price", 0.0)) <= 0
+        ]
+        if not missing_codes:
+            return
+
+        price_map: Dict[str, float] = {}
+        if price_reference is not None and not price_reference.empty and "price" in price_reference.columns:
+            price_reference = price_reference.dropna(subset=["price"])
+            reference_series = price_reference.set_index("instrument")["price"]
+            for code in missing_codes:
+                value = reference_series.get(code)
+                if value is not None and pd.notna(value) and float(value) > 0:
+                    price_map[code] = float(value)
+
+        still_missing = [code for code in missing_codes if code not in price_map]
+        if still_missing:
+            fetched = self._fetch_prices(still_missing)
+            if not fetched.empty:
+                for _, row in fetched.iterrows():
+                    code = row.get("instrument")
+                    price = row.get("price")
+                    if code in still_missing and pd.notna(price) and float(price) > 0:
+                        price_map[code] = float(price)
+
+        unresolved = [code for code in missing_codes if code not in price_map]
+        if unresolved:
+            print(f"   [警告] 仍有 {len(unresolved)} 只持仓缺少价格信息，将默认价格为 0: {unresolved[:5]}")
+
+        for code in missing_codes:
+            price = price_map.get(code, 0.0)
+            pos_entry = normalized.setdefault(code, {})
+            pos_entry["price"] = price
+
+        position.position = {**cash_entries, **normalized}
+
     def _calculate_target_shares(
         self,
         exchange: Exchange,
@@ -921,10 +1099,56 @@ class DailyPredictionPipeline:
         except Exception:
             amount_dict = {code: 0.0 for code in target_weight_position}
 
+        min_lot = max(int(self.trading_cfg.min_shares or 1), 1)
         for code, amount in self.trading_cfg.current_holdings.items():
             amount_dict[code] = amount_dict.get(code, 0.0) + float(amount)
 
-        return {code: int(round(value)) for code, value in amount_dict.items()}
+        rounded = {}
+        for code, value in amount_dict.items():
+            if min_lot > 1:
+                shares = math.floor(float(value) / min_lot) * min_lot
+            else:
+                shares = int(round(float(value)))
+            if shares > 0:
+                rounded[code] = int(shares)
+        return rounded
+
+    def _cap_buy_orders_to_budget(self, orders_df: pd.DataFrame, budget: float) -> Tuple[pd.DataFrame, float]:
+        """控制买入侧的资金暴露，确保总买入金额不超过可用预算（现金+计划卖出所得）。"""
+        if budget <= 0:
+            buy_mask = orders_df["action"] == "买入"
+            orders_df.loc[buy_mask, ["shares", "amount"]] = 0
+            return orders_df, 0.0
+
+        min_lot = max(int(self.trading_cfg.min_shares or 1), 1)
+        remaining = float(budget)
+
+        for idx, row in orders_df.iterrows():
+            if row["action"] != "买入":
+                continue
+            price = float(row.get("price", 0.0)) if pd.notna(row.get("price")) else 0.0
+            shares = int(row.get("shares", 0))
+            if price <= 0 or shares < min_lot:
+                orders_df.at[idx, "shares"] = 0
+                orders_df.at[idx, "amount"] = 0.0
+                continue
+
+            amount = price * shares
+            if amount <= remaining:
+                remaining -= amount
+                continue
+
+            max_shares = int(math.floor(remaining / price / min_lot) * min_lot)
+            if max_shares >= min_lot:
+                orders_df.at[idx, "shares"] = max_shares
+                orders_df.at[idx, "amount"] = max_shares * price
+                remaining -= max_shares * price
+            else:
+                orders_df.at[idx, "shares"] = 0
+                orders_df.at[idx, "amount"] = 0.0
+
+        total_buy_amount = float(orders_df.loc[orders_df["action"] == "买入", "amount"].sum())
+        return orders_df, total_buy_amount
 
     def _orders_to_frame(
         self,
@@ -938,11 +1162,15 @@ class DailyPredictionPipeline:
         total_buy_amount = 0.0
         total_sell_amount = 0.0
 
+        min_lot = max(int(self.trading_cfg.min_shares or 1), 1)
+
         for order in orders:
-            shares = int(round(order.amount))
-            if shares <= 0:
-                continue
-            if shares < self.trading_cfg.min_shares:
+            raw_shares = float(order.amount)
+            if min_lot > 1:
+                shares = int(math.floor(raw_shares / min_lot) * min_lot)
+            else:
+                shares = int(round(raw_shares))
+            if shares < min_lot:
                 continue
 
             price = self._resolve_price(exchange, order, trade_start, trade_end, base_df)
@@ -1046,10 +1274,6 @@ class DailyPredictionPipeline:
         csv_path = self.output_cfg.output_dir / f"prediction_results_{date_tag}.csv"
         self._write_prediction_csv(final_pred_df, csv_path)
         saved_files.append(csv_path)
-
-        excel_path = self.output_cfg.output_dir / f"prediction_results_{date_tag}.xlsx"
-        self._write_prediction_excel(final_pred_df, excel_path)
-        saved_files.append(excel_path)
 
         if trading_result and trading_result.has_orders:
             orders_path = self.output_cfg.output_dir / f"trading_orders_{date_tag}.csv"
@@ -1289,7 +1513,7 @@ def main(argv: Optional[Sequence[str]] = None) -> bool:
         recorder_id="3d0e78192f384bb881c63b32f743d5f8",
         # prediction_date="2025-10-15",
         prediction_date=datetime.now().strftime("%Y-%m-%d"),
-        top_k=5,
+        top_k=20,
         min_score_threshold=0.0,
         weight_method="equal",
     )
@@ -1297,7 +1521,9 @@ def main(argv: Optional[Sequence[str]] = None) -> bool:
     trading_cfg = TradingConfig(
         enable_trading=True,
         use_exchange_system=True,
-        total_cash=10000,
+        total_cash=50000,
+        max_stock_price=10.0,
+        dropout_rate=0.2,
         min_shares=100,
         price_search_days=5,
         current_holdings=current_holdings,

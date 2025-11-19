@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe test_claude_code/check_2023_data.py)",
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe test_claude_code/test_raw_valid.py)",
+      "Bash(timeout 300 /c/Users/Administrator/.conda/envs/qlib/python.exe workflow_by_code.py)",
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe test_claude_code/verify_stock_data.py)",
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe test_claude_code/verify_stock_data_en.py)",
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe test_claude_code/check_adjustment.py)",
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe test_claude_code/verify_recent_data.py)",
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe test_claude_code/diagnose_valid_empty.py)",
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe test_claude_code/test_model_fit.py)",
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe workflow_by_code.py)",
+      "Read(//d/**)",
+      "Bash(D:UsersAdministrator.condaenvsqlibpython.exe examplesworkflow_by_code.py)",
+      "Bash(/c/Users/Administrator/.conda/envs/qlib/python.exe:*)",
+      "Bash(mkdir:*)",
+      "Bash(cat:*)",
+      "Bash(python:*)",
+      "Bash(timeout 60 /c/Users/Administrator/.conda/envs/qlib/python.exe:*)",
+      "Bash(git checkout:*)",
+      "Bash(tasklist:*)",
+      "mcp__ide__executeCode",
+      "Bash(dir:*)",
+      "Bash(find:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

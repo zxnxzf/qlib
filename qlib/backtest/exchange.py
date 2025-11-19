@@ -426,35 +426,41 @@ class Exchange:
         dealt_order_amount: Dict[str, float] = defaultdict(float),
     ) -> Tuple[float, float, float]:
         """
-        Deal order when the actual transaction
-        the results section in `Order` will be changed.
-        :param order:  Deal the order.
-        :param trade_account: Trade account to be updated after dealing the order.
-        :param position: position to be updated after dealing the order.
-        :param dealt_order_amount: the dealt order amount dict with the format of {stock_id: float}
-        :return: trade_val, trade_cost, trade_price
+        执行一笔订单（会修改 order 的成交字段），并更新账户或持仓。
+
+        参数
+        ----------
+        order : Order
+            待成交的订单。
+        trade_account : Account | None
+            交易账户，成交后更新其现金/持仓；与 position 互斥。
+        position : BasePosition | None
+            直接更新的持仓对象；与 trade_account 互斥。
+        dealt_order_amount : Dict[str, float]
+            当日已成交量的字典，格式 {stock_id: 累计成交量}，用于成交量约束/记录。
+
+        返回
+        -------
+        (trade_val, trade_cost, trade_price) : Tuple[float, float, float]
+            成交金额、交易成本、成交价。
         """
-        # check order first.
+        # 先检查可交易性（涨跌停/停牌等）
         if not self.check_order(order):
             order.deal_amount = 0.0
-            # using np.nan instead of None to make it more convenient to show the value in format string
             self.logger.debug(f"Order failed due to trading limitation: {order}")
             return 0.0, 0.0, np.nan
 
         if trade_account is not None and position is not None:
             raise ValueError("trade_account and position can only choose one")
 
-        # NOTE: order will be changed in this function
+        # NOTE: 该函数内会修改 order 的成交信息
         trade_price, trade_val, trade_cost = self._calc_trade_info_by_order(
             order,
             trade_account.current_position if trade_account else position,
             dealt_order_amount,
         )
         if trade_val > 1e-5:
-            # If the order can only be deal 0 value. Nothing to be updated
-            # Otherwise, it will result in
-            # 1) some stock with 0 value in the position
-            # 2) `trade_unit` of trade_cost will be lost in user account
+            # 仅在有实际成交金额时更新账户/持仓，避免出现 0 金额持仓或成本
             if trade_account:
                 trade_account.update_order(order=order, trade_val=trade_val, cost=trade_cost, trade_price=trade_price)
             elif position:
@@ -863,12 +869,21 @@ class Exchange:
         dealt_order_amount: dict,
     ) -> Tuple[float, float, float]:
         """
-        Calculation of trade info
-        **NOTE**: Order will be changed in this function
-        :param order:
-        :param position: Position
-        :param dealt_order_amount: the dealt order amount dict with the format of {stock_id: float}
-        :return: trade_price, trade_val, trade_cost
+        计算订单的成交价/金额/成本（会修改 order.deal_amount 等字段）。
+
+        参数
+        ----------
+        order : Order
+            待成交订单。
+        position : Optional[BasePosition]
+            当前持仓，用于校验可卖数量/现金约束；为空时仅按交易单位/成交价处理。
+        dealt_order_amount : dict
+            当日已成交量 {stock_id: amount}，用于按成交量裁剪大额订单。
+
+        返回
+        -------
+        trade_price, trade_val, trade_cost : Tuple[float, float, float]
+            成交价、成交金额、交易成本。
         """
         trade_price = cast(
             float,
@@ -876,39 +891,33 @@ class Exchange:
         )
         total_trade_val = cast(float, self.get_volume(order.stock_id, order.start_time, order.end_time)) * trade_price
         order.factor = self.get_factor(order.stock_id, order.start_time, order.end_time)
-        order.deal_amount = order.amount  # set to full amount and clip it step by step
-        # Clipping amount first
-        # - It simulates that the order is rejected directly by the exchange due to large order
-        # Another choice is placing it after rounding the order
-        # - It simulates that the large order is submitted, but partial is dealt regardless of rounding by trading unit.
+        order.deal_amount = order.amount  # 先假定全额成交，后续逐步裁剪
+
+        # 先按可成交量裁剪：模拟交易所直接拒绝超量订单
         self._clip_amount_by_volume(order, dealt_order_amount)
 
-        # TODO: the adjusted cost ratio can be overestimated as deal_amount will be clipped in the next steps
         trade_val = order.deal_amount * trade_price
         if not total_trade_val or np.isnan(total_trade_val):
-            # TODO: assert trade_val == 0, f"trade_val != 0, total_trade_val: {total_trade_val}; order info: {order}"
             adj_cost_ratio = self.impact_cost
         else:
+            # 冲击成本按成交金额占全量的平方比调整
             adj_cost_ratio = self.impact_cost * (trade_val / total_trade_val) ** 2
 
         if order.direction == Order.SELL:
             cost_ratio = self.close_cost + adj_cost_ratio
-            # sell
-            # if we don't know current position, we choose to sell all
-            # Otherwise, we clip the amount based on current position
             if position is not None:
-                # TODO: make the trading shortable
+                # 可卖数量 = 当前持仓数量
                 current_amount = (
                     position.get_stock_amount(order.stock_id) if position.check_stock(order.stock_id) else 0
                 )
                 if not np.isclose(order.deal_amount, current_amount):
-                    # when not selling last stock. rounding is necessary
+                    # 非清仓卖出时，按交易单位取整且不超过持仓
                     order.deal_amount = self.round_amount_by_trade_unit(
                         min(current_amount, order.deal_amount),
                         order.factor,
                     )
 
-                # in case of negative value of cash
+                # 校验卖出后现金是否足以覆盖成本
                 if position.get_cash() + order.deal_amount * trade_price < max(
                     order.deal_amount * trade_price * cost_ratio,
                     self.min_cost,
@@ -918,16 +927,15 @@ class Exchange:
 
         elif order.direction == Order.BUY:
             cost_ratio = self.open_cost + adj_cost_ratio
-            # buy
             if position is not None:
                 cash = position.get_cash()
                 trade_val = order.deal_amount * trade_price
                 if cash < max(trade_val * cost_ratio, self.min_cost):
-                    # cash cannot cover cost
+                    # 现金连成本都覆盖不了
                     order.deal_amount = 0
                     self.logger.debug(f"Order clipped due to cost higher than cash: {order}")
                 elif cash < trade_val + max(trade_val * cost_ratio, self.min_cost):
-                    # The money is not enough
+                    # 现金不足以全额买入，按现金上限裁剪
                     max_buy_amount = self._get_buy_amount_by_cash_limit(trade_price, cash, cost_ratio)
                     order.deal_amount = self.round_amount_by_trade_unit(
                         min(max_buy_amount, order.deal_amount),
@@ -935,10 +943,10 @@ class Exchange:
                     )
                     self.logger.debug(f"Order clipped due to cash limitation: {order}")
                 else:
-                    # The money is enough
+                    # 现金足够，按交易单位取整
                     order.deal_amount = self.round_amount_by_trade_unit(order.deal_amount, order.factor)
             else:
-                # Unknown amount of money. Just round the amount
+                # 未知现金，上限不明，只按交易单位取整
                 order.deal_amount = self.round_amount_by_trade_unit(order.deal_amount, order.factor)
 
         else:
@@ -947,7 +955,7 @@ class Exchange:
         trade_val = order.deal_amount * trade_price
         trade_cost = max(trade_val * cost_ratio, self.min_cost)
         if trade_val <= 1e-5:
-            # if dealing is not successful, the trade_cost should be zero.
+            # 未成交视作 0 成本
             trade_cost = 0
         return trade_price, trade_val, trade_cost
 

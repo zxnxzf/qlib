@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation.
+﻿# Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 import os
 import copy
@@ -136,20 +136,28 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         self.forbid_all_trade_at_limit = forbid_all_trade_at_limit
 
     def generate_trade_decision(self, execute_result=None):
-        # get the number of trading step finished, trade_step can be [0, 1, 2, ..., trade_len - 1]
+        # 当前交易步及对应的交易/预测窗口
+        # trade_step 可取 [0, 1, 2, ..., trade_len - 1]
         trade_step = self.trade_calendar.get_trade_step()
         trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
-        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
-        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
-        # NOTE: the current version of topk dropout strategy can't handle pd.DataFrame(multiple signal)
-        # So it only leverage the first col of signal
+        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)  # 前一天的数据
+        # step=0 trade_window=[2025-01-02 00:00:00, 2025-01-02 23:59:59] pred_window=[2024-12-31 00:00:00, 2025-01-01 23:59:59]
+        if trade_step == 0:
+            print(
+                f"[TopkDropoutStrategy] step={trade_step} "
+                f"trade_window=[{trade_start_time}, {trade_end_time}] "
+                f"pred_window=[{pred_start_time}, {pred_end_time}]"
+            )
+        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)  # 前一天的分数
+
+        # NOTE: current version can't handle multi-signal DataFrame,仅取第一列
         if isinstance(pred_score, pd.DataFrame):
             pred_score = pred_score.iloc[:, 0]
+        # 无信号直接空决策返回
         if pred_score is None:
             return TradeDecisionWO([], self)
         if self.only_tradable:
-            # If The strategy only consider tradable stock when make decision
-            # It needs following actions to filter stocks
+            # 仅考虑可交易标的时，筛选助手函数基于交易所可交易状态过滤
             def get_first_n(li, n, reverse=False):
                 cur_n = 0
                 res = []
@@ -186,19 +194,20 @@ class TopkDropoutStrategy(BaseSignalStrategy):
             def filter_stock(li):
                 return li
 
+        # 拷贝当前仓位状态用于计算交易结果（不污染原仓位）
         current_temp: Position = copy.deepcopy(self.trade_position)
-        # generate order list for this adjust date
+        # 当期生成的卖/买单列表
         sell_order_list = []
         buy_order_list = []
-        # load score
+        # 资金与现持仓信息
         cash = current_temp.get_cash()
         current_stock_list = current_temp.get_stock_list()
-        # last position (sorted by score)
+        # 现持仓按预测得分排序（last）
         last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
-        # The new stocks today want to buy **at most**
+        # 生成今日最多想买的候选 today
         if self.method_buy == "top":
             today = get_first_n(
-                pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index,
+                pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index, #剔除当前持仓的股票中选择
                 self.n_drop + self.topk - len(last),
             )
         elif self.method_buy == "random":
@@ -211,11 +220,10 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                 today = candi
         else:
             raise NotImplementedError(f"This type of input is not supported")
-        # combine(new stocks + last stocks),  we will drop stocks from this list
-        # In case of dropping higher score stock and buying lower score stock.
+        # 合并当前+候选，按得分排序，避免卖高买低
         comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
 
-        # Get the stock list we really want to sell (After filtering the case that we sell high and buy low)
+        # 依策略得到实际卖出列表（底部/随机）
         if self.method_sell == "bottom":
             sell = last[last.isin(get_last_n(comb, self.n_drop))]
         elif self.method_sell == "random":
@@ -227,9 +235,10 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         else:
             raise NotImplementedError(f"This type of input is not supported")
 
-        # Get the stock list we really want to buy
+        # 最终买入列表：卖出的数量 + 补足 topk
         buy = today[: len(sell) + self.topk - len(last)]
         for code in current_stock_list:
+            # 涨跌停/停牌不可卖
             if not self.trade_exchange.is_stock_tradable(
                 stock_id=code,
                 start_time=trade_start_time,
@@ -238,11 +247,11 @@ class TopkDropoutStrategy(BaseSignalStrategy):
             ):
                 continue
             if code in sell:
-                # check hold limit
+                # 持仓未达 hold_thresh 则跳过卖出
                 time_per_step = self.trade_calendar.get_freq()
-                if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
+                if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh: #小于指定的持仓天数
                     continue
-                # sell order
+                # 构造卖单，全仓卖出
                 sell_amount = current_temp.get_stock_amount(code=code)
                 # sell_amount = self.trade_exchange.round_amount_by_trade_unit(sell_amount, factor)
                 sell_order = Order(
@@ -255,21 +264,19 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                 # is order executable
                 if self.trade_exchange.check_order(sell_order):
                     sell_order_list.append(sell_order)
+                    # 成交并更新现金（收入-成本）
                     trade_val, trade_cost, trade_price = self.trade_exchange.deal_order(
                         sell_order, position=current_temp
                     )
-                    # update cash
                     cash += trade_val - trade_cost
-        # buy new stock
-        # note the current has been changed
-        # current_stock_list = current_temp.get_stock_list()
+        # 重新分配买入金额（已含最新现金）
         value = cash * self.risk_degree / len(buy) if len(buy) > 0 else 0
 
         # open_cost should be considered in the real trading environment, while the backtest in evaluate.py does not
         # consider it as the aim of demo is to accomplish same strategy as evaluate.py, so comment out this line
         # value = value / (1+self.trade_exchange.open_cost) # set open_cost limit
         for code in buy:
-            # check is stock suspended
+            # 涨跌停/停牌不可买
             if not self.trade_exchange.is_stock_tradable(
                 stock_id=code,
                 start_time=trade_start_time,
@@ -520,3 +527,4 @@ class EnhancedIndexingStrategy(WeightStrategyBase):
             self.logger.info("total holding weight: {:.6f}".format(weight.sum()))
 
         return target_weight_position
+

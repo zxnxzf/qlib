@@ -230,38 +230,32 @@ class BaseExecutor:
         return_value: dict | None = None,
         level: int = 0,
     ) -> Generator[Any, Any, List[object]]:
-        """Generator for collecting the trade decision data for rl training
+        """收集/执行一次交易决策（生成器形式，用于嵌套执行器和 RL 数据采集）
 
-        his function will make a step forward
-
-        Parameters
+        参数
         ----------
         trade_decision : BaseTradeDecision
-
-        level : int
-            the level of current executor. 0 indicates the top level
-
+            本层策略生成的交易决策（可含子决策）。
         return_value : dict
-            the mem address to return the value
-            e.g.  {"return_value": <the executed result>}
+            用于回传执行结果的容器，例如 {"return_value": <execute_result> }。
+        level : int
+            当前 executor 层级，0 表示最外层。
 
-        Returns
+        返回
         ----------
         execute_result : List[object]
-            the executed result for trade decision.
-            ** NOTE!!!! **:
-            1) This is necessary,  The return value of generator will be used in NestedExecutor
-            2) Please note the executed results are not merged.
+            本层决策的执行结果列表（不会在此处合并）。
 
-        Yields
+        生成
         -------
         object
-            trade decision
+            透传决策/子决策（供外部逐步执行）。
         """
 
         if self.track_data:
             yield trade_decision
 
+        # atomic 表示无子执行器的叶子节点，嵌套执行器则为 False
         atomic = not issubclass(self.__class__, NestedExecutor)  # issubclass(A, A) is True
 
         if atomic and trade_decision.get_range_limit(default_value=None) is not None:
@@ -270,6 +264,7 @@ class BaseExecutor:
         if self._settle_type != BasePosition.ST_NO:
             self.trade_account.current_position.settle_start(self._settle_type)
 
+        # 调用具体实现，可能返回元组或生成器
         obj = self._collect_data(trade_decision=trade_decision, level=level)
 
         if isinstance(obj, GeneratorType):
@@ -281,7 +276,7 @@ class BaseExecutor:
             res, kwargs = obj
 
         trade_start_time, trade_end_time = self.trade_calendar.get_step_time()
-        # Account will not be changed in this function
+        # 此处不改动账户，负责收尾更新（滑点/费率等内部状态）
         self.trade_account.update_bar_end(
             trade_start_time,
             trade_end_time,
@@ -592,15 +587,13 @@ class SimulatorExecutor(BaseExecutor):
         execute_result: list = []
 
         for order in self._get_order_iterator(trade_decision):
-            # Each time we move into a new date, clear `self.dealt_order_amount` since it only maintains intraday
-            # information.
+            # 每踏入新交易日，清空单日产出的成交累积（用于控制当日成交量等约束）
             now_deal_day = self.trade_calendar.get_step_time()[0].floor(freq="D")
             if self.deal_day is None or now_deal_day > self.deal_day:
-                self.dealt_order_amount = defaultdict(float)
+                self.dealt_order_amount = defaultdict(float) #初始化一个字典的数据结构{stock_id, amount}
                 self.deal_day = now_deal_day
 
-            # execute the order.
-            # NOTE: The trade_account will be changed in this function
+            # 实际执行订单，账户将被更新
             trade_val, trade_cost, trade_price = self.trade_exchange.deal_order(
                 order,
                 trade_account=self.trade_account,
@@ -608,6 +601,7 @@ class SimulatorExecutor(BaseExecutor):
             )
             execute_result.append((order, trade_val, trade_cost, trade_price))
 
+            # 记录当日累计成交量（per stock）
             self.dealt_order_amount[order.stock_id] += order.deal_amount
 
             if self.verbose:

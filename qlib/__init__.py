@@ -2,12 +2,20 @@
 # Licensed under the MIT License.
 from pathlib import Path
 
-from setuptools_scm import get_version
+import os
 
-__version__ = get_version(root="..", relative_to=__file__)
+# NOTE:
+# The project used to query the git-based version via setuptools_scm here.
+# In some user environments (e.g. offline deployment or trimmed git history)
+# this version probing may fail and block the runtime.  We now skip the check
+# entirely unless the user explicitly opts in.
+_force_version = os.environ.get("QLIB_FORCE_VERSION")
+if _force_version:
+    __version__ = _force_version
+else:
+    __version__ = "0.9.0.dev"
 __version__bak = __version__  # This version is backup for QlibConfig.reset_qlib_version
 import logging
-import os
 import platform
 import re
 import subprocess
