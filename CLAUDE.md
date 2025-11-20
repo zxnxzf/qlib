@@ -381,5 +381,157 @@ record:
    - 在 qlib 虚拟环境中 `python examples/live_daily_predict.py`（确保 `pip install pandas`、`import qlib` 正常）
    - 观察 `state.json` 随阶段变化；若某阶段阻塞，请调试对应导出逻辑。
 
-请不要增加新的功能，只需确保上述流程跑通，定位/修复在等待持仓或导出行情时的异常。调试完成后，将修改和关键日志写入本文件的“实盘 Debug 说明”段落，便于 review。
+请不要增加新的功能，只需确保上述流程跑通，定位/修复在等待持仓或导出行情时的异常。调试完成后，将修改和关键日志写入本文件的"实盘 Debug 说明"段落，便于 review。
 - 涉及到iquant api接口的，参考file:///D:/%E5%9B%BD%E4%BF%A1iQuant%E7%AD%96%E7%95%A5%E4%BA%A4%E6%98%93%E5%B9%B3%E5%8F%B0/HTML/guosenPythonApiHelp/iQuant_Python_API_Doc.html#id24
+
+---
+
+## 已知问题与修复记录
+
+### Bug #1: iQuant 实盘下单失败 - passorder 返回 0（已修复）
+
+**发现时间**: 2025-11-20
+**修复提交**: `43ef5eeb` - fix: 修复 iQuant 实盘下单失败问题
+
+#### 问题描述
+
+在交易时间内调用 `passorder` 下单时：
+- `passorder` 始终返回 `0`（表示失败）
+- 订单完全未进入券商系统
+- iQuant 客户端的【委托】列表中看不到任何订单记录
+- 没有任何拒绝提示或错误弹窗
+- 订单回调函数（`orderError_callback`、`order_callback`）完全没有触发
+
+#### 症状特征
+
+```python
+[DEBUG] passorder 返回值: type=<class 'int'>, value=0
+[iQuant] 已提交 300122.SZ 买入 2200 股 (order_id=xxx, ver=xxx)
+```
+
+看似"已提交"，但实际上：
+- ✅ 运行模式已确认为"实盘模式"
+- ✅ 账户 ID 设置正确
+- ✅ 当前时间在交易时间内（9:30-11:30 或 13:00-15:00）
+- ✅ 股票代码格式正确（`300122.SZ`）
+- ✅ passorder 参数与成功案例完全一致
+- ❌ 但订单就是不进入系统
+
+#### 根本原因
+
+**缺少 `is_last_bar()` 检查**，导致在历史回放/预热阶段就执行了下单逻辑。
+
+iQuant 的 `handlebar()` 函数在策略运行时会先回放历史数据（预热阶段），然后才进入实时 bar。在历史回放阶段执行的 `passorder` 调用会被 iQuant 内部忽略，不会提交到券商系统，也不会触发任何回调或错误提示。
+
+对比成功案例 `iquant_lizi.py`，发现关键差异：
+
+```python
+# ✅ 成功案例 (iquant_lizi.py)
+def handlebar(ContextInfo):
+    # 检查是否为实时 bar
+    is_last = getattr(ContextInfo, 'is_last_bar', lambda: True)
+    if not is_last():
+        return  # 非实时 bar，跳过执行
+
+    # 只在实时 bar 执行下单逻辑
+    ...
+
+# ❌ 问题版本 (iquant_qlib.py - 修复前)
+def handlebar(ContextInfo):
+    # 直接开始轮询和下单，没有检查 is_last_bar()
+    if getattr(ContextInfo, "_polling_started", False):
+        return
+    ...
+```
+
+#### 其他发现的问题
+
+1. **`ContextInfo.set_account()` 调用不必要**
+   - 成功案例只设置 `ContextInfo.accid = ACCOUNT_ID`
+   - 不需要额外调用 `set_account()` 方法
+
+2. **缺少诊断日志**
+   - 无法确认是否在正确的 bar 上执行
+   - 无法验证账户设置是否生效
+
+#### 修复方案
+
+1. **添加 `is_last_bar()` 检查**（关键修复）
+```python
+def handlebar(ContextInfo):
+    # 获取 is_last_bar 函数
+    is_last_bar_func = getattr(ContextInfo, 'is_last_bar', lambda: True)
+    is_last = is_last_bar_func()
+
+    # 只在实时 bar 执行
+    if not is_last:
+        print(f"[DEBUG] 非实时 bar，跳过执行")
+        return
+```
+
+2. **移除 `set_account()` 调用**
+```python
+def init(ContextInfo):
+    if ACCOUNT_ID:
+        ContextInfo.accid = ACCOUNT_ID
+        # ❌ 移除这行: ContextInfo.set_account(ACCOUNT_ID)
+```
+
+3. **增强诊断日志**
+```python
+# handlebar 入口诊断
+print(f"[DEBUG][handlebar] barpos={ContextInfo.barpos}, "
+      f"is_last_bar={is_last}, accid={ContextInfo.accid}")
+
+# 下单前账户验证
+test_positions = get_trade_detail_data(acc_id, ACCOUNT_TYPE, "position")
+print(f"[DEBUG] 账户验证成功，当前持仓 {len(test_positions)} 条")
+
+# passorder 详细诊断
+print(f"[DEBUG][passorder] 准备调用 passorder")
+print(f"[DEBUG][passorder] 参数: code={code}, qty={qty}, accid={acc_id}")
+ret = passorder(...)
+print(f"[DEBUG][passorder] 返回值: {ret} ({'成功' if ret > 0 else '失败'})")
+```
+
+#### 验证结果
+
+修复后在交易时间内测试：
+- ✅ `is_last_bar=True` 确认在实时 bar 执行
+- ✅ passorder 返回值 > 0（成功）
+- ✅ 订单成功进入券商系统
+- ✅ iQuant 客户端【委托】列表中可见订单
+- ✅ 订单正常成交
+
+#### 经验教训
+
+1. **iQuant 策略生命周期**
+   - `handlebar()` 会先执行历史回放，再执行实时 bar
+   - **必须使用 `is_last_bar()` 区分**历史数据和实时数据
+   - 在历史 bar 上的交易操作会被静默忽略
+
+2. **passorder 返回值含义**
+   - 返回 `0`：下单失败，订单未进入系统
+   - 返回 `> 0`：下单成功，返回值通常是委托号
+   - **但在非实时 bar 上调用会返回 0，且不会有任何错误提示**
+
+3. **调试实盘问题的要点**
+   - 对比成功案例的完整流程，不只是 API 调用
+   - 检查执行时机（历史 vs 实时）
+   - 添加详细的上下文诊断日志
+   - 验证环境状态（账户、时间、bar 类型等）
+
+4. **iQuant 回调函数触发条件**
+   - 回调函数只在实盘模式 + 实时 bar 上触发
+   - 历史回放阶段不会触发任何回调
+   - 如果回调不触发，首先检查 `is_last_bar()`
+
+#### 相关文件
+
+- `examples/iquant_qlib.py` - 已修复的实盘下单脚本
+- `examples/iquant_lizi.py` - 成功案例（参考实现）
+- `examples/live_daily_predict.py` - qlib 侧实盘预测脚本
+
+#### 相关提交
+
+- `43ef5eeb` - fix: 修复 iQuant 实盘下单失败问题
