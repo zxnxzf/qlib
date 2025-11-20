@@ -237,7 +237,40 @@ def _read_positions(path: Optional[str]) -> Dict[str, float]:
     if code_col not in df.columns or pos_col not in df.columns:
         raise ValueError(f"positions file must contain columns: code, position/pos; got {df.columns}")
     df = df[[code_col, pos_col]].dropna()
-    return {str(r[code_col]).strip(): float(r[pos_col]) for _, r in df.iterrows()}
+
+    def _normalize_pos_code(code: str) -> str:
+        if code is None:
+            return ""
+        s = str(code).strip().upper()
+        if not s:
+            return ""
+        if s.endswith(".0"):
+            s = s[:-2]
+        if "." in s:
+            left, right = s.split(".", 1)
+            if left.isdigit() and (not right or right.isdigit()):
+                s = left
+        if s.isdigit() and 0 < len(s) < 6:
+            s = s.zfill(6)
+        if s.endswith(".SH") or s.endswith(".SZ"):
+            return s
+        if s.startswith("SH") or s.startswith("SZ"):
+            return s
+        if len(s) == 6 and s.isdigit():
+            if s[0] in {"6", "5", "9"}:
+                return f"SH{s}"
+            if s[0] in {"0", "3"}:
+                return f"SZ{s}"
+        return s
+
+    holdings = {}
+    for _, row in df.iterrows():
+        code = _normalize_pos_code(row[code_col])
+        if not code:
+            continue
+        holdings[code] = float(row[pos_col])
+    print(f"[live] 读取持仓，共 {len(holdings)} 只，示例: {list(holdings)[:5]}")
+    return holdings
 
 
 def _read_quotes(path: Optional[str]) -> Dict[str, Dict[str, float]]:
@@ -252,9 +285,27 @@ def _read_quotes(path: Optional[str]) -> Dict[str, Dict[str, float]]:
     for col in required:
         if col not in df.columns:
             raise ValueError(f"quotes file missing column: {col}")
+    def _normalize_quote_code(code: str) -> str:
+        if code is None:
+            return ""
+        s = str(code).strip().upper()
+        if not s:
+            return ""
+        if "." in s:
+            left, right = s.split(".", 1)
+            if len(left) == 6 and left.isdigit() and right in {"SH", "SZ"}:
+                return f"{right}{left}"
+        if s.startswith("SH") or s.startswith("SZ"):
+            return s
+        if len(s) == 6 and s.isdigit():
+            return s
+        return s
+
     records = {}
     for _, r in df.iterrows():
-        code = str(r["code"]).strip()
+        code = _normalize_quote_code(r["code"])
+        if not code:
+            continue
         records[code] = {
             "last": float(r.get("last", float("nan"))),
             "bid1": float(r.get("bid1", float("nan"))) if "bid1" in df.columns else float("nan"),
@@ -262,6 +313,7 @@ def _read_quotes(path: Optional[str]) -> Dict[str, Dict[str, float]]:
             "high_limit": float(r.get("high_limit", float("nan"))) if "high_limit" in df.columns else float("nan"),
             "low_limit": float(r.get("low_limit", float("nan"))) if "low_limit" in df.columns else float("nan"),
         }
+    print(f"[live] 读取报价，共 {len(records)} 只，示例: {list(records)[:5]}")
     return records
 
 
@@ -433,7 +485,7 @@ class LiveDailyPredictionPipeline(DailyPredictionPipeline):
             try:
                 position.fill_stock_value(start_time=self.prediction_cfg.prediction_date, freq=self.trading_cfg.trade_freq)
             except Exception as err:
-                print(f"   [警告] 无法补全持仓价格: {err}")
+                print(f"   [提示] 本地历史数据缺失({err})，将使用实时报价补齐持仓价格")
             self._ensure_position_prices(position, tradable_df)
 
         order_generator = OrderGenWOInteract()
@@ -626,11 +678,25 @@ def main(argv=None) -> bool:
     pred_df = pipeline._attach_market_data(pred_df)
     pred_df = pipeline._select_buyable_topk(pred_df)
 
+    req_cols = ["instrument", "score", "target_weight"]
+    req_df = pred_df[req_cols].copy()
+    holding_symbols = set(holdings.keys())
+    candidate_symbols = set(req_df["instrument"].dropna().tolist())
+    extra_symbols = sorted(holding_symbols - candidate_symbols)
+    if extra_symbols:
+        extra_df = pd.DataFrame(
+            {
+                "instrument": extra_symbols,
+                "score": [float("nan")] * len(extra_symbols),
+                "target_weight": [float("nan")] * len(extra_symbols),
+            }
+        )
+        req_df = pd.concat([req_df, extra_df], ignore_index=True)
+        print(f"[live] 附加持仓代码 {len(extra_symbols)} 只以便获取实时报价: {extra_symbols[:5]}")
+
     symbols_path = Path(symbols_out)
     symbols_path.parent.mkdir(parents=True, exist_ok=True)
-    symbols_path.write_text(
-        pred_df[["instrument", "score", "target_weight"]].to_csv(index=False), encoding="utf-8-sig"
-    )
+    symbols_path.write_text(req_df.to_csv(index=False), encoding="utf-8-sig")
     print(f"[live] symbols_req -> {symbols_path}")
     # 写 state：symbols_ready
     state_path.parent.mkdir(parents=True, exist_ok=True)
