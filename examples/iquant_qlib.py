@@ -161,19 +161,60 @@ def _extract_order_error(ret) -> str:
     return ""
 
 
-def _call_order_shares(code, qty, price, ContextInfo):
+def _call_order_shares(code, qty, price, order_id, ContextInfo):
+    """使用 passorder 下单，格式与 iquant_lizi.py 完全一致"""
     acc_id = getattr(ContextInfo, "accid", None) or (ACCOUNT_ID or None)
     is_sell = qty < 0
     opType = 24 if is_sell else 23
     volume = abs(qty)
-    if USE_LIMIT_PRICE and price is not None and price > 0:
-        prType = 0
-        use_price = float(price)
-    else:
-        prType = 4
-        use_price = -1
-    print(f"[DEBUG] order code={code}, qty={qty}, opType={opType}, prType={prType}, price={use_price}, accid={acc_id}")
-    ret = passorder(opType, 1101, acc_id, code, prType, use_price, volume, 'qlib_batch', 1, '', ContextInfo)
+    prType = 5  # 最新价
+    use_price = -1
+
+    # ========== passorder 调用前诊断 ==========
+    print(f"\n{'='*60}")
+    print(f"[DEBUG][passorder] ===== 准备调用 passorder =====")
+    print(f"[DEBUG][passorder] 股票代码: {code}")
+    print(f"[DEBUG][passorder] 数量: {qty} (volume={volume})")
+    print(f"[DEBUG][passorder] 方向: {'卖出' if is_sell else '买入'} (opType={opType})")
+    print(f"[DEBUG][passorder] 价格类型: prType={prType} (5=最新价)")
+    print(f"[DEBUG][passorder] 价格: {use_price}")
+    print(f"[DEBUG][passorder] 账户: {acc_id}")
+    print(f"[DEBUG][passorder] ContextInfo 类型: {type(ContextInfo)}")
+    print(f"[DEBUG][passorder] ContextInfo.accid: {getattr(ContextInfo, 'accid', 'NOT SET')}")
+
+    # 检查 passorder 函数是否存在
+    try:
+        passorder_exists = callable(passorder)
+        print(f"[DEBUG][passorder] passorder 函数存在: {passorder_exists}")
+    except NameError:
+        print(f"[ERROR][passorder] ❌ passorder 函数不存在！")
+        return None
+
+    print(f"[DEBUG][passorder] 开始调用 passorder...")
+    print(f"{'='*60}\n")
+
+    # ========== 调用 passorder ==========
+    ret = passorder(opType, 1101, acc_id, code, prType, use_price, volume, 'qlib_live', 1, '', ContextInfo)
+
+    # ========== passorder 调用后诊断 ==========
+    print(f"\n{'-'*60}")
+    print(f"[DEBUG][passorder] ===== passorder 执行完毕 =====")
+    print(f"[DEBUG][passorder] 返回值类型: {type(ret)}")
+    print(f"[DEBUG][passorder] 返回值: {ret}")
+
+    if hasattr(ret, '__dict__'):
+        print(f"[DEBUG][passorder] 返回对象属性: {ret.__dict__}")
+
+    if isinstance(ret, int):
+        if ret > 0:
+            print(f"[DEBUG][passorder] ✅ 返回 {ret} (>0)，可能成功")
+        elif ret == 0:
+            print(f"[DEBUG][passorder] ❌ 返回 0，下单失败（订单未进入系统）")
+        else:
+            print(f"[DEBUG][passorder] ❌ 返回 {ret} (<0)，下单失败")
+
+    print(f"{'-'*60}\n")
+
     return ret
 
 
@@ -211,16 +252,14 @@ def _place_orders(df: pd.DataFrame, ContextInfo, version: str):
             continue
 
         try:
-            result = _call_order_shares(code, final_qty, price, ContextInfo)
+            # ✅ 修复：passorder 无返回值，不应依赖返回值判断成功
+            # 根据 iQuant API 文档，passorder 是无返回值函数，下单成功与否需要通过查询委托来确认
+            _call_order_shares(code, final_qty, price, oid, ContextInfo)
+            print(f"[iQuant] 已发送下单请求 {code} {side} {abs(final_qty)} 股 (order_id={oid}, ver={version})")
+            print(f"[iQuant][INFO] 请在 iQuant 客户端查看【委托】确认订单是否成功")
         except Exception as err:
-            warn = str(err)
-        else:
-            warn = "" if result in (None, 0) else _extract_order_error(result)
+            print(f"[iQuant][ERROR] {code} {side} {abs(final_qty)} 股 下单异常: {err} (order_id={oid}, ver={version})")
 
-        if warn:
-            print(f"[iQuant][WARN] {code} {side} {abs(final_qty)} 股 未成交: {warn} (order_id={oid}, ver={version})")
-        else:
-            print(f"[iQuant] 已提交 {code} {side} {abs(final_qty)} 股 (order_id={oid}, ver={version})")
         _DONE_IDS.add(oid)
 
 
@@ -473,6 +512,26 @@ def _convert_quotes(raw, symbols, context_info=None):
     return pd.DataFrame()
 
 
+def _create_mock_quotes(symbols):
+    """创建模拟行情数据（用于非交易时间测试）"""
+    import random
+    rows = []
+    for code in symbols:
+        ncode = _normalize_code(code)
+        # 生成模拟价格（10-50元之间）
+        base_price = random.uniform(10.0, 50.0)
+        rows.append({
+            "code": ncode,
+            "last": base_price,
+            "bid1": base_price * 0.999,  # 买一价略低
+            "ask1": base_price * 1.001,  # 卖一价略高
+            "high_limit": base_price * 1.10,  # 涨停价
+            "low_limit": base_price * 0.90,   # 跌停价
+        })
+    print(f"[INFO] 创建了 {len(rows)} 条模拟行情数据")
+    return pd.DataFrame(rows)
+
+
 def _export_quotes(ContextInfo, version: str) -> bool:
     symbols = _load_symbols()
     if not symbols:
@@ -483,7 +542,12 @@ def _export_quotes(ContextInfo, version: str) -> bool:
         if os.path.isfile(QUOTES_CSV_ABS_PATH):
             print("[INFO] quotes file already exists, treated as ready")
             return True
-    df = _convert_quotes(data or {}, symbols, context_info=ContextInfo)
+        # 非交易时间，创建模拟行情数据
+        print("[WARN] get_full_tick 返回空数据（可能非交易时间），创建模拟行情...")
+        df = _create_mock_quotes(symbols)
+    else:
+        df = _convert_quotes(data or {}, symbols, context_info=ContextInfo)
+
     if df.empty:
         print("[WARN] quotes dataframe empty")
         return False
@@ -539,6 +603,32 @@ def _process_state(ContextInfo):
 
         try:
             print(f"[iQuant] 检测到 phase=orders_ready，开始执行订单...")
+
+            # ========== 账户和环境验证 ==========
+            import datetime
+            print(f"[DEBUG][orders] 当前时间: {datetime.datetime.now()}")
+            print(f"[DEBUG][orders] ContextInfo.accid: {getattr(ContextInfo, 'accid', 'NOT SET')}")
+            print(f"[DEBUG][orders] ContextInfo 类型: {type(ContextInfo)}")
+            print(f"[DEBUG][orders] ACCOUNT_ID: {ACCOUNT_ID}")
+            print(f"[DEBUG][orders] ACCOUNT_TYPE: {ACCOUNT_TYPE}")
+
+            # 验证账户是否可访问
+            acc_id = getattr(ContextInfo, "accid", None) or ACCOUNT_ID
+            if not acc_id:
+                print(f"[ERROR][orders] 账户 ID 未设置！")
+            else:
+                print(f"[DEBUG][orders] 使用账户 ID: {acc_id}")
+                # 尝试查询持仓验证账户
+                try:
+                    print(f"[DEBUG][orders] 尝试查询账户持仓以验证账户...")
+                    test_positions = get_trade_detail_data(acc_id, ACCOUNT_TYPE, "position")
+                    if test_positions:
+                        print(f"[DEBUG][orders] ✅ 账户验证成功，当前持仓 {len(test_positions)} 条")
+                    else:
+                        print(f"[WARN][orders] 账户查询返回空（可能正常）")
+                except Exception as verify_err:
+                    print(f"[WARN][orders] 账户验证失败: {verify_err}")
+
             df = getattr(ContextInfo, "_qlib_df", None)
             if df is None:
                 df = _load_orders()
@@ -564,12 +654,21 @@ def _process_state(ContextInfo):
 
 # ---------- QMT lifecycle ----------
 def init(ContextInfo):
+    """策略加载后调用一次：设置账户并提前缓存 CSV"""
     if ACCOUNT_ID:
         ContextInfo.accid = ACCOUNT_ID
+        # ❌ 移除 set_account() 调用，与成功案例保持一致
+        print(f"[DEBUG][init] 设置账户 ID: {ACCOUNT_ID}")
+    else:
+        print(f"[WARN][init] ACCOUNT_ID 未配置")
+
+    print(f"[DEBUG][init] ContextInfo.accid = {getattr(ContextInfo, 'accid', 'NOT SET')}")
+
     ContextInfo._qlib_df = None
     ContextInfo._polling_started = False
     try:
         ContextInfo._qlib_df = _load_orders()
+        print(f"[DEBUG][init] 预加载订单 CSV 成功")
     except Exception as exc:
         print(f"[iQuant][ERROR] init load orders failed: {exc}")
         ContextInfo._qlib_df = None
@@ -577,8 +676,25 @@ def init(ContextInfo):
 
 def handlebar(ContextInfo):
     """每个 bar 调用一次，首次调用时启动主动轮询"""
+    # ========== 关键 DEBUG：bar 状态诊断 ==========
+    ts_func = getattr(ContextInfo, 'get_bar_timetag', None)
+    ts = ts_func(ContextInfo.barpos) if callable(ts_func) else None
+    is_last_bar_func = getattr(ContextInfo, 'is_last_bar', lambda: True)
+    is_last = is_last_bar_func()
+
+    print(f"[DEBUG][handlebar] barpos={getattr(ContextInfo, 'barpos', 'N/A')}, "
+          f"timestamp={ts}, is_last_bar={is_last}, accid={getattr(ContextInfo, 'accid', 'NOT SET')}")
+
+    # ✅ 关键检查：只在实时 bar 执行，防止在历史回放阶段下单
+    if not is_last:
+        print(f"[DEBUG][handlebar] 非实时 bar，跳过执行")
+        return
+
+    print(f"[DEBUG][handlebar] ✅ 确认为实时 bar，继续执行")
+
     # 只在首次调用时启动轮询
     if getattr(ContextInfo, "_polling_started", False):
+        print(f"[DEBUG][handlebar] 轮询已启动，跳过")
         return
 
     ContextInfo._polling_started = True
@@ -605,3 +721,63 @@ def handlebar(ContextInfo):
         print(f"[iQuant][WARN] 达到最大轮询次数 {MAX_POLL_COUNT}，停止轮询")
 
     print("[iQuant] ========== 轮询结束 ==========")
+
+
+# ---------- 订单状态回调函数 ----------
+def orderError_callback(ContextInfo, orderArgs, errMsg):
+    """
+    下单异常时的回调函数
+    当 passorder 等下单函数执行失败时，iQuant 会自动调用此函数
+    """
+    print("\n" + "="*60)
+    print("[iQuant][订单异常] 下单失败！")
+    print(f"[iQuant][订单异常] 错误信息: {errMsg}")
+    print(f"[iQuant][订单异常] 订单参数: {orderArgs}")
+    if hasattr(orderArgs, '__dict__'):
+        print(f"[iQuant][订单异常] 订单详情: {orderArgs.__dict__}")
+    print("="*60 + "\n")
+
+
+def order_callback(ContextInfo, orderInfo):
+    """
+    委托状态变化时的回调函数
+    当订单状态有变化时（如已报、已成、已撤等），iQuant 会自动调用此函数
+    """
+    print("\n" + "-"*60)
+    print("[iQuant][委托回调] 委托状态变化")
+    if hasattr(orderInfo, 'm_strInstrumentID'):
+        code = getattr(orderInfo, 'm_strInstrumentID', 'N/A')
+        status = getattr(orderInfo, 'm_nOrderStatus', 'N/A')  # 委托状态
+        msg = getattr(orderInfo, 'm_strStatusMsg', '')  # 状态消息
+        order_id = getattr(orderInfo, 'm_strOrderSysID', 'N/A')  # 委托号
+        remark = getattr(orderInfo, 'm_strRemark', '')  # 用户自定义ID (userOrderId)
+        print(f"[iQuant][委托回调] 股票代码: {code}")
+        print(f"[iQuant][委托回调] 委托号: {order_id}")
+        print(f"[iQuant][委托回调] 用户ID: {remark}")
+        print(f"[iQuant][委托回调] 委托状态: {status} - {msg}")
+    else:
+        print(f"[iQuant][委托回调] 委托信息: {orderInfo}")
+    print("-"*60 + "\n")
+
+
+def deal_callback(ContextInfo, dealInfo):
+    """
+    成交状态变化时的回调函数
+    当订单有成交时，iQuant 会自动调用此函数
+    """
+    print("\n" + "+"*60)
+    print("[iQuant][成交回调] 订单成交！")
+    if hasattr(dealInfo, 'm_strInstrumentID'):
+        code = getattr(dealInfo, 'm_strInstrumentID', 'N/A')
+        price = getattr(dealInfo, 'm_dPrice', 'N/A')  # 成交价格
+        volume = getattr(dealInfo, 'm_nVolume', 'N/A')  # 成交数量
+        order_id = getattr(dealInfo, 'm_strOrderSysID', 'N/A')  # 委托号
+        remark = getattr(dealInfo, 'm_strRemark', '')  # 用户自定义ID
+        print(f"[iQuant][成交回调] 股票代码: {code}")
+        print(f"[iQuant][成交回调] 委托号: {order_id}")
+        print(f"[iQuant][成交回调] 用户ID: {remark}")
+        print(f"[iQuant][成交回调] 成交价格: {price}")
+        print(f"[iQuant][成交回调] 成交数量: {volume}")
+    else:
+        print(f"[iQuant][成交回调] 成交信息: {dealInfo}")
+    print("+"*60 + "\n")
