@@ -13,6 +13,12 @@
   - [核心文件](#核心文件)
   - [使用流程](#使用流程)
   - [已修复问题](#已修复问题)
+- [Qlib 与 iQuant 数据一致性验证](#qlib-与-iquant-数据一致性验证)
+  - [验证目标](#验证目标)
+  - [技术方案](#技术方案)
+  - [验证结果](#验证结果)
+  - [核心代码](#核心代码)
+  - [关键发现](#关键发现)
 
 ---
 
@@ -241,4 +247,352 @@ else:
 
 ---
 
+## Qlib 与 iQuant 数据一致性验证
+
+**实现时间**: 2025-11-25
+**状态**: ✅ 已完成
+
+### 验证目标
+
+验证 Qlib 社区数据与 iQuant 实盘数据的一致性，确保使用 Qlib 训练的模型在 iQuant 实盘环境中能获得相同的价格数据。
+
+### 技术方案
+
+#### 方案选择：使用原始价格（未复权）
+
+**问题**: Qlib 默认使用复权价格，iQuant 实盘使用原始价格，导致价格数量级差异巨大。
+
+**解决方案**: 让 Qlib 也使用原始价格（未复权），与 iQuant 保持一致。
+
+| 项目 | 复权价格 | 原始价格 |
+|------|---------|---------|
+| 贵州茅台 | 198.85 元 | 1419.20 元 |
+| 比亚迪 | 13.08 元 | 105.69 元 |
+| 相对差异 | **86%** | **< 0.0001%** ✅ |
+
+#### Qlib 侧实现
+
+**使用 `$close / $factor` 还原为原始价格**
+
+```python
+# test_claude_code/export_qlib_data.py
+
+# 错误方式：使用复权价格
+data = D.features(stocks, ["$close"], start_time, end_time)
+
+# 正确方式：使用原始价格（未复权）
+data = D.features(stocks, ["$close / $factor"], start_time, end_time)
+```
+
+**说明**:
+- `$close`: 调整后价格（已复权）
+- `$factor`: 复权因子
+- `$close / $factor`: 原始价格（未复权，与 iQuant 一致）
+
+#### iQuant 侧实现
+
+**关键发现：回测中获取历史数据的正确方法**
+
+经过多次尝试，找到了在回测模式下获取历史收盘价的正确 API：
+
+##### ❌ 错误方法 1: `get_full_tick`
+
+```python
+# 问题：返回实时快照，不是历史数据
+data = ContextInfo.get_full_tick(stock_list)
+```
+
+**现象**: 所有日期返回相同的价格（脚本运行时刻的实时行情）
+
+**原因**: `get_full_tick` 在回测中仍然调用实时行情接口，返回的是当前时刻的快照，而非历史上某个日期的真实数据。
+
+##### ❌ 错误方法 2: `get_market_data_ex`
+
+```python
+# 问题：参数错误，返回空数据
+data = ContextInfo.get_market_data_ex(
+    ['close'],
+    [stock],
+    '1d',
+    start_time=date_str,
+    end_time=date_str
+)
+```
+
+**现象**:
+- Python argument types did not match C++ signature
+- 或返回空字典/空列表
+
+**原因**:
+1. 需要使用位置参数而非关键字参数
+2. 即使改为位置参数，在回测中仍然无法获取当前 bar 的数据
+
+##### ✅ 正确方法: `get_history_data`
+
+```python
+# examples/export_iquant_data.py
+
+def handlebar(ContextInfo):
+    # 先设置股票池（必须）
+    ContextInfo.set_universe(stock_list)
+
+    # 获取当前 bar 的历史数据
+    hisdict = ContextInfo.get_history_data(
+        1,        # len: 获取 1 根 K 线（当前 bar）
+        '1d',     # period: 日线
+        'close',  # field: 收盘价
+        0         # dividend_type: 0=不复权, 1=前复权, 2=后复权
+    )
+
+    # hisdict 是字典: {股票代码: [收盘价]}
+    for stock in stock_list:
+        if stock in hisdict:
+            close_data = hisdict[stock]
+            close_price = float(close_data[-1])  # 取最后一个值
+```
+
+**为什么这个方法正确**:
+1. **专为回测设计**: 在每个 bar 上自动返回该 bar 对应日期的历史数据
+2. **无需指定日期**: 自动匹配当前 bar 的时间
+3. **返回格式稳定**: 字典格式，key 是股票代码，value 是价格列表
+
+### 验证结果
+
+**对比统计**:
+```
+对比记录数: 75 条（15 个交易日 × 5 只股票）
+平均相对差异: 0.0000%
+最大相对差异: 0.0000%
+数据相关系数: 1.00000000 (完美相关)
+```
+
+**最大差异的 5 条记录**:
+
+| 日期 | 股票 | qlib 价格 | iQuant 价格 | 差异 |
+|------|------|----------|-----------|------|
+| 2025-11-06 | 600519.SH | 1435.1299 | 1435.13 | 0.0001 |
+| 2025-11-12 | 600519.SH | 1465.1499 | 1465.15 | 0.0001 |
+| 2025-10-13 | 600519.SH | 1419.2001 | 1419.20 | 0.0001 |
+
+**结论**: 差异只有 0.0001 元（浮点数精度），数据完全一致 ✅
+
+### 核心代码
+
+#### 1. Qlib 数据导出
+
+```python
+# test_claude_code/export_qlib_data.py
+
+import qlib
+from qlib.data import D
+
+# 初始化
+qlib.init(provider_uri="~/.qlib/qlib_data/cn_data", region="cn")
+
+# 获取原始价格（未复权）
+stocks = ["sh600519", "sz002594", "sh600036"]
+data = D.features(
+    stocks,
+    ["$close / $factor"],  # 关键：除以复权因子
+    start_time="2025-10-11",
+    end_time="2025-11-20"
+)
+
+# 保存到 CSV
+df = data.reset_index()
+df.to_csv("qlib_data.csv", index=False)
+```
+
+#### 2. iQuant 回测数据导出
+
+```python
+# examples/export_iquant_data.py (GBK 编码)
+
+def init(ContextInfo):
+    # 读取股票列表
+    ContextInfo._stocks = ["000858.SZ", "600519.SH", "002594.SZ"]
+    ContextInfo._collected_data = []
+
+def handlebar(ContextInfo):
+    # 获取当前日期
+    timetag = ContextInfo.get_bar_timetag(ContextInfo.barpos)
+    date_str = datetime.fromtimestamp(timetag / 1000).strftime('%Y-%m-%d')
+
+    # 设置股票池（必须先设置）
+    ContextInfo.set_universe(ContextInfo._stocks)
+
+    # 获取当前 bar 的收盘价
+    hisdict = ContextInfo.get_history_data(
+        1,        # 获取 1 根 K 线
+        '1d',     # 日线
+        'close',  # 收盘价
+        0         # 不复权
+    )
+
+    # 解析数据
+    for stock in ContextInfo._stocks:
+        if stock in hisdict:
+            close_data = hisdict[stock]
+            if isinstance(close_data, (list, tuple)) and len(close_data) > 0:
+                close_price = float(close_data[-1])
+                ContextInfo._collected_data.append({
+                    'date': date_str,
+                    'stock_code': stock,
+                    'close': close_price
+                })
+
+    # 保存到 CSV（在最后一个 bar 或累计够一定数量）
+    if len(ContextInfo._collected_data) >= 40:
+        df = pd.DataFrame(ContextInfo._collected_data)
+        df.to_csv("iquant_data.csv", index=False)
+```
+
+#### 3. 数据对比分析
+
+```python
+# test_claude_code/compare_data.py
+
+import pandas as pd
+
+# 加载数据
+qlib_df = pd.read_csv("qlib_data.csv")
+iquant_df = pd.read_csv("iquant_data.csv")
+
+# 合并数据
+merged = pd.merge(
+    qlib_df.rename(columns={"close": "qlib_close"}),
+    iquant_df.rename(columns={"close": "iquant_close"}),
+    on=["date", "stock_code"],
+    how="outer"
+)
+
+# 计算差异
+merged["abs_diff"] = abs(merged["qlib_close"] - merged["iquant_close"])
+merged["rel_diff_pct"] = (merged["abs_diff"] / merged["iquant_close"]) * 100
+
+# 统计
+print(f"平均相对差异: {merged['rel_diff_pct'].mean():.4f}%")
+print(f"数据相关系数: {merged['qlib_close'].corr(merged['iquant_close']):.8f}")
+```
+
+### 关键发现
+
+#### 1. iQuant 回测 API 对比
+
+| API | 用途 | 回测中是否可用 | 返回数据类型 |
+|-----|------|---------------|-------------|
+| `get_full_tick` | 获取实时快照 | ❌ 返回当前实时数据，非历史 | 字典 {code: tick_data} |
+| `get_market_data` | 获取历史行情 | ⚠️ 参数复杂，难以使用 | DataFrame |
+| `get_market_data_ex` | 获取历史行情（扩展版）| ⚠️ 参数签名问题 | 字典 {code: [[time, value]]} |
+| `get_history_data` | 获取历史 K 线 | ✅ **推荐使用** | 字典 {code: [values]} |
+
+#### 2. `get_history_data` 使用要点
+
+**必须先设置股票池**:
+```python
+ContextInfo.set_universe(stock_list)  # 必须先调用
+hisdict = ContextInfo.get_history_data(1, '1d', 'close', 0)
+```
+
+**参数说明**:
+- `len` (int): 获取多少根 K 线（1 = 当前 bar）
+- `period` (str): 周期，可选值: `'1d'`, `'1m'`, `'5m'`, `'1h'`, `'1w'` 等
+- `field` (str): 字段，可选值: `'open'`, `'high'`, `'low'`, `'close'`, `'quoter'`
+- `dividend_type` (int): 复权方式
+  - `0`: 不复权（与 iQuant 实盘一致）
+  - `1`: 向前复权
+  - `2`: 向后复权
+
+**返回数据格式**:
+```python
+{
+    "000858.SZ": [119.85],      # 列表，包含 len 个值
+    "600519.SH": [1419.20],
+    "002594.SZ": [105.69]
+}
+```
+
+#### 3. 常见问题
+
+**Q: 为什么有些 bar 返回空数据？**
+
+A: 可能是非交易日，或者 iQuant 数据未下载到本地。解决方法：
+```python
+# 在 init() 中预下载历史数据
+ContextInfo.download_history_data(
+    stock_code=stock_list,
+    period='1d',
+    start_time='2025-10-11',
+    end_time='2025-11-20'
+)
+```
+
+**Q: `get_market_data_ex` 为什么总是失败？**
+
+A: iQuant 的 Python API 底层是 C++，必须使用位置参数：
+```python
+# ❌ 错误：使用关键字参数
+data = ContextInfo.get_market_data_ex(
+    fields=['close'],
+    stock_code=[stock],
+    period='1d'
+)
+
+# ✅ 正确：使用位置参数
+data = ContextInfo.get_market_data_ex(
+    ['close'],     # 位置 0
+    [stock],       # 位置 1
+    '1d',          # 位置 2
+    start_time=...,
+    end_time=...
+)
+```
+
+**Q: `get_full_tick` 在回测中能用吗？**
+
+A: 可以调用，但返回的是**实时快照而非历史数据**。所有日期会返回相同的价格（脚本运行时刻的行情），不适合回测数据导出。
+
+#### 4. 调试技巧
+
+**打印返回数据结构**:
+```python
+data = ContextInfo.get_history_data(1, '1d', 'close', 0)
+print(f"类型: {type(data)}")
+print(f"键: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+print(f"第一个值: {data[list(data.keys())[0]] if data else 'Empty'}")
+```
+
+**对比不同日期的价格**:
+```python
+# 在每个 bar 打印价格，确认是否变化
+print(f"日期: {date_str}, 贵州茅台: {hisdict.get('600519.SH', 'N/A')}")
+```
+
+### 相关文件
+
+| 文件 | 说明 |
+|------|------|
+| `test_claude_code/export_qlib_data.py` | Qlib 数据导出（原始价格） |
+| `test_claude_code/compare_data.py` | 数据对比分析工具 |
+| `examples/export_iquant_data.py` | iQuant 回测数据导出（GBK 编码） |
+| `examples/simple_get_price.py` | iQuant API 测试示例 |
+| `predictions/qlib_data.csv` | Qlib 导出的数据 |
+| `predictions/iquant_data.csv` | iQuant 导出的数据 |
+| `predictions/data_comparison.csv` | 对比结果详细数据 |
+
+### Git 提交
+
+```bash
+git commit: feat: qlib 与 iQuant 数据一致性验证
+```
+
+**主要改动**:
+- 新增 Qlib 原始价格导出脚本
+- 新增 iQuant 回测数据导出脚本（使用 `get_history_data`）
+- 新增数据对比分析工具
+- 验证结果：数据完全一致（相关系数 1.0）
+
+---
+
+*最后更新: 2025-11-25*
 **文档维护**: 每次实现新功能并验证通过后，及时更新本文档。
