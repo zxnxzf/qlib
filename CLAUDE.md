@@ -234,6 +234,46 @@ task:
 - 就是claude code你自己新建的测试脚本，放在test_claude_code的文件夹下吧，便于管理
 - 我这个项目用了anaconda的虚拟环境，虚拟环境的名字是qlib，注意执行的时候使用这个
 
+## 文档更新规范（重要）
+
+**每次实现新功能后必须更新文档！**
+
+### 文档更新要求
+
+1. **功能文档**: `docs/self/features.md`
+   - 这个文档用于记录项目中新增和改进的功能
+   - 每次实现新功能并经过测试验证后，必须立即更新此文档
+   - 确保代码更新和文档保持同步
+
+2. **更新内容包括**:
+   - 功能概述和实现时间
+   - 技术架构和设计方案
+   - 核心代码文件列表
+   - 使用流程和示例
+   - 已修复的问题（如果适用）
+   - 相关的 git 提交信息
+
+3. **更新时机**:
+   - 功能实现完成 → 测试验证通过 → **立即更新文档**
+   - 不要等到最后才更新，避免遗忘细节
+
+4. **文档格式**:
+   - 使用 Markdown 格式
+   - 添加清晰的标题和目录
+   - 使用代码块展示关键代码
+   - 添加流程图和表格辅助说明
+   - 标注功能状态（✅ 已完成、🚧 进行中、⚠️ 已知问题）
+
+### 示例
+
+参考 `docs/self/features.md` 中 "iQuant 实盘交易集成" 章节的格式，包含：
+- 功能概述
+- 技术架构（流程图 + 状态机表格）
+- 已实现功能（分模块列出）
+- 核心文件列表
+- 使用流程
+- 已修复问题
+
 ## qrun 工作流处理详细流程
 
 以 `examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158_2020_2025.yaml` 为例，`qrun` 的处理流程如下：
@@ -535,3 +575,156 @@ print(f"[DEBUG][passorder] 返回值: {ret} ({'成功' if ret > 0 else '失败'}
 #### 相关提交
 
 - `43ef5eeb` - fix: 修复 iQuant 实盘下单失败问题
+
+---
+
+### Feature #1: 实盘账户现金自动获取（已实现）
+
+**实现时间**: 2025-11-20
+**功能**: 从 iQuant 自动获取账户可用资金，替代配置文件中的固定值
+
+#### 背景问题
+
+在之前的实现中存在数据来源不一致的问题：
+- ✅ **持仓数据**：使用从 iQuant 读取的实际持仓
+- ❌ **账户现金**：使用配置文件的固定值（`total_cash=50000`）
+
+这导致：
+1. 无法反映真实账户余额
+2. 可能过度下单或资金使用不足
+3. 配置值与实际值冲突时，难以判断使用哪个
+
+#### 解决方案
+
+**原则**：配置值与实际数据冲突时，**优先使用从 iQuant 读取的实际数据**
+
+**实现：**
+
+##### 1. iQuant 侧 (`examples/iquant_qlib.py`)
+
+新增 `_fetch_account_cash()` 函数：
+```python
+def _fetch_account_cash(ContextInfo):
+    """获取账户可用资金"""
+    acc_id = ACCOUNT_ID or getattr(ContextInfo, "accid", None)
+
+    # 调用 iQuant API 获取账户信息
+    data = get_trade_detail_data(acc_id, ACCOUNT_TYPE, "account")
+
+    # 提取 m_dAvailable 字段（可用资金）
+    account_obj = data[0] if isinstance(data, (list, tuple)) else data
+    if hasattr(account_obj, 'm_dAvailable'):
+        cash = getattr(account_obj, 'm_dAvailable', None)
+        print(f"[INFO] ✅ 从 iQuant 获取账户现金: {cash:.2f} 元")
+        return float(cash)
+    return None
+```
+
+修改 `_convert_positions()` 添加 CASH 行：
+```python
+def _convert_positions(raw, cash=None):
+    # ... 处理持仓数据 ...
+
+    # 添加特殊的 CASH 行
+    if cash is not None:
+        cash_row = pd.DataFrame([{
+            "code": "CASH",
+            "position": float(cash),
+            "available": float(cash),
+            "cost_price": "",
+            "last_price": "",
+        }])
+        df = pd.concat([df, cash_row], ignore_index=True)
+    return df
+```
+
+导出的 `positions_live.csv` 格式：
+```csv
+code,position,available,cost_price,last_price
+SH600000,1000,1000,10.5,11.2
+SZ000001,500,500,15.3,16.1
+CASH,50000.00,50000.00,,
+```
+
+##### 2. qlib 侧 (`examples/live_daily_predict.py`)
+
+修改 `_read_positions()` 识别 CASH 行：
+```python
+def _read_positions(path):
+    # ... 读取 CSV ...
+
+    holdings = {}
+    cash = None
+
+    for _, row in df.iterrows():
+        code_raw = str(row[code_col]).strip().upper()
+
+        # 检查是否是 CASH 行
+        if code_raw == "CASH":
+            cash = float(row[pos_col])
+            print(f"[live] ✅ 从 positions_live.csv 读取账户现金: {cash:.2f} 元")
+            continue
+
+        # ... 处理普通持仓 ...
+
+    return holdings, cash  # 返回元组
+```
+
+使用实际现金初始化交易配置：
+```python
+def main():
+    # ... Phase0: 读取持仓 ...
+    holdings, cash_from_iquant = _read_positions(positions_path)
+
+    # 优先使用实际现金，否则回退到配置值
+    config_cash = trading_raw.get("total_cash", 50000)
+    if cash_from_iquant is not None:
+        actual_cash = cash_from_iquant
+        print(f"[live] ✅ 使用从 iQuant 读取的实际总资金: {actual_cash:.2f} 元")
+    else:
+        actual_cash = config_cash
+        print(f"[live] ⚠️  使用配置文件的默认总资金: {actual_cash:.2f} 元")
+
+    base_trading_cfg = TradingConfig(
+        total_cash=actual_cash,  # 使用实际现金
+        current_holdings=holdings,
+        # ...
+    )
+```
+
+#### 关键特性
+
+✅ **数据优先级**：实际 iQuant 数据 > 配置默认值
+✅ **明确日志**：清楚显示使用的是实际值还是配置值
+✅ **向后兼容**：如果 CASH 行不存在，自动回退到配置值
+✅ **一致性**：持仓和现金都使用从 iQuant 读取的实际值
+
+#### 预期日志输出
+
+**iQuant 侧：**
+```
+[DEBUG] _fetch_account_cash: acc_id=410015004039, ACCOUNT_TYPE=STOCK
+[DEBUG] calling get_trade_detail_data(acc_id=410015004039, account_type=STOCK, data_type='account')
+[DEBUG] 提取账户可用资金: 50000.0
+[INFO] ✅ 从 iQuant 获取账户现金: 50000.00 元
+[DEBUG] 添加 CASH 行: 可用资金=50000.0
+[INFO] 导出持仓 5 条 -> positions_live.csv
+```
+
+**qlib 侧：**
+```
+[live] ✅ 从 positions_live.csv 读取账户现金: 50000.00 元
+[live] 读取到持仓: 4 只股票
+[live] ✅ 使用从 iQuant 读取的实际总资金: 50000.00 元
+```
+
+#### 相关文件
+
+- `examples/iquant_qlib.py` - 新增账户现金获取逻辑 (lines 303-348, 432-459)
+- `examples/live_daily_predict.py` - 读取和使用实际现金 (lines 269-287, 633-683)
+
+#### API 参考
+
+- iQuant API: `get_trade_detail_data(accountID, ACCOUNT_TYPE, "account")` - 获取账户信息
+- 返回对象字段: `m_dAvailable` - 可用资金（浮点数）
+- 详细文档: `D:/国信iQuant策略交易平台/HTML/guosenPythonApiHelp/iQuant_Python_API_Doc.html`

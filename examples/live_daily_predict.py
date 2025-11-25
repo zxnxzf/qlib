@@ -42,53 +42,55 @@ from daily_predict import (  # noqa: E402  # 延迟导入
 DEFAULT_CONFIG = {
     "qlib_init": {
         "provider_uri": "~/.qlib/qlib_data/cn_data",  # 数据路径
-        "region": "cn",                                 # 市场区域
-        "kernels": 1,
-        "joblib_backend": "threading",
-        "maxtasksperchild": 1
+        "region": "cn",  # 市场区域
+        "kernels": 1,  # 进程池个数
+        "joblib_backend": "threading",  # joblib 后端类型
+        "maxtasksperchild": 1,  # 子进程最大任务数
     },
     "paths": {
-        "positions": "predictions/positions_live.csv",   # 持仓文件
-        "quotes": "predictions/quotes_live.csv",         # 当日行情（ask1/bid1/last/limits）
-        "symbols_out": "predictions/symbols_req.csv",    # Phase1 输出
-        "orders_out": "predictions/orders_to_exec.csv",  # Phase2 输出
-        "state": "predictions/state.json"                # 状态文件
+        "positions": "predictions/positions_live.csv",  # 持仓 CSV
+        "quotes": "predictions/quotes_live.csv",  # 实时报价 CSV
+        "symbols_out": "predictions/symbols_req.csv",  # Phase1 输出路径
+        "orders_out": "predictions/orders_to_exec.csv",  # Phase2 输出路径
+        "state": "predictions/state.json",  # 握手状态文件
     },
     "runtime": {
-        "version": None,    # 流水号；None 则自动用当前时间戳
-        "wait_secs": 300    # 等待 quotes_ready 超时时间（秒）
+        "version": None,  # 运行批次号
+        "wait_secs": 300,  # 等待下一阶段超时时间
     },
     "prediction": {
-        "experiment_id": "866149675032491302",
-        "recorder_id": "3d0e78192f384bb881c63b32f743d5f8",
-        "prediction_date": "auto",   # auto=用最新交易日(T-1)
-        "top_k": 20,
-        "min_score_threshold": 0.0,
-        "weight_method": "equal",
-        "provider_uri": "~/.qlib/qlib_data/cn_data",
-        "region": "cn",
-        "instruments": "csi300",
-        "dataset_class": "DatasetH",
-        "dataset_module": "qlib.data.dataset",
-        "handler_class": "Alpha158",
-        "handler_module": "qlib.contrib.data.handler",
-        "min_history_days": 120
+        "experiment_id": "866149675032491302",  # 实验 ID
+        "recorder_id": "3d0e78192f384bb881c63b32f743d5f8",  # recorder ID
+        "prediction_date": "auto",  # 预测日期（auto=最新交易日）
+        "top_k": 20,  # 选股数量
+        "min_score_threshold": 0.0,  # 评分阈值
+        "weight_method": "equal",  # 权重计算方式
+        "provider_uri": "~/.qlib/qlib_data/cn_data",  # 数据源
+        "region": "cn",  # 区域
+        "instruments": "csi300",  # 证券池
+        "dataset_class": "DatasetH",  # 数据集类型
+        "dataset_module": "qlib.data.dataset",  # 数据集模块
+        "handler_class": "Alpha158",  # Handler 类
+        "handler_module": "qlib.contrib.data.handler",  # Handler 模块
+        "min_history_days": 120,  # 最短历史窗口
     },
     "trading": {
-        "enable_trading": True,
-        "use_exchange_system": True,
-        "total_cash": 50000,
-        "max_stock_price": None,
-        "dropout_rate": 0.0,
-        "min_shares": 100,
-        "price_search_days": 5,
-        "risk_degree": 0.95
+        "enable_trading": True,  # 是否生成交易
+        "use_exchange_system": True,  # 是否使用 Exchange 系统
+        "total_cash": 50000,  # 资金规模
+        "max_stock_price": None,  # 股票价格上限
+        "dropout_rate": 0.0,  # TopK dropout 比例
+        "min_shares": 100,  # 单笔最小股数
+        "price_search_days": 5,  # 回溯价格天数
+        "risk_degree": 0.0001,  # 可用资金比例，账户有20万 * 10 ^ 3，预计使用20万
+        "n_drop": 3,  # TopkDropoutStrategy: 每次替换的股票数量（Dropout 换仓机制）
+        "hold_thresh": 1,  # TopkDropoutStrategy: 最短持有天数（持有天数控制，单位：交易日）
     },
     "data_update": {
-        "enable_auto_update": True,
-        "data_source_url": "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",
-        "download_timeout": 600,
-        "temp_dir": None,
+        "enable_auto_update": True,  # 是否自动更新数据
+        "data_source_url": "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",  # 数据源 URL
+        "download_timeout": 600,  # 下载超时
+        "temp_dir": None,  # 临时目录
     },
 }
 # ==============================================================
@@ -96,12 +98,15 @@ DEFAULT_CONFIG = {
 
 @dataclass
 class DataUpdateConfig:
-    enable_auto_update: bool = True
-    data_source_url: str = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
-    download_timeout: int = 600
-    temp_dir: Optional[str] = None
+    """描述数据自动更新所需的各项参数。"""
+
+    enable_auto_update: bool = True  # 是否启用自动更新逻辑
+    data_source_url: str = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"  # 默认数据源
+    download_timeout: int = 600  # 下载超时时间
+    temp_dir: Optional[str] = None  # 临时目录位置
 
     def get_temp_dir(self) -> Path:
+        """返回用于下载/解压的临时目录。"""
         if self.temp_dir:
             return Path(self.temp_dir).expanduser()
         return Path.home() / ".qlib" / "temp"
@@ -264,13 +269,24 @@ def _read_positions(path: Optional[str]) -> Dict[str, float]:
         return s
 
     holdings = {}
+    cash = None
+
     for _, row in df.iterrows():
+        code_raw = str(row[code_col]).strip().upper()
+
+        # 检查是否是 CASH 行
+        if code_raw == "CASH":
+            cash = float(row[pos_col])
+            print(f"[live] ✅ 从 positions_live.csv 读取账户现金: {cash:.2f} 元")
+            continue
+
         code = _normalize_pos_code(row[code_col])
         if not code:
             continue
         holdings[code] = float(row[pos_col])
+
     print(f"[live] 读取持仓，共 {len(holdings)} 只，示例: {list(holdings)[:5]}")
-    return holdings
+    return holdings, cash
 
 
 def _read_quotes(path: Optional[str]) -> Dict[str, Dict[str, float]]:
@@ -428,186 +444,421 @@ class LiveDailyPredictionPipeline(DailyPredictionPipeline):
             return float(price)
         return super()._resolve_price(exchange, order, trade_start, trade_end, base_df)
 
+    def _create_trade_calendar_for_single_day(self, trade_date: str):
+        """
+        为单日实盘创建 TradeCalendarManager
+
+        在实盘场景中，每天只需要生成一次订单，因此创建一个单日的交易日历。
+
+        参数：
+        :param trade_date: 交易日期字符串，格式：'YYYY-MM-DD'
+        :return: TradeCalendarManager 对象
+        """
+        from qlib.backtest.utils import TradeCalendarManager
+
+        return TradeCalendarManager(
+            freq="day",                           # 交易频率：日频
+            start_time=pd.Timestamp(trade_date),  # 交易开始时间
+            end_time=pd.Timestamp(trade_date),    # 交易结束时间（同一天=单日）
+        )
+
+    def _create_signal_from_predictions(self, pred_df: pd.DataFrame):
+        """
+        将预测 DataFrame 转换为 Signal 对象
+
+        TopkDropoutStrategy 需要 Signal 对象作为输入。Signal 期望的数据格式是
+        MultiIndex Series：(instrument, datetime) -> score
+
+        参数：
+        :param pred_df: 预测 DataFrame，必须包含 'instrument' 和 'score' 列
+        :return: Signal 对象
+        """
+        from qlib.backtest.signal import create_signal_from
+
+        # Signal 期望的格式是 MultiIndex: (instrument, datetime)
+        # 示例：
+        # instrument  datetime
+        # SH600000    2025-11-19    0.85
+        # SZ000001    2025-11-19    0.72
+        # dtype: float64
+
+        # 获取预测日期（T 日），信号使用 T-1 日的数据
+        pred_date = pd.Timestamp(self.prediction_cfg.prediction_date)
+        # 获取 T-1 日期（用于 signal 的 datetime 索引）
+        signal_date = pred_date - pd.Timedelta(days=1)
+
+        # 创建 MultiIndex Series
+        df_for_signal = pred_df[['instrument', 'score']].copy()
+        df_for_signal['datetime'] = signal_date
+        df_for_signal = df_for_signal.set_index(['instrument', 'datetime'])
+        signal_series = df_for_signal['score']
+
+        # 创建 Signal 对象（qlib 内部会将 Series 包装为 SignalWCache）
+        signal = create_signal_from(signal_series)
+
+        return signal
+
     def _generate_trading_orders(self, pred_df: pd.DataFrame):
         """覆写：使用 LiveExchange 将 quotes_live 注入 Exchange，再生成订单。"""
+        # ========== 第一步：检查交易配置，决定是否生成订单 ==========
+
+        # 检查 enable_trading 标志：如果为 False，则完全跳过交易生成
         if not self.trading_cfg.enable_trading:
             print("\n[提示] 交易生成被关闭，直接返回空结果")
+            # 计算价格匹配率和可交易股票数（用于统计）
             price_rate, tradable = self._price_stats(pred_df)
-            from daily_predict import TradingResult  # 延迟导入
+            from daily_predict import TradingResult  # 延迟导入避免循环依赖
 
+            # 返回空的 TradingResult，标记未使用 Exchange
             return TradingResult.empty(price_success_rate=price_rate, tradable_stocks=tradable, exchange_used=False)
 
+        # 检查 use_exchange_system 标志：如果为 False，则不使用 Exchange 系统
         if not self.trading_cfg.use_exchange_system:
             print("\n[提示] Exchange 系统关闭，直接返回空结果")
+            # 同样计算统计信息后返回空结果
             price_rate, tradable = self._price_stats(pred_df)
             from daily_predict import TradingResult
 
             return TradingResult.empty(price_success_rate=price_rate, tradable_stocks=tradable, exchange_used=False)
 
+        # ========== 第二步：验证预测数据有效性 ==========
+
         print("\n[info] 使用 LiveExchange + 实时报价生成订单...")
+        # 检查预测 DataFrame 是否为空
         if pred_df.empty:
             print("   [警告] 预测为空，不产生订单")
             from daily_predict import TradingResult
 
+            # 返回空结果，但标记使用了 Exchange（因为配置允许）
             return TradingResult.empty(exchange_used=True)
 
+        # ========== 第三步：过滤可交易标的 ==========
+
+        # 计算价格匹配率和总可交易股票数
         price_rate, tradable_total = self._price_stats(pred_df)
+        # 从预测结果中筛选出可交易的股票（排除涨跌停、停牌等）
+        # is_tradable 字段由前面的 _calculate_trading_weights() 设置
         tradable_df = pred_df[pred_df.get("is_tradable", False)].copy()
+        # 如果过滤后没有可交易标的，返回空结果
         if tradable_df.empty:
             print("   [警告] 没有可交易标的（涨跌停/停牌）")
             from daily_predict import TradingResult
 
             return TradingResult.empty(price_success_rate=price_rate, tradable_stocks=0, exchange_used=True)
 
+        # ========== 第四步：初始化 LiveExchange（注入实时行情） ==========
+
+        # 提取可交易股票代码列表，用于 Exchange，选择出来的topk
         stock_pool = tradable_df["instrument"].tolist()
+        # 交易开始时间：预测日期当天
         trade_start = pd.Timestamp(self.prediction_cfg.prediction_date)
+        # 交易结束时间：预测日期 + 1 天
         trade_end = trade_start + pd.Timedelta(days=1)
+        # 起始日期：需要回溯 price_search_days 天以获取历史价格数据
         start_date = (trade_start - pd.Timedelta(days=max(self.trading_cfg.price_search_days, 1))).strftime("%Y-%m-%d")
-        # 用 LiveExchange 注入 quotes_live
+
+        # 创建 LiveExchange 实例，将实时行情 quotes_live 注入
+        # LiveExchange 会优先使用 quotes_live 中的实时价格（bid1/ask1/last）
         exchange = LiveExchange(
-            quotes_live=self.quotes_live,
-            codes=stock_pool,
-            start_time=start_date,
-            end_time=trade_end.strftime("%Y-%m-%d"),
-            deal_price=self.trading_cfg.deal_price,
-            freq=self.trading_cfg.trade_freq,
+            quotes_live=self.quotes_live,  # 从 iQuant 读取的实时行情
+            codes=stock_pool,              # 可交易股票池
+            start_time=start_date,         # 数据起始时间
+            end_time=trade_end.strftime("%Y-%m-%d"),  # 数据结束时间
+            deal_price=self.trading_cfg.deal_price,   # 成交价类型（bid1/ask1/last 等）
+            freq=self.trading_cfg.trade_freq,         # 交易频率（day/1min 等）
         )
+
+        # ========== 第五步：初始化当前持仓 Position ==========
 
         from daily_predict import TradingResult  # 延迟导入避免循环
-        from qlib.backtest.position import Position  # 这里重用原 Position
-        from qlib.contrib.strategy.order_generator import OrderGenWOInteract
+        from qlib.backtest.position import Position  # 重用 qlib 的 Position 类
+        from qlib.contrib.strategy.order_generator import OrderGenWOInteract  # 订单生成器
 
+        # 创建 Position 对象，表示当前账户状态，从position_needed中去获取
         position = Position(
-            cash=self.trading_cfg.total_cash,
+            cash=self.trading_cfg.total_cash,  # 可用现金（从 iQuant 读取或配置默认值）
+            # 将持仓字典转换为 Position 需要的格式：{code: {"amount": shares}}
             position_dict={code: {"amount": amount} for code, amount in self.trading_cfg.current_holdings.items()},
         )
+
+        # 如果有持仓，需要填充持仓股票的当前价格，TODO: 这里我觉得应该先从实时报价中获取
         if self.trading_cfg.current_holdings:
             try:
+                # 尝试从本地历史数据填充持仓价格
                 position.fill_stock_value(start_time=self.prediction_cfg.prediction_date, freq=self.trading_cfg.trade_freq)
             except Exception as err:
+                # 如果本地数据缺失（常见于刚更新的数据），提示将使用实时报价
                 print(f"   [提示] 本地历史数据缺失({err})，将使用实时报价补齐持仓价格")
+            # 使用实时报价补齐持仓价格（从 quotes_live 或 tradable_df 中获取）
             self._ensure_position_prices(position, tradable_df)
 
-        order_generator = OrderGenWOInteract()
+        # ========== 第六步：重构 target_weight_position（用于后续计算 target_shares） ==========
+
+        # TopkDropoutStrategy 不需要 target_weight_position，但 _calculate_target_shares() 需要
+        # 从 tradable_df 中提取 target_weight 构建字典：{股票代码: 目标权重}
         target_weight_position = dict(zip(tradable_df["instrument"], tradable_df["target_weight"]))
-        orders = order_generator.generate_order_list_from_target_weight_position(
-            current=position,
-            trade_exchange=exchange,
-            target_weight_position=target_weight_position,
-            risk_degree=self.trading_cfg.risk_degree,
-            pred_start_time=trade_start,
-            pred_end_time=trade_end,
-            trade_start_time=trade_start,
-            trade_end_time=trade_end,
+        print(f"   [DEBUG] 重构 target_weight_position: {len(target_weight_position)} 只股票")
+
+        # ========== 第七步：使用 TopkDropoutStrategy 生成订单列表 ==========
+
+        # 从 qlib 导入 TopkDropoutStrategy（内置的 Topk + Dropout 选股策略）
+        from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy
+
+        # 7.1 创建单日交易日历（TopkDropoutStrategy 需要）
+        trade_calendar = self._create_trade_calendar_for_single_day(
+            trade_date=self.prediction_cfg.prediction_date
         )
 
+        # 7.2 将预测 DataFrame 转换为 Signal 对象（TopkDropoutStrategy 需要）
+        # Signal 对象内部使用 pd.Series 存储预测分数（index=股票代码，values=分数）
+        signal = self._create_signal_from_predictions(pred_df)
+
+        # 7.3 实例化 TopkDropoutStrategy
+        strategy = TopkDropoutStrategy(
+            signal=signal,                                 # 预测信号（包含所有股票的分数）
+            topk=self.prediction_cfg.top_k,                # 目标持仓数量（例如 20 只）
+            n_drop=self.trading_cfg.n_drop,                # Dropout 数量：每次替换几只股票（例如 3 只）
+            method_sell="bottom",                          # 卖出方法：卖出分数最低的 n_drop 只
+            method_buy="top",                              # 买入方法：买入分数最高的 n_drop 只
+            hold_thresh=self.trading_cfg.hold_thresh,      # 最短持有天数（例如 1 天）
+            only_tradable=True,                            # 只考虑可交易标的（自动过滤涨跌停、停牌）
+            risk_degree=self.trading_cfg.risk_degree,      # 风险度（资金使用比例，0-1）
+        )
+
+        # 7.4 设置策略内部状态（通过 Infrastructure 对象）
+        # TopkDropoutStrategy 的属性是只读的，需要通过 reset() 方法设置
+        from qlib.backtest.utils import LevelInfrastructure, CommonInfrastructure
+        from qlib.backtest.account import Account
+
+        # 7.4.1 创建 Account 对象（包装 Position，提供 current_position 属性）
+        # Account 需要从 Position 中提取现金和持仓信息
+        position_dict = {}
+        for stock_id, stock_info in position.position.items():
+            if stock_id == "cash" or stock_id == "now_account_value":
+                continue
+            if isinstance(stock_info, dict):
+                position_dict[stock_id] = stock_info
+            else:
+                position_dict[stock_id] = {"amount": float(stock_info)}
+
+        trade_account = Account(
+            init_cash=position.position.get("cash", self.trading_cfg.total_cash),
+            position_dict=position_dict,
+            freq="day",
+        )
+        # 用我们已构建的 Position 替换 Account 内部的 position
+        trade_account.current_position = position
+
+        # 7.4.2 创建 LevelInfrastructure（包含 trade_calendar）
+        level_infra = LevelInfrastructure()
+        level_infra.reset_infra(trade_calendar=trade_calendar)
+
+        # 7.4.3 创建 CommonInfrastructure（包含 trade_account 和 trade_exchange）
+        common_infra = CommonInfrastructure()
+        common_infra.reset_infra(trade_account=trade_account, trade_exchange=exchange)
+
+        # 7.4.4 通过 reset() 方法设置策略的基础设施
+        strategy.reset(level_infra=level_infra, common_infra=common_infra)
+
+        # 7.5 调用策略生成订单
+        # TopkDropoutStrategy.generate_trade_decision() 返回 TradeDecisionWO 对象
+        # 该对象包含订单列表（order_list）
+        print(f"   [TopkDropoutStrategy] topk={self.prediction_cfg.top_k}, n_drop={self.trading_cfg.n_drop}, hold_thresh={self.trading_cfg.hold_thresh}")
+        trade_decision = strategy.generate_trade_decision()
+        orders = trade_decision.order_list  # 提取订单列表（List[Order]）
+
+        # ========== 第八步：处理订单为空的情况 ==========
+
+        # 如果生成的订单列表为空（可能当前持仓已达目标权重）
         if not orders:
             print("   [提示] 生成订单为空")
             return TradingResult.empty(price_success_rate=price_rate, tradable_stocks=len(tradable_df), exchange_used=True)
 
+        # ========== 第九步：转换订单格式并计算金额 ==========
+
+        # 将 Order 对象列表转换为 DataFrame，同时计算买入/卖出总金额
         orders_df, total_buy_amount, total_sell_amount = self._orders_to_frame(
-            orders=orders,
-            exchange=exchange,
-            base_df=tradable_df,
-            trade_start=trade_start,
-            trade_end=trade_end,
+            orders=orders,         # 订单对象列表
+            exchange=exchange,     # 交易所对象
+            base_df=tradable_df,   # 基础预测数据（用于补充信息）
+            trade_start=trade_start,  # 交易开始时间
+            trade_end=trade_end,   # 交易结束时间
         )
+
+        # ========== 第十步：资金预算控制 ==========
+
+        # 计算可用预算：现金 * 风险度 + 卖出回笼的资金
         budget = self.trading_cfg.total_cash * self.trading_cfg.risk_degree + total_sell_amount
+        # 如果买入金额超过预算，需要削减买入订单
         if total_buy_amount > budget and budget > 0:
+            # 按预算比例缩减买入订单的份额
             orders_df, total_buy_amount = self._cap_buy_orders_to_budget(orders_df, budget)
+
+        # ========== 第十一步：计算目标份额和净投入金额 ==========
+
+        # 计算每只股票的目标持仓份额（用于记录和验证）
         target_shares = self._calculate_target_shares(exchange, target_weight_position, trade_start, trade_end)
+        # 计算净投入金额：买入金额 - 卖出金额（取非负）
         net_amount = max(total_buy_amount - total_sell_amount, 0.0)
 
+        # ========== 第十二步：打印订单统计信息 ==========
+
+        # 统计买入订单数量
         print(f"   生成买入订单数: {len(orders_df[orders_df['action'] == '买入'])} 条")
+        # 显示预计买入总金额
         print(f"   预计买入金额: {total_buy_amount:,.0f} 元")
+        # 计算并显示资金使用率（买入金额 / 总现金）
         if self.trading_cfg.total_cash > 0:
             print(f"   资金使用率: {total_buy_amount / self.trading_cfg.total_cash:.1%}")
 
+        # ========== 第十三步：返回交易结果 ==========
+
         return TradingResult(
-            orders=orders_df,
-            total_buy_amount=total_buy_amount,
-            total_sell_amount=total_sell_amount,
-            net_amount=net_amount,
-            price_success_rate=price_rate,
-            tradable_stocks=len(tradable_df),
-            target_shares=target_shares,
-            exchange_used=True,
+            orders=orders_df,                      # 订单 DataFrame（包含买卖订单）
+            total_buy_amount=total_buy_amount,     # 买入总金额
+            total_sell_amount=total_sell_amount,   # 卖出总金额
+            net_amount=net_amount,                 # 净投入金额
+            price_success_rate=price_rate,         # 价格匹配成功率
+            tradable_stocks=len(tradable_df),      # 可交易股票数量
+            target_shares=target_shares,           # 目标持仓份额字典
+            exchange_used=True,                    # 标记使用了 Exchange 系统
         )
 
 
 def main(argv=None) -> bool:
-    """命令行入口：读取持仓/行情，跑两阶段，输出 symbols_req 和 orders_to_exec，并写 state.json。"""
+    """
+    命令行入口：实盘交易的主流程（两阶段握手）
+
+    完整流程：
+    1. Phase0: 请求持仓 → 等待 iQuant 导出 positions_live.csv
+    2. Phase1: 模型推理 + Topk 选股 → 输出 symbols_req.csv
+    3. 等待 iQuant 导出 quotes_live.csv（实时行情）
+    4. Phase2: 注入实时行情 + 生成订单 → 输出 orders_to_exec.csv
+    5. iQuant 读取订单并执行实盘下单
+    """
+    # ========== 第一步：命令行参数解析和配置加载 ==========
+
+    # 创建命令行参数解析器
     parser = argparse.ArgumentParser(description="Qlib live daily predict (two-phase, live quotes, config-driven)")
+    # 添加 --config 参数：可选的 JSON 配置文件路径
     parser.add_argument("--config", type=str, required=False, help="JSON 配置路径；不传则使用代码内 DEFAULT_CONFIG")
+    # 解析命令行参数
     args = parser.parse_args(argv)
+
+    # 根据是否提供配置文件，决定使用外部配置还是默认配置
     if args.config:
+        # 使用外部 JSON 配置文件
         cfg_path = Path(args.config)
         if not cfg_path.exists():
             raise FileNotFoundError(f"未找到配置文件: {cfg_path}")
+        # 读取并解析 JSON 配置
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         print(f"[live] 使用外部配置: {cfg_path}")
     else:
+        # 使用文件顶部定义的 DEFAULT_CONFIG
         cfg = DEFAULT_CONFIG
         print("[live] 未提供 --config，使用 DEFAULT_CONFIG（请根据需要修改文件顶部配置）")
 
+    # ========== 第二步：从配置中提取各部分配置项 ==========
+
+    # 提取 qlib 初始化配置
     qlib_init_cfg = cfg.get("qlib_init", {})
+    # 提取预测相关配置（模型、数据集等）
     pred_cfg_raw = cfg.get("prediction", {})
+    # 提取数据更新配置（自动下载等）
     data_update_raw = cfg.get("data_update", {})
+
+    # 获取当前日期（UTC，归一化为日期）
     today_ts = pd.Timestamp.utcnow().normalize()
+    # 从配置中获取预测日期
     pred_cfg_date = pred_cfg_raw.get("prediction_date")
+    # 如果配置中未指定或为 "auto"，则使用今天作为预测日期
     if not pred_cfg_date or str(pred_cfg_date).lower() == "auto":
         target_pred_date = today_ts.strftime("%Y-%m-%d")
     else:
+        # 使用配置中指定的日期
         target_pred_date = pd.Timestamp(pred_cfg_date).strftime("%Y-%m-%d")
 
+    # ========== 第三步：构建数据更新配置对象 ==========
+
+    # 先获取默认配置
     default_update_cfg = DataUpdateConfig()
+    # 根据配置文件覆盖默认值，构建数据更新配置
     data_update_cfg = DataUpdateConfig(
+        # 是否启用自动数据更新（下载最新数据）
         enable_auto_update=bool(
             data_update_raw.get("enable_auto_update", default_update_cfg.enable_auto_update)
         ),
+        # 数据源 URL（从哪里下载数据）
         data_source_url=data_update_raw.get("data_source_url", default_update_cfg.data_source_url),
+        # 下载超时时间（秒）
         download_timeout=int(data_update_raw.get("download_timeout", default_update_cfg.download_timeout)),
+        # 临时文件存储目录
         temp_dir=data_update_raw.get("temp_dir", default_update_cfg.temp_dir),
     )
 
+    # ========== 第四步：提取核心配置参数 ==========
+
+    # 数据存储路径（本地 qlib 数据目录）
+    # 优先使用 prediction 配置，其次使用 qlib_init 配置
     provider_uri = pred_cfg_raw.get("provider_uri") or qlib_init_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data")
+    # 市场区域（cn=中国，us=美国等）
     region = pred_cfg_raw.get("region") or qlib_init_cfg.get("region", "cn")
+    # 股票池（csi300=沪深300，csi500=中证500等）
     instruments = pred_cfg_raw.get("instruments", "csi300")
 
+    # 打印关键信息
     print(f"[live] 目标预测日: {target_pred_date}")
     print(f"[live] 检查本地数据: provider={provider_uri}")
+    # 确保本地数据准备就绪（如有需要会自动下载）
     _ensure_data_ready(provider_uri, instruments, target_pred_date, data_update_cfg)
 
-    # 初始化 qlib（参考 daily_predict.py）
+    # ========== 第五步：初始化 qlib 数据引擎 ==========
+
     import qlib
+    # 并行计算核心数（用于特征计算加速）
     kernels = qlib_init_cfg.get("kernels", 1)
+    # joblib 后端类型（threading=线程，multiprocessing=进程）
     joblib_backend = qlib_init_cfg.get("joblib_backend", "threading")
+    # 每个子进程最大任务数（用于内存管理）
     maxtasksperchild = qlib_init_cfg.get("maxtasksperchild", 1)
 
     print(f"[live] 初始化 qlib: provider_uri={provider_uri}, region={region}")
+    # 调用 qlib.init() 初始化数据引擎
     qlib.init(
-        provider_uri=provider_uri,
-        region=region,
-        kernels=kernels,
-        joblib_backend=joblib_backend,
-        maxtasksperchild=maxtasksperchild,
+        provider_uri=provider_uri,      # 数据路径
+        region=region,                  # 市场区域
+        kernels=kernels,                # 并行核心数
+        joblib_backend=joblib_backend,  # 并行后端
+        maxtasksperchild=maxtasksperchild,  # 子进程任务数限制
     )
     print("[live] qlib 初始化完成")
 
-    # 读取路径配置
+    # ========== 第六步：读取文件路径和运行时配置 ==========
+
+    # 提取路径配置
     paths = cfg.get("paths", {})
+    # positions_live.csv 的路径（iQuant 导出的持仓文件）
     positions_path = paths.get("positions")
+    # quotes_live.csv 的路径（iQuant 导出的实时行情）
     quotes_path = paths.get("quotes")
+    # symbols_req.csv 的输出路径（qlib 输出给 iQuant 的选股请求）
     symbols_out = paths.get("symbols_out", "predictions/symbols_req.csv")
+    # orders_to_exec.csv 的输出路径（qlib 输出给 iQuant 的订单文件）
     orders_out = paths.get("orders_out", "predictions/orders_to_exec.csv")
+    # state.json 的路径（握手状态文件，用于阶段同步）
     state_path = Path(paths.get("state", "predictions/state.json"))
 
-    # 运行参数
+    # 提取运行时配置
     runtime = cfg.get("runtime", {})
+    # 等待超时时间（秒），用于等待 iQuant 响应
     wait_secs = int(runtime.get("wait_secs", 300))
+    # 版本号（用于握手时识别批次，默认使用当前时间戳）
     version = runtime.get("version") or pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
 
-    # ===== 启动时重置 state.json =====
+    # ========== 第七步：启动时重置 state.json（清理旧状态） ==========
+
+    # 如果存在旧的 state.json，删除它以避免状态冲突
     if state_path.exists():
         print(f"[live] 检测到旧的 state.json，正在重置...")
         try:
@@ -616,74 +867,155 @@ def main(argv=None) -> bool:
         except Exception as e:
             print(f"[live] [WARN] 无法删除旧的 state.json: {e}")
 
-    # ===== Phase0: 请求持仓，等待 positions_ready =====
+    # ========== 第八步：Phase0 - 请求持仓并等待 iQuant 响应 ==========
+
+    # 写入 state.json: phase=positions_needed（告知 iQuant 需要持仓数据）
     print(f"[live] 请求持仓，写 state=positions_needed, version={version}")
     _write_state(state_path, phase="positions_needed", version=version, extra={})
+
+    # 等待 iQuant 写入 state.json: phase=positions_ready（表示持仓已导出）
     print(f"[live] 等待 positions_ready (version={version}) ...")
     _wait_for_phase(state_path, expect_phase="positions_ready", expect_version=version, timeout=wait_secs)
-    holdings = _read_positions(positions_path)
+
+    # 读取 iQuant 导出的 positions_live.csv
+    # 返回 (holdings, cash)：持仓字典 + 账户现金
+    holdings, cash_from_iquant = _read_positions(positions_path)
     print(f"[live] 读取到持仓: {len(holdings)} 只股票")
 
-    # 预测配置
+    # 检查是否成功读取账户现金（CASH 行）
+    if cash_from_iquant is not None:
+        print(f"[live] ✅ 读取到账户现金: {cash_from_iquant:.2f} 元")
+    else:
+        print(f"[live] ⚠️  未读取到账户现金（positions_live.csv 中无 CASH 行）")
+
+    # ========== 第九步：构建预测配置对象 PredictionConfig ==========
+
     base_pred_cfg = PredictionConfig(
+        # MLflow 实验 ID（用于定位模型）
         experiment_id=pred_cfg_raw.get("experiment_id", "866149675032491302"),
+        # MLflow recorder ID（用于加载特定模型版本）
         recorder_id=pred_cfg_raw.get("recorder_id", "3d0e78192f384bb881c63b32f743d5f8"),
+        # 预测日期（T 日）
         prediction_date=target_pred_date,
+        # Topk 选股数量（从预测结果中选择得分最高的 top_k 只）
         top_k=pred_cfg_raw.get("top_k", 20),
+        # 最小得分阈值（低于此分数的股票不参与选股）
         min_score_threshold=pred_cfg_raw.get("min_score_threshold", 0.0),
+        # 权重分配方法（equal=等权，score=按分数加权）
         weight_method=pred_cfg_raw.get("weight_method", "equal"),
+        # 数据路径
         provider_uri=provider_uri,
+        # 市场区域
         region=region,
+        # 股票池
         instruments=instruments,
+        # 数据集类（DatasetH 是 qlib 的标准数据集类）
         dataset_class=pred_cfg_raw.get("dataset_class", "DatasetH"),
+        # 数据集模块路径
         dataset_module=pred_cfg_raw.get("dataset_module", "qlib.data.dataset"),
+        # 数据处理器类（Alpha158 是常用的 158 因子）
         handler_class=pred_cfg_raw.get("handler_class", "Alpha158"),
+        # 数据处理器模块路径
         handler_module=pred_cfg_raw.get("handler_module", "qlib.contrib.data.handler"),
+        # 最小历史数据天数（用于计算特征，如需要 120 天历史数据）
         min_history_days=pred_cfg_raw.get("min_history_days", 120)
     )
 
-    # 交易配置
+    # ========== 第十步：构建交易配置对象 TradingConfig ==========
+
+    # 提取交易相关配置
     trading_raw = cfg.get("trading", {})
+
+    # 决定使用的现金金额：优先使用从 iQuant 读取的实际值，否则使用配置默认值
+    config_cash = trading_raw.get("total_cash", 50000)
+    if cash_from_iquant is not None:
+        # 使用从 iQuant 读取的实际账户现金
+        actual_cash = cash_from_iquant
+        print(f"[live] ✅ 使用从 iQuant 读取的实际总资金: {actual_cash:.2f} 元")
+    else:
+        # 回退到配置文件中的默认值
+        actual_cash = config_cash
+        print(f"[live] ⚠️  使用配置文件的默认总资金: {actual_cash:.2f} 元（建议检查 iQuant 账户现金获取逻辑）")
+
+    # 构建交易配置对象
     base_trading_cfg = TradingConfig(
+        # 是否启用交易生成
         enable_trading=trading_raw.get("enable_trading", True),
+        # 是否使用 Exchange 系统（用于模拟撮合和价格获取）
         use_exchange_system=trading_raw.get("use_exchange_system", True),
-        total_cash=trading_raw.get("total_cash", 50000),
+        # 总现金（使用从 iQuant 读取的实际值）
+        total_cash=actual_cash,
+        # 最大股价限制（None=不限制，设置后会过滤高价股）
         max_stock_price=trading_raw.get("max_stock_price", None),
+        # Dropout 比率（随机丢弃一部分持仓，用于组合优化）
         dropout_rate=trading_raw.get("dropout_rate", 0.0),
+        # 最小购买份额（A 股最小 100 股）
         min_shares=trading_raw.get("min_shares", 100),
+        # 价格搜索天数（回溯多少天寻找有效价格）
         price_search_days=trading_raw.get("price_search_days", 5),
+        # 当前持仓（从 iQuant 读取的实际持仓）
         current_holdings=holdings,
+        # 资金使用比例（风险度，0-1，控制实际使用的资金占比）
+        risk_degree=trading_raw.get("risk_degree", 0.95),
+        # TopkDropoutStrategy 相关参数
+        # Dropout 换仓数量（每次交易替换的股票数量，默认 3 只）
+        n_drop=trading_raw.get("n_drop", 3),
+        # 持有天数控制（最短持有天数，默认 1 天，单位：交易日）
+        hold_thresh=trading_raw.get("hold_thresh", 1),
     )
 
+    # ========== 第十一步：构建输出配置和 Pipeline 对象 ==========
+
+    # 创建输出配置对象（使用默认配置）
     output_cfg = OutputConfig()
 
-    # 构造实盘 Pipeline（Phase1 不需要 quotes_live）
+    # 构建实盘预测 Pipeline
+    # 注意：Phase1 不需要实时行情，quotes_live 在 Phase2 才注入
     pipeline = LiveDailyPredictionPipeline(
-        prediction_cfg=base_pred_cfg,
-        trading_cfg=base_trading_cfg,
-        output_cfg=output_cfg,
-        quotes_live={},  # Phase1 不需要行情，Phase2 再注入
-        data_update_cfg=data_update_cfg,
-        enable_detailed_logs=True,
+        prediction_cfg=base_pred_cfg,      # 预测配置
+        trading_cfg=base_trading_cfg,      # 交易配置
+        output_cfg=output_cfg,              # 输出配置
+        quotes_live={},                     # Phase1 不需要行情，先传空字典
+        data_update_cfg=data_update_cfg,    # 数据更新配置
+        enable_detailed_logs=True,          # 启用详细日志
     )
 
-    # Phase1：推理 + Topk 选股
+    # ========== 第十二步：Phase1 - 模型推理 + Topk 选股 ==========
+
+    # 初始化 qlib 环境（加载配置、检查数据等）
     pipeline._init_environment()
+    # 加载 MLflow recorder（用于访问实验记录）
     pipeline.recorder = pipeline._load_recorder()
+    # 从 recorder 中加载训练好的模型
     pipeline.model = pipeline._load_model(pipeline.recorder)
+    # 构建数据集（特征计算、数据处理）
     pipeline.dataset = pipeline._build_dataset()
 
+    # 生成模型预测（对股票池中的所有股票进行打分）
     preds = pipeline._generate_predictions()
+    # 准备预测结果（转换为 DataFrame，添加 instrument 列等）
     pred_df = pipeline._prepare_predictions(preds)
+    # 附加市场数据（价格、涨跌停等信息）
     pred_df = pipeline._attach_market_data(pred_df)
+    # 选择 Topk 可买入股票（按分数排序，取前 top_k 只，可能由于过滤会小于topk） TODO：这里我觉得要返回全部的topk
     pred_df = pipeline._select_buyable_topk(pred_df)
 
+    # ========== 第十三步：生成选股请求文件 symbols_req.csv ==========
+
+    # 提取需要的列：股票代码、分数、目标权重
     req_cols = ["instrument", "score", "target_weight"]
     req_df = pred_df[req_cols].copy()
+
+    # 获取当前持仓的股票代码集合
     holding_symbols = set(holdings.keys())
+    # 获取选股候选的股票代码集合
     candidate_symbols = set(req_df["instrument"].dropna().tolist())
+    # 计算持仓中但不在候选中的股票（需要获取这些股票的实时报价以便决定是否卖出）
     extra_symbols = sorted(holding_symbols - candidate_symbols)
+
+    # 如果有额外的持仓股票，添加到 symbols_req 中
     if extra_symbols:
+        # 为这些股票创建占位行（score 和 target_weight 为 NaN）
         extra_df = pd.DataFrame(
             {
                 "instrument": extra_symbols,
@@ -691,32 +1023,51 @@ def main(argv=None) -> bool:
                 "target_weight": [float("nan")] * len(extra_symbols),
             }
         )
+        # 合并到请求 DataFrame
         req_df = pd.concat([req_df, extra_df], ignore_index=True)
         print(f"[live] 附加持仓代码 {len(extra_symbols)} 只以便获取实时报价: {extra_symbols[:5]}")
 
+    # 写入 symbols_req.csv（告知 iQuant 需要获取哪些股票的实时行情）
     symbols_path = Path(symbols_out)
-    symbols_path.parent.mkdir(parents=True, exist_ok=True)
+    symbols_path.parent.mkdir(parents=True, exist_ok=True)  # 确保父目录存在
     symbols_path.write_text(req_df.to_csv(index=False), encoding="utf-8-sig")
     print(f"[live] symbols_req -> {symbols_path}")
-    # 写 state：symbols_ready
+
+    # 写入 state.json: phase=symbols_ready（告知 iQuant 选股完成，可以获取行情了）
     state_path.parent.mkdir(parents=True, exist_ok=True)
     _write_state(state_path, phase="symbols_ready", version=version, extra={"symbols": symbols_path.name})
 
-    # 等待 quotes_ready
+    # ========== 第十四步：等待 iQuant 导出实时行情 quotes_live.csv ==========
+
+    # 等待 iQuant 写入 state.json: phase=quotes_ready（表示行情已导出）
     print(f"[live] 等待 quotes_ready (version={version}) ...")
     _wait_for_phase(state_path, expect_phase="quotes_ready", expect_version=version, timeout=wait_secs)
+
+    # 读取 iQuant 导出的 quotes_live.csv（实时行情：last/bid1/ask1/涨跌停等）
     quotes_live = _read_quotes(quotes_path)
+    # 将实时行情注入 Pipeline（Phase2 需要使用）
     pipeline.quotes_live = quotes_live
 
-    # Phase2：注入 quotes_live，用 LiveExchange 生成订单
+    # ========== 第十五步：Phase2 - 注入实时行情，生成订单 ==========
+
+    # 调用 _generate_trading_orders，使用 LiveExchange + quotes_live 生成订单
     trading_result = pipeline._generate_trading_orders(pred_df)
+    # 提取订单 DataFrame（如果生成失败则为空 DataFrame）
     orders_df = trading_result.orders if trading_result else pd.DataFrame()
+
+    # 写入 orders_to_exec.csv（告知 iQuant 需要执行的订单）
     orders_path = Path(orders_out)
-    orders_path.parent.mkdir(parents=True, exist_ok=True)
+    orders_path.parent.mkdir(parents=True, exist_ok=True)  # 确保父目录存在
     orders_path.write_text(orders_df.to_csv(index=False), encoding="utf-8-sig")
     print(f"[live] orders_to_exec -> {orders_path}")
-    # 写 state：orders_ready
+
+    # 写入 state.json: phase=orders_ready（告知 iQuant 订单已生成，可以执行下单了）
     _write_state(state_path, phase="orders_ready", version=version, extra={"orders": orders_path.name})
+
+    # ========== 第十六步：流程完成，返回成功 ==========
+
+    # 返回 True 表示整个流程执行成功
+    # 后续 iQuant 会读取 orders_to_exec.csv 并执行实盘下单
     return True
 
 

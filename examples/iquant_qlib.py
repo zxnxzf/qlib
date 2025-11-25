@@ -300,11 +300,60 @@ def _fetch_positions(ContextInfo):
         return None
 
 
-def _convert_positions(raw):
+def _fetch_account_cash(ContextInfo):
+    """
+    获取账户可用资金
+    调用 get_trade_detail_data(accountID, ACCOUNT_TYPE, "account") 获取账户信息
+    """
+    acc_id = ACCOUNT_ID or getattr(ContextInfo, "accid", None)
+    print(f"[DEBUG] _fetch_account_cash: acc_id={acc_id}, ACCOUNT_TYPE={ACCOUNT_TYPE}")
+    if not acc_id:
+        print("[WARN] ACCOUNT_ID is not set")
+        return None
+
+    try:
+        # 调用 get_trade_detail_data 获取账户信息
+        print(f"[DEBUG] calling get_trade_detail_data(acc_id={acc_id}, account_type={ACCOUNT_TYPE}, data_type='account')")
+        data = get_trade_detail_data(acc_id, ACCOUNT_TYPE, "account")
+
+        print(f"[DEBUG] get_trade_detail_data(account) returned: type={type(data)}, data={data}")
+
+        if not data:
+            print("[WARN] get_trade_detail_data(account) returned empty")
+            return None
+
+        # data 应该是账户对象或对象列表
+        # 如果是列表，取第一个
+        account_obj = data[0] if isinstance(data, (list, tuple)) and len(data) > 0 else data
+
+        # 从账户对象中提取可用资金 m_dAvailable
+        if hasattr(account_obj, 'm_dAvailable'):
+            cash = getattr(account_obj, 'm_dAvailable', None)
+            print(f"[DEBUG] 提取账户可用资金: {cash}")
+            return float(cash) if cash is not None else None
+        else:
+            print(f"[WARN] account object does not have m_dAvailable attribute")
+            print(f"[DEBUG] account_obj type: {type(account_obj)}")
+            if hasattr(account_obj, '__dict__'):
+                print(f"[DEBUG] account_obj attributes: {account_obj.__dict__}")
+            return None
+
+    except NameError as err:
+        print(f"[ERROR] get_trade_detail_data not found in iQuant environment: {err}")
+        return None
+    except Exception as err:
+        print(f"[WARN] get_trade_detail_data(account) failed: {err}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def _convert_positions(raw, cash=None):
     """
     ✅ 修复：正确处理 iQuant position 对象的属性
+    ✅ 新增：支持添加 CASH 行
     """
-    print(f"[DEBUG] _convert_positions: raw type={type(raw)}, length={len(raw) if hasattr(raw, '__len__') else 'N/A'}")
+    print(f"[DEBUG] _convert_positions: raw type={type(raw)}, length={len(raw) if hasattr(raw, '__len__') else 'N/A'}, cash={cash}")
 
     if isinstance(raw, pd.DataFrame):
         records = raw.to_dict("records")
@@ -363,11 +412,25 @@ def _convert_positions(raw):
 
     print(f"[DEBUG] _convert_positions: converted {len(rows)} rows")
     df = pd.DataFrame(rows)
+
+    # 添加 CASH 行
+    if cash is not None:
+        cash_row = pd.DataFrame([{
+            "code": "CASH",
+            "position": float(cash),
+            "available": float(cash),
+            "cost_price": "",
+            "last_price": "",
+        }])
+        df = pd.concat([df, cash_row], ignore_index=True)
+        print(f"[DEBUG] 添加 CASH 行: 可用资金={cash}")
+
     print(f"[DEBUG] resulting DataFrame: shape={df.shape}, columns={list(df.columns) if not df.empty else 'empty'}")
     return df
 
 
 def _export_positions(ContextInfo, version: str) -> bool:
+    # 获取持仓数据
     data = _fetch_positions(ContextInfo)
     if not data:
         if os.path.isfile(POSITIONS_CSV_ABS_PATH):
@@ -375,14 +438,24 @@ def _export_positions(ContextInfo, version: str) -> bool:
             return True
         print("[WARN] cannot fetch holdings; please implement ContextInfo API or manually create positions_live.csv")
         return False
-    df = _convert_positions(data)
+
+    # 获取账户现金
+    cash = _fetch_account_cash(ContextInfo)
+    if cash is not None:
+        print(f"[INFO] ✅ 从 iQuant 获取账户现金: {cash:.2f} 元")
+    else:
+        print("[WARN] 无法获取账户现金，CASH 行将不会包含在 positions_live.csv 中")
+
+    # 转换持仓数据，包含 CASH 行
+    df = _convert_positions(data, cash=cash)
     if df.empty:
         print("[WARN] holdings dataframe empty")
         return False
+
     _ensure_parent(POSITIONS_CSV_ABS_PATH)
     df.to_csv(POSITIONS_CSV_ABS_PATH, index=False, encoding="utf-8-sig")
     print(f"[INFO] 导出持仓 {len(df)} 条 -> {POSITIONS_CSV_ABS_PATH}")
-    print(f"[DEBUG] positions preview:\n{df.head()}")
+    print(f"[DEBUG] positions preview:\n{df.head(10)}")
     return True
 
 

@@ -148,6 +148,10 @@ class TradingConfig:
     auto_load_previous: bool = True  # 自动加载上一交易日的目标仓位作为当前持仓
     holdings_lookup_days: int = 10  # 自动回溯持仓的最大交易日跨度
 
+    # TopkDropoutStrategy 相关参数
+    n_drop: int = 3  # Dropout 换仓：每次替换的股票数量
+    hold_thresh: int = 1  # 持有天数控制：最短持有天数（单位：交易日）
+
 
 @dataclass
 class OutputConfig:
