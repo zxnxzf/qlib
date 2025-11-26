@@ -11,6 +11,7 @@ import shutil
 import tarfile
 import time  # 等待 state 用
 from dataclasses import dataclass, replace  # 覆盖配置的便捷方法
+from datetime import datetime  # 持仓历史日期计算
 from pathlib import Path  # 路径处理
 from typing import Dict, Optional  # 类型注解
 from urllib.request import urlretrieve
@@ -93,6 +94,128 @@ DEFAULT_CONFIG = {
         "temp_dir": None,  # 临时目录
     },
 }
+# ==============================================================
+
+
+# ================= 持仓历史管理（T+1 限制支持） =================
+
+# 持仓历史文件路径
+HOLDINGS_HISTORY_PATH = Path("predictions/holdings_history.json")
+
+
+def _load_holdings_history():
+    """加载持仓历史"""
+    if HOLDINGS_HISTORY_PATH.exists():
+        with open(HOLDINGS_HISTORY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_holdings_history(history):
+    """保存持仓历史"""
+    HOLDINGS_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(HOLDINGS_HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+
+
+def _calculate_hold_days(current_holdings, today_str, hold_thresh=1):
+    """
+    计算每只股票的持有天数
+
+    参数:
+        current_holdings: dict {股票代码: 持仓数量}
+        today_str: 当前日期 "YYYY-MM-DD"
+        hold_thresh: 最短持有天数
+
+    返回:
+        hold_days_dict: dict {股票代码: 持有天数}
+
+    逻辑:
+        - 在 history 中有记录 → 计算实际持有天数
+        - 在 history 中无记录 → 认为是老持仓，默认可卖（hold_days = hold_thresh + 100）
+        - 自动清理 history 中已卖出的股票（不在 current_holdings 中）
+    """
+    history = _load_holdings_history()
+    hold_days_dict = {}
+    today = datetime.strptime(today_str, "%Y-%m-%d")
+
+    # 清理已卖出的股票（不在当前持仓中）
+    removed = []
+    for code in list(history.keys()):
+        if code not in current_holdings:
+            del history[code]
+            removed.append(code)
+
+    if removed:
+        print(f"   [清理] 已卖出股票: {', '.join(removed)}")
+        _save_holdings_history(history)
+
+    # 计算每只股票的持有天数
+    for code, amount in current_holdings.items():
+        if code in history:
+            # 在历史记录中，计算实际持有天数
+            buy_date_str = history[code]["buy_date"]
+            buy_date = datetime.strptime(buy_date_str, "%Y-%m-%d")
+            hold_days = (today - buy_date).days
+            print(f"   [{code}] 持有天数: {hold_days} 天 (买入日期: {buy_date_str})")
+        else:
+            # 不在历史记录中，认为是老持仓，默认可卖
+            hold_days = hold_thresh + 100  # 例如 101 天
+            print(f"   [{code}] 老持仓（无记录），默认可卖 (hold_days={hold_days})")
+
+        hold_days_dict[code] = hold_days
+
+    return hold_days_dict
+
+
+def _update_holdings_history_after_buy(buy_orders, today_str):
+    """
+    在生成买入订单后，更新持仓历史
+
+    参数:
+        buy_orders: DataFrame 买入订单列表（包含 'stock' 和 'shares' 列）
+        today_str: 当前日期 "YYYY-MM-DD"
+    """
+    history = _load_holdings_history()
+
+    for _, order in buy_orders.iterrows():
+        code = order["stock"]
+        amount = order["shares"]
+
+        if amount > 0:
+            # 只在首次买入时记录日期，避免重复买入重置持有天数
+            if code not in history:
+                history[code] = {
+                    "buy_date": today_str,
+                    "amount": int(amount),
+                }
+                print(f"   [记录] {code} 买入 {amount} 股，日期: {today_str}")
+            else:
+                # 已有记录，只更新数量
+                history[code]["amount"] = int(amount)
+
+    _save_holdings_history(history)
+
+
+def _cleanup_holdings_history(current_holdings):
+    """
+    清理已卖出的股票记录
+
+    注意：只在确认持仓变化后调用（例如下一次运行时）
+    """
+    history = _load_holdings_history()
+    removed = []
+
+    for code in list(history.keys()):
+        if code not in current_holdings:
+            del history[code]
+            removed.append(code)
+
+    if removed:
+        print(f"   [清理] 已卖出股票: {', '.join(removed)}")
+        _save_holdings_history(history)
+
+
 # ==============================================================
 
 
@@ -568,17 +691,33 @@ class LiveDailyPredictionPipeline(DailyPredictionPipeline):
             freq=self.trading_cfg.trade_freq,         # 交易频率（day/1min 等）
         )
 
-        # ========== 第五步：初始化当前持仓 Position ==========
+        # ========== 第五步：初始化当前持仓 Position（包含持有天数） ==========
 
         from daily_predict import TradingResult  # 延迟导入避免循环
         from qlib.backtest.position import Position  # 重用 qlib 的 Position 类
         from qlib.contrib.strategy.order_generator import OrderGenWOInteract  # 订单生成器
 
-        # 创建 Position 对象，表示当前账户状态，从position_needed中去获取
+        # 5.1 计算每只股票的持有天数（支持 T+1 限制）
+        print(f"\n[处理] 计算持仓持有天数...")
+        hold_days_dict = _calculate_hold_days(
+            current_holdings=self.trading_cfg.current_holdings,
+            today_str=self.prediction_cfg.prediction_date,
+            hold_thresh=self.trading_cfg.hold_thresh,
+        )
+
+        # 5.2 初始化 Position，包含 count_day 字段
+        position_dict = {}
+        for code, amount in self.trading_cfg.current_holdings.items():
+            hold_days = hold_days_dict.get(code, self.trading_cfg.hold_thresh + 100)  # 默认可卖
+            position_dict[code] = {
+                "amount": amount,
+                "count_day": hold_days,  # 设置持有天数，确保 T+1 检查生效
+            }
+
+        # 5.3 创建 Position 对象
         position = Position(
             cash=self.trading_cfg.total_cash,  # 可用现金（从 iQuant 读取或配置默认值）
-            # 将持仓字典转换为 Position 需要的格式：{code: {"amount": shares}}
-            position_dict={code: {"amount": amount} for code, amount in self.trading_cfg.current_holdings.items()},
+            position_dict=position_dict,
         )
 
         # 如果有持仓，需要填充持仓股票的当前价格，TODO: 这里我觉得应该先从实时报价中获取
@@ -684,6 +823,16 @@ class LiveDailyPredictionPipeline(DailyPredictionPipeline):
             trade_start=trade_start,  # 交易开始时间
             trade_end=trade_end,   # 交易结束时间
         )
+
+        # ========== 第九点五步：记录买入订单到持仓历史 ==========
+
+        buy_orders = orders_df[orders_df["action"] == "买入"]
+        if len(buy_orders) > 0:
+            print(f"\n[记录] 更新持仓历史...")
+            _update_holdings_history_after_buy(
+                buy_orders=buy_orders,
+                today_str=self.prediction_cfg.prediction_date,
+            )
 
         # ========== 第十步：资金预算控制 ==========
 
