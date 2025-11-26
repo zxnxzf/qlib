@@ -138,8 +138,6 @@ class TradingConfig:
     use_exchange_system: bool = True
     total_cash: float = 100000.0
     min_shares: int = 100  # 最小下单股数（A股默认 1 手=100 股）
-    max_stock_price: Optional[float] = None  # 价格过滤上限
-    dropout_rate: float = 0.0  # 每次换仓替换的仓位比例（0~1）
     risk_degree: float = 0.95  # 资金使用比例（可控风险敞口）
     price_search_days: int = 5
     trade_freq: str = "day"
@@ -151,6 +149,16 @@ class TradingConfig:
     # TopkDropoutStrategy 相关参数
     n_drop: int = 3  # Dropout 换仓：每次替换的股票数量
     hold_thresh: int = 1  # 持有天数控制：最短持有天数（单位：交易日）
+
+    # LiveTopkStrategy 相关参数（小资金优化）
+    use_live_topk_strategy: bool = False  # 是否使用 LiveTopkStrategy（两轮预算分配）
+    min_affordable_shares: int = 100  # 最小可负担股数（默认 1 手）
+
+    # 交易成本参数（符合中国 A 股实际成本）
+    open_cost: float = 0.0003   # 买入成本率（佣金 0.025% + 过户费 0.001%）
+    close_cost: float = 0.0013  # 卖出成本率（佣金 0.025% + 印花税 0.1% + 过户费 0.001%）
+    min_cost: float = 1.0       # 最小交易成本（元）
+    impact_cost: float = 0.0    # 市场冲击成本/滑点
 
 
 @dataclass
@@ -771,13 +779,15 @@ class DailyPredictionPipeline:
 
     def _select_buyable_topk(self, pred_df: pd.DataFrame) -> pd.DataFrame:
         """
-        结合价格上限、预算/最小手数约束与 dropout 机制，对预测列表逐层筛选得到最终可交易的股票。
+        结合预算/最小手数约束，对预测列表逐层筛选得到最终可交易的股票。
 
         处理步骤：
-        1. 根据 `max_stock_price` 过滤高价股票；
+        1. （可选）根据 `max_stock_price` 过滤高价股票（如果配置中提供）；
         2. 按得分降序依次检测资金与最小手数，构建可买候选；
-        3. 在候选中优先保留旧持仓（由 `dropout_rate` 决定替换比例），剩余名额由新股票填补；
+        3. （可选）应用 dropout 机制优先保留旧持仓（如果配置中提供 `dropout_rate`）；
         4. 对最终列表重新计算 `target_weight`，供交易模块使用。
+
+        注意：实盘模式（live_daily_predict.py）使用 _get_topk_candidates_for_quotes() 替代此方法。
         """
         top_k = int(self.prediction_cfg.top_k or 0)
         if top_k <= 0 or pred_df.empty:
@@ -785,7 +795,7 @@ class DailyPredictionPipeline:
 
         # Step 1: apply optional price-cap filter on raw predictions.
         # 步骤1：依据价格上限先过滤掉不满足条件的股票。
-        price_cap = self.trading_cfg.max_stock_price
+        price_cap = getattr(self.trading_cfg, "max_stock_price", None)
         working_df = pred_df.copy()
         if price_cap is not None and price_cap > 0:
             before = len(working_df)
@@ -810,13 +820,26 @@ class DailyPredictionPipeline:
         candidates = working_df.sort_values("score", ascending=False).reset_index(drop=True)
         selected: List[Dict[str, Any]] = []
 
+        # 统计过滤原因
+        filter_stats = {"not_tradable": 0, "invalid_price": 0, "not_affordable": []}
+
         for record in candidates.to_dict("records"):
             if len(selected) >= top_k:
                 break
+
+            # 检查1: 是否可交易
             if not record.get("is_tradable", True):
+                filter_stats["not_tradable"] += 1
+                stock_code = record.get("instrument", "UNKNOWN")
+                print(f"   [过滤] {stock_code}: 不可交易 (is_tradable=False)")
                 continue
+
+            # 检查2: 价格是否有效
             price = record.get("price")
             if not (pd.notna(price) and float(price) > 0):
+                filter_stats["invalid_price"] += 1
+                stock_code = record.get("instrument", "UNKNOWN")
+                print(f"   [过滤] {stock_code}: 价格无效 (price={price})")
                 continue
 
             tentative = [rec.copy() for rec in selected]
@@ -824,28 +847,70 @@ class DailyPredictionPipeline:
             scores = pd.Series([float(rec["score"]) for rec in tentative], dtype=float)
             weights = self._compute_weights(scores, self.prediction_cfg.weight_method)
 
+            # 检查3: 是否可负担（每只股票能买到至少1手）
             affordable = True
+            failed_stock = None
+            failed_reason = ""
+
             for idx, temp_record in enumerate(tentative):
                 price_val = temp_record.get("price")
+                stock_code = temp_record.get("instrument", "UNKNOWN")
+
                 if not (pd.notna(price_val) and float(price_val) > 0):
                     affordable = False
+                    failed_stock = stock_code
+                    failed_reason = f"价格无效 (price={price_val})"
                     break
+
                 lot_cost = float(price_val) * min_lot
                 if lot_cost <= 0:
                     affordable = False
+                    failed_stock = stock_code
+                    failed_reason = f"单手成本异常 (lot_cost={lot_cost})"
                     break
 
                 budget = float(weights.iloc[idx]) * available_cash
                 max_shares = math.floor(budget / lot_cost) * min_lot
+
                 if max_shares < min_lot:
                     affordable = False
+                    failed_stock = stock_code
+                    # 计算当前已选股票数（包括新添加的）
+                    current_count = len(tentative)
+                    failed_reason = (
+                        f"预算不足买1手 (价格={price_val:.2f}元, "
+                        f"分配预算={budget:.0f}元, 可买={max_shares}股 < {min_lot}股, "
+                        f"当前候选数={current_count})"
+                    )
                     break
+
                 temp_record["target_weight"] = float(weights.iloc[idx])
 
             if not affordable:
+                # 记录被过滤的股票（尝试添加的那只）
+                attempting_stock = record.get("instrument", "UNKNOWN")
+                attempting_price = record.get("price", 0)
+                filter_stats["not_affordable"].append({
+                    "stock": attempting_stock,
+                    "price": attempting_price,
+                    "failed_at": failed_stock,
+                    "reason": failed_reason
+                })
+                print(f"   [过滤] {attempting_stock}: 不可负担 - {failed_reason}")
                 continue
 
             selected = [rec.copy() for rec in tentative]
+
+        # 打印过滤统计
+        if filter_stats["not_tradable"] > 0 or filter_stats["invalid_price"] > 0 or filter_stats["not_affordable"]:
+            print(f"\n[交易筛选统计]")
+            print(f"   不可交易: {filter_stats['not_tradable']} 只")
+            print(f"   价格无效: {filter_stats['invalid_price']} 只")
+            print(f"   预算不足: {len(filter_stats['not_affordable'])} 只")
+            if filter_stats["not_affordable"]:
+                print(f"   预算不足详情（前5只）:")
+                for item in filter_stats["not_affordable"][:5]:
+                    print(f"      - {item['stock']}: {item['reason']}")
 
         if not selected:
             print(f"[交易] 在资金与最小股数约束下未找到可买的前 {top_k} 只股票")
@@ -1526,8 +1591,6 @@ def main(argv: Optional[Sequence[str]] = None) -> bool:
         enable_trading=True,
         use_exchange_system=True,
         total_cash=50000,
-        max_stock_price=10.0,
-        dropout_rate=0.2,
         min_shares=100,
         price_search_days=5,
         current_holdings=current_holdings,

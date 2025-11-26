@@ -17,6 +17,7 @@ from typing import Dict, Optional  # 类型注解
 from urllib.request import urlretrieve
 import sys  # 修改 sys.path 便于导入
 
+import numpy as np  # 数值计算
 import pandas as pd  # 数据处理
 from pandas.tseries.offsets import BDay
 
@@ -79,13 +80,19 @@ DEFAULT_CONFIG = {
         "enable_trading": True,  # 是否生成交易
         "use_exchange_system": True,  # 是否使用 Exchange 系统
         "total_cash": 50000,  # 资金规模
-        "max_stock_price": None,  # 股票价格上限
-        "dropout_rate": 0.0,  # TopK dropout 比例
         "min_shares": 100,  # 单笔最小股数
         "price_search_days": 5,  # 回溯价格天数
         "risk_degree": 0.0001,  # 可用资金比例，账户有20万 * 10 ^ 3，预计使用20万
         "n_drop": 3,  # TopkDropoutStrategy: 每次替换的股票数量（Dropout 换仓机制）
         "hold_thresh": 1,  # TopkDropoutStrategy: 最短持有天数（持有天数控制，单位：交易日）
+        # LiveTopkStrategy 相关配置
+        "use_live_topk_strategy": True,  # 是否使用 LiveTopkStrategy（小资金优化）
+        "min_affordable_shares": 100,  # LiveTopkStrategy: 最小可负担股数（默认1手）
+        # 交易成本参数（符合中国 A 股实际成本）
+        "open_cost": 0.0003,   # 买入成本率（佣金 0.025% + 过户费 0.001%）
+        "close_cost": 0.0013,  # 卖出成本率（佣金 0.025% + 印花税 0.1% + 过户费 0.001%）
+        "min_cost": 1.0,       # 最小交易成本（元）
+        "impact_cost": 0.0,    # 市场冲击成本/滑点
     },
     "data_update": {
         "enable_auto_update": True,  # 是否自动更新数据
@@ -151,19 +158,35 @@ def _calculate_hold_days(current_holdings, today_str, hold_thresh=1):
         _save_holdings_history(history)
 
     # 计算每只股票的持有天数
+    new_holdings = []
+    old_holdings = []
+
     for code, amount in current_holdings.items():
         if code in history:
             # 在历史记录中，计算实际持有天数
             buy_date_str = history[code]["buy_date"]
             buy_date = datetime.strptime(buy_date_str, "%Y-%m-%d")
             hold_days = (today - buy_date).days
-            print(f"   [{code}] 持有天数: {hold_days} 天 (买入日期: {buy_date_str})")
+            new_holdings.append((code, hold_days, buy_date_str))
         else:
             # 不在历史记录中，认为是老持仓，默认可卖
             hold_days = hold_thresh + 100  # 例如 101 天
-            print(f"   [{code}] 老持仓（无记录），默认可卖 (hold_days={hold_days})")
+            old_holdings.append(code)
 
         hold_days_dict[code] = hold_days
+
+    # 简洁地输出汇总信息
+    if new_holdings:
+        print(f"   📊 新买入持仓 ({len(new_holdings)} 只):")
+        for code, days, buy_date in new_holdings[:5]:  # 只显示前5个
+            print(f"      • {code}: 持有 {days} 天 (买入: {buy_date})")
+        if len(new_holdings) > 5:
+            print(f"      ... 还有 {len(new_holdings) - 5} 只")
+
+    if old_holdings:
+        print(f"   📦 老持仓 ({len(old_holdings)} 只): {', '.join(old_holdings[:8])}")
+        if len(old_holdings) > 8:
+            print(f"      ... 还有 {len(old_holdings) - 8} 只")
 
     return hold_days_dict
 
@@ -487,15 +510,12 @@ def _wait_for_phase(path: Path, expect_phase: str, expect_version: str, timeout:
         current_phase = st.get("phase")
         current_version = st.get("version")
 
-        # 每 5 次循环打印一次调试信息
-        if loop_count % 5 == 1:
-            print(f"[live] 轮询 state.json (第 {loop_count} 次):")
-            print(f"   路径: {path}")
-            print(f"   期待: phase={expect_phase}, version={expect_version}")
-            print(f"   当前: phase={current_phase}, version={current_version}")
+        # 每 10 次循环打印一次等待提示
+        if loop_count % 10 == 1:
+            print(f"   ⏳ 等待中... ({loop_count}s)")
 
         if current_phase == expect_phase and current_version == expect_version:
-            print(f"[live] ✓ 检测到期待的状态: phase={expect_phase}, version={expect_version}")
+            print(f"   ✅ 完成")
             return
 
         if time.time() - start > timeout:
@@ -518,6 +538,37 @@ class LiveDailyPredictionPipeline(DailyPredictionPipeline):
         super().__init__(prediction_cfg, trading_cfg, output_cfg, **kwargs)
         # 保存实时报价
         self.quotes_live: Dict[str, Dict[str, float]] = quotes_live or {}
+
+    def _get_topk_candidates_for_quotes(self, pred_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Phase1 专用：获取需要获取实时报价的候选股票列表
+
+        功能：
+        - 只按分数排序取 topk
+        - 不做任何筛选（价格、预算、可负担性等）
+        - 用于生成 symbols_req.csv
+
+        参数：
+            pred_df: 包含 instrument, score, target_weight 等列的预测结果
+
+        返回：
+            topk 只股票的 DataFrame（按分数降序）
+        """
+        top_k = int(self.prediction_cfg.top_k or 0)
+        if top_k <= 0 or pred_df.empty:
+            return pred_df
+
+        # 极简逻辑：按分数排序取前 topk
+        result_df = pred_df.sort_values("score", ascending=False).head(top_k).copy()
+
+        # 重新计算权重（确保权重总和为 1.0）
+        result_df["target_weight"] = self._compute_weights(
+            result_df["score"],
+            self.prediction_cfg.weight_method
+        )
+
+        print(f"   └─ 已选出 {len(result_df)} 只候选股票")
+        return result_df.reset_index(drop=True)
 
     def _quote_price(self, code: str, is_buy: bool) -> float:
         """从 quotes_live 中取参考价：买用 ask1→last→高停，卖用 bid1→last→低停。"""
@@ -689,6 +740,11 @@ class LiveDailyPredictionPipeline(DailyPredictionPipeline):
             end_time=trade_end.strftime("%Y-%m-%d"),  # 数据结束时间
             deal_price=self.trading_cfg.deal_price,   # 成交价类型（bid1/ask1/last 等）
             freq=self.trading_cfg.trade_freq,         # 交易频率（day/1min 等）
+            # 交易成本参数（符合实际 A 股成本）
+            open_cost=self.trading_cfg.open_cost,     # 买入成本率
+            close_cost=self.trading_cfg.close_cost,   # 卖出成本率
+            min_cost=self.trading_cfg.min_cost,       # 最小成本
+            impact_cost=self.trading_cfg.impact_cost, # 滑点成本
         )
 
         # ========== 第五步：初始化当前持仓 Position（包含持有天数） ==========
@@ -752,17 +808,48 @@ class LiveDailyPredictionPipeline(DailyPredictionPipeline):
         # Signal 对象内部使用 pd.Series 存储预测分数（index=股票代码，values=分数）
         signal = self._create_signal_from_predictions(pred_df)
 
-        # 7.3 实例化 TopkDropoutStrategy
-        strategy = TopkDropoutStrategy(
-            signal=signal,                                 # 预测信号（包含所有股票的分数）
-            topk=self.prediction_cfg.top_k,                # 目标持仓数量（例如 20 只）
-            n_drop=self.trading_cfg.n_drop,                # Dropout 数量：每次替换几只股票（例如 3 只）
-            method_sell="bottom",                          # 卖出方法：卖出分数最低的 n_drop 只
-            method_buy="top",                              # 买入方法：买入分数最高的 n_drop 只
-            hold_thresh=self.trading_cfg.hold_thresh,      # 最短持有天数（例如 1 天）
-            only_tradable=True,                            # 只考虑可交易标的（自动过滤涨跌停、停牌）
-            risk_degree=self.trading_cfg.risk_degree,      # 风险度（资金使用比例，0-1）
-        )
+        # 7.3 根据配置选择策略类
+        # 从配置中读取 use_live_topk_strategy 标志（默认 False）
+        # 注意：这个配置来自 DEFAULT_CONFIG 或外部 JSON，通过 trading_cfg 访问可能没有这个字段
+        # 因此我们需要从原始配置中读取（如果 Pipeline 保存了的话）
+        # 为简化实现，我们直接从 DEFAULT_CONFIG 或环境读取
+
+        # 临时方案：检查环境变量或使用父类的 trading_cfg
+        # 更好的方案是在 __init__ 中保存完整配置字典
+        use_live_topk = getattr(self.trading_cfg, 'use_live_topk_strategy', False)
+        min_afford_shares = getattr(self.trading_cfg, 'min_affordable_shares', 100)
+
+        # 如果启用 LiveTopkStrategy，导入并使用
+        if use_live_topk:
+            from qlib.contrib.strategy.live_strategy import LiveTopkStrategy
+            print("[live] 使用 LiveTopkStrategy（两轮预算分配优化）")
+            strategy = LiveTopkStrategy(
+                signal=signal,                                 # 预测信号（包含所有股票的分数）
+                topk=self.prediction_cfg.top_k,                # 目标持仓数量（例如 20 只）
+                n_drop=self.trading_cfg.n_drop,                # Dropout 数量：每次替换几只股票（例如 3 只）
+                method_sell="bottom",                          # 卖出方法：卖出分数最低的 n_drop 只
+                method_buy="top",                              # 买入方法：买入分数最高的 n_drop 只
+                hold_thresh=self.trading_cfg.hold_thresh,      # 最短持有天数（例如 1 天）
+                only_tradable=True,                            # 只考虑可交易标的（自动过滤涨跌停、停牌）
+                risk_degree=self.trading_cfg.risk_degree,      # 风险度（资金使用比例，0-1）
+                # LiveTopkStrategy 专属参数
+                min_affordable_shares=min_afford_shares,       # 最小可负担股数（默认 100 股）
+                enable_affordability_filter=True,              # 启用两轮分配逻辑
+            )
+        else:
+            # 使用标准的 TopkDropoutStrategy
+            from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy
+            print("[live] 使用 TopkDropoutStrategy（标准策略）")
+            strategy = TopkDropoutStrategy(
+                signal=signal,                                 # 预测信号（包含所有股票的分数）
+                topk=self.prediction_cfg.top_k,                # 目标持仓数量（例如 20 只）
+                n_drop=self.trading_cfg.n_drop,                # Dropout 数量：每次替换几只股票（例如 3 只）
+                method_sell="bottom",                          # 卖出方法：卖出分数最低的 n_drop 只
+                method_buy="top",                              # 买入方法：买入分数最高的 n_drop 只
+                hold_thresh=self.trading_cfg.hold_thresh,      # 最短持有天数（例如 1 天）
+                only_tradable=True,                            # 只考虑可交易标的（自动过滤涨跌停、停牌）
+                risk_degree=self.trading_cfg.risk_degree,      # 风险度（资金使用比例，0-1）
+            )
 
         # 7.4 设置策略内部状态（通过 Infrastructure 对象）
         # TopkDropoutStrategy 的属性是只读的，需要通过 reset() 方法设置
@@ -850,15 +937,154 @@ class LiveDailyPredictionPipeline(DailyPredictionPipeline):
         # 计算净投入金额：买入金额 - 卖出金额（取非负）
         net_amount = max(total_buy_amount - total_sell_amount, 0.0)
 
-        # ========== 第十二步：打印订单统计信息 ==========
+        # ========== 第十二步：打印详细的持仓和交易信息 ==========
 
-        # 统计买入订单数量
-        print(f"   生成买入订单数: {len(orders_df[orders_df['action'] == '买入'])} 条")
-        # 显示预计买入总金额
-        print(f"   预计买入金额: {total_buy_amount:,.0f} 元")
-        # 计算并显示资金使用率（买入金额 / 总现金）
-        if self.trading_cfg.total_cash > 0:
-            print(f"   资金使用率: {total_buy_amount / self.trading_cfg.total_cash:.1%}")
+        print(f"\n{'='*60}")
+        print(f"[交易分析] 持仓与订单详情")
+        print(f"{'='*60}")
+
+        # 1. 当前持仓信息（交易前）
+        print(f"\n【交易前持仓】")
+        current_holdings = self.trading_cfg.current_holdings
+        if current_holdings:
+            current_holdings_value = 0.0
+            holdings_list = []
+
+            # 遍历所有股票计算总价值
+            for code, amount in current_holdings.items():
+                # 优先使用 iQuant 实时价格，否则回退到 tradable_df 的历史价格
+                price = np.nan
+                price_source = ""
+                if code in self.quotes_live:
+                    price = self.quotes_live[code].get('last', np.nan)
+                    price_source = "[实时]"
+                elif code in tradable_df['instrument'].values:
+                    price = tradable_df[tradable_df['instrument'] == code]['price'].iloc[0]
+                    price_source = "[历史]"
+
+                if pd.notna(price) and price > 0:
+                    value = amount * price
+                    current_holdings_value += value
+                    holdings_list.append((code, amount, price, value, price_source))
+                else:
+                    holdings_list.append((code, amount, np.nan, 0.0, ""))
+
+            # 按市值降序排序
+            holdings_list.sort(key=lambda x: x[3], reverse=True)
+
+            print(f"   持仓股票数: {len(current_holdings)} 只")
+            # 只显示前 5 只
+            for code, amount, price, value, price_source in holdings_list[:5]:
+                if pd.notna(price) and price > 0:
+                    print(f"   - {code}: {amount:.0f}股 × {price:.2f}元{price_source} = {value:,.0f}元")
+                else:
+                    print(f"   - {code}: {amount:.0f}股 (价格缺失)")
+
+            if len(holdings_list) > 5:
+                print(f"   ... 还有 {len(holdings_list) - 5} 只股票")
+
+            print(f"   持仓总价值: {current_holdings_value:,.0f} 元")
+        else:
+            print(f"   空仓")
+
+        print(f"   可用现金: {self.trading_cfg.total_cash:,.0f} 元")
+        total_assets_before = (current_holdings_value if current_holdings else 0.0) + self.trading_cfg.total_cash
+        print(f"   总资产: {total_assets_before:,.0f} 元")
+
+        # 2. 卖出订单详情
+        sell_orders = orders_df[orders_df["action"] == "卖出"]
+        print(f"\n【卖出订单】")
+        if len(sell_orders) == 0:
+            print(f"   无卖出订单")
+            print(f"   原因：当前持仓 {len(current_holdings)} 只 < topk {self.prediction_cfg.top_k} 只，且持仓股票分数较高")
+            print(f"   策略：保留所有持仓，买入新股票补足到 topk")
+        elif len(sell_orders) > 0:
+            print(f"   卖出股票数: {len(sell_orders)} 只")
+            for idx, row in sell_orders.iterrows():
+                print(f"   - {row['stock']}: {int(row['shares'])}股 × {row['price']:.2f}元 = {row['amount']:,.0f}元")
+            print(f"   卖出总金额: {total_sell_amount:,.0f} 元")
+
+            # 交易成本估算
+            sell_cost_estimate = max(total_sell_amount * self.trading_cfg.close_cost, self.trading_cfg.min_cost)
+            print(f"   预估卖出成本: {sell_cost_estimate:,.2f} 元 (费率 {self.trading_cfg.close_cost:.4%}, 最小 {self.trading_cfg.min_cost:.0f}元)")
+
+        # 3. 买入订单详情
+        buy_orders = orders_df[orders_df["action"] == "买入"]
+        print(f"\n【买入订单】")
+        if len(buy_orders) > 0:
+            print(f"   买入股票数: {len(buy_orders)} 只")
+            for idx, row in buy_orders.head(10).iterrows():  # 显示前10只
+                print(f"   - {row['stock']}: {int(row['shares'])}股 × {row['price']:.2f}元 = {row['amount']:,.0f}元")
+            if len(buy_orders) > 10:
+                print(f"   ... 还有 {len(buy_orders) - 10} 只股票")
+            print(f"   买入总金额: {total_buy_amount:,.0f} 元")
+            if self.trading_cfg.total_cash > 0:
+                print(f"   资金使用率: {total_buy_amount / self.trading_cfg.total_cash:.1%}")
+
+            # 交易成本估算
+            buy_cost_estimate = max(total_buy_amount * self.trading_cfg.open_cost, self.trading_cfg.min_cost)
+            print(f"   预估买入成本: {buy_cost_estimate:,.2f} 元 (费率 {self.trading_cfg.open_cost:.4%}, 最小 {self.trading_cfg.min_cost:.0f}元)")
+        else:
+            print(f"   无买入订单")
+
+        # 4. 交易后预期持仓
+        print(f"\n【交易后预期持仓】")
+        if target_shares:
+            expected_holdings_value = 0.0
+            print(f"   预期持仓股票数: {len(target_shares)} 只")
+            # 按持仓金额排序显示
+            holdings_with_value = []
+            for code, shares in target_shares.items():
+                # 优先使用 iQuant 实时价格，否则回退到 tradable_df 的历史价格
+                price = np.nan
+                price_source = ""
+                if code in self.quotes_live:
+                    price = self.quotes_live[code].get('last', np.nan)
+                    price_source = "[实时]"
+                elif code in tradable_df['instrument'].values:
+                    price = tradable_df[tradable_df['instrument'] == code]['price'].iloc[0]
+                    price_source = "[历史]"
+
+                if pd.notna(price) and price > 0:
+                    value = shares * price
+                    holdings_with_value.append((code, shares, price, value, price_source))
+                    expected_holdings_value += value
+
+            # 按价值降序排序
+            holdings_with_value.sort(key=lambda x: x[3], reverse=True)
+
+            for code, shares, price, value, price_source in holdings_with_value[:10]:  # 显示前10只
+                weight = value / expected_holdings_value if expected_holdings_value > 0 else 0
+                print(f"   - {code}: {shares:.0f}股 × {price:.2f}元{price_source} = {value:,.0f}元 ({weight:.1%})")
+
+            if len(holdings_with_value) > 10:
+                print(f"   ... 还有 {len(holdings_with_value) - 10} 只股票")
+
+            print(f"   预期持仓总价值: {expected_holdings_value:,.0f} 元")
+
+            # 预期剩余现金（扣除交易成本）
+            buy_cost_total = max(total_buy_amount * self.trading_cfg.open_cost, self.trading_cfg.min_cost) if total_buy_amount > 0 else 0
+            sell_cost_total = max(total_sell_amount * self.trading_cfg.close_cost, self.trading_cfg.min_cost) if total_sell_amount > 0 else 0
+            total_cost = buy_cost_total + sell_cost_total
+
+            expected_cash = self.trading_cfg.total_cash + total_sell_amount - total_buy_amount - total_cost
+            print(f"   预期剩余现金: {expected_cash:,.0f} 元")
+
+            # 预期总资产
+            expected_total_assets = expected_holdings_value + expected_cash
+            print(f"   预期总资产: {expected_total_assets:,.0f} 元")
+
+            # 资产变化详情
+            asset_change = expected_total_assets - total_assets_before
+            print(f"\n   资产变化分析:")
+            print(f"   - 交易前总资产: {total_assets_before:,.0f} 元")
+            print(f"   - 交易后总资产: {expected_total_assets:,.0f} 元")
+            print(f"   - 总成本: {total_cost:,.2f} 元 (买入 {buy_cost_total:.2f} + 卖出 {sell_cost_total:.2f})")
+            print(f"   - 净变化: {asset_change:+,.2f} 元")
+        else:
+            print(f"   无持仓")
+
+        print(f"\n{'='*60}\n")
 
         # ========== 第十三步：返回交易结果 ==========
 
@@ -1019,23 +1245,25 @@ def main(argv=None) -> bool:
     # ========== 第八步：Phase0 - 请求持仓并等待 iQuant 响应 ==========
 
     # 写入 state.json: phase=positions_needed（告知 iQuant 需要持仓数据）
-    print(f"[live] 请求持仓，写 state=positions_needed, version={version}")
+    print(f"\n📊 [Phase 0] 获取账户数据")
+    print(f"   ├─ 请求持仓数据...")
     _write_state(state_path, phase="positions_needed", version=version, extra={})
 
     # 等待 iQuant 写入 state.json: phase=positions_ready（表示持仓已导出）
-    print(f"[live] 等待 positions_ready (version={version}) ...")
+    print(f"   ├─ 等待 iQuant 导出...")
     _wait_for_phase(state_path, expect_phase="positions_ready", expect_version=version, timeout=wait_secs)
 
     # 读取 iQuant 导出的 positions_live.csv
     # 返回 (holdings, cash)：持仓字典 + 账户现金
     holdings, cash_from_iquant = _read_positions(positions_path)
-    print(f"[live] 读取到持仓: {len(holdings)} 只股票")
 
     # 检查是否成功读取账户现金（CASH 行）
     if cash_from_iquant is not None:
-        print(f"[live] ✅ 读取到账户现金: {cash_from_iquant:.2f} 元")
+        print(f"   ├─ 持仓: {len(holdings)} 只股票")
+        print(f"   └─ 现金: {cash_from_iquant:,.2f} 元 ✅")
     else:
-        print(f"[live] ⚠️  未读取到账户现金（positions_live.csv 中无 CASH 行）")
+        print(f"   ├─ 持仓: {len(holdings)} 只股票")
+        print(f"   └─ 现金: 未读取 ⚠️")
 
     # ========== 第九步：构建预测配置对象 PredictionConfig ==========
 
@@ -1094,10 +1322,6 @@ def main(argv=None) -> bool:
         use_exchange_system=trading_raw.get("use_exchange_system", True),
         # 总现金（使用从 iQuant 读取的实际值）
         total_cash=actual_cash,
-        # 最大股价限制（None=不限制，设置后会过滤高价股）
-        max_stock_price=trading_raw.get("max_stock_price", None),
-        # Dropout 比率（随机丢弃一部分持仓，用于组合优化）
-        dropout_rate=trading_raw.get("dropout_rate", 0.0),
         # 最小购买份额（A 股最小 100 股）
         min_shares=trading_raw.get("min_shares", 100),
         # 价格搜索天数（回溯多少天寻找有效价格）
@@ -1111,6 +1335,14 @@ def main(argv=None) -> bool:
         n_drop=trading_raw.get("n_drop", 3),
         # 持有天数控制（最短持有天数，默认 1 天，单位：交易日）
         hold_thresh=trading_raw.get("hold_thresh", 1),
+        # LiveTopkStrategy 相关参数（小资金优化）
+        use_live_topk_strategy=trading_raw.get("use_live_topk_strategy", False),
+        min_affordable_shares=trading_raw.get("min_affordable_shares", 100),
+        # 交易成本参数（符合实际 A 股成本）
+        open_cost=trading_raw.get("open_cost", 0.0003),
+        close_cost=trading_raw.get("close_cost", 0.0013),
+        min_cost=trading_raw.get("min_cost", 1.0),
+        impact_cost=trading_raw.get("impact_cost", 0.0),
     )
 
     # ========== 第十一步：构建输出配置和 Pipeline 对象 ==========
@@ -1131,23 +1363,29 @@ def main(argv=None) -> bool:
 
     # ========== 第十二步：Phase1 - 模型推理 + Topk 选股 ==========
 
+    print(f"🤖 [Phase 1] 模型推理与选股")
+    print(f"   ├─ 正在初始化环境...")
     # 初始化 qlib 环境（加载配置、检查数据等）
     pipeline._init_environment()
     # 加载 MLflow recorder（用于访问实验记录）
     pipeline.recorder = pipeline._load_recorder()
     # 从 recorder 中加载训练好的模型
+    print(f"   ├─ 正在加载模型...")
     pipeline.model = pipeline._load_model(pipeline.recorder)
     # 构建数据集（特征计算、数据处理）
+    print(f"   ├─ 正在构建数据集...")
     pipeline.dataset = pipeline._build_dataset()
 
     # 生成模型预测（对股票池中的所有股票进行打分）
+    print(f"   ├─ 正在执行预测...")
     preds = pipeline._generate_predictions()
     # 准备预测结果（转换为 DataFrame，添加 instrument 列等）
     pred_df = pipeline._prepare_predictions(preds)
     # 附加市场数据（价格、涨跌停等信息）
     pred_df = pipeline._attach_market_data(pred_df)
-    # 选择 Topk 可买入股票（按分数排序，取前 top_k 只，可能由于过滤会小于topk） TODO：这里我觉得要返回全部的topk
-    pred_df = pipeline._select_buyable_topk(pred_df)
+    # Phase1: 选择 Topk 候选股票用于获取实时报价（不做筛选，输出完整的 topk）
+    print(f"   ├─ 正在选择候选股票...")
+    pred_df = pipeline._get_topk_candidates_for_quotes(pred_df)
 
     # ========== 第十三步：生成选股请求文件 symbols_req.csv ==========
 
@@ -1174,31 +1412,34 @@ def main(argv=None) -> bool:
         )
         # 合并到请求 DataFrame
         req_df = pd.concat([req_df, extra_df], ignore_index=True)
-        print(f"[live] 附加持仓代码 {len(extra_symbols)} 只以便获取实时报价: {extra_symbols[:5]}")
 
     # 写入 symbols_req.csv（告知 iQuant 需要获取哪些股票的实时行情）
     symbols_path = Path(symbols_out)
     symbols_path.parent.mkdir(parents=True, exist_ok=True)  # 确保父目录存在
     symbols_path.write_text(req_df.to_csv(index=False), encoding="utf-8-sig")
-    print(f"[live] symbols_req -> {symbols_path}")
 
     # 写入 state.json: phase=symbols_ready（告知 iQuant 选股完成，可以获取行情了）
     state_path.parent.mkdir(parents=True, exist_ok=True)
     _write_state(state_path, phase="symbols_ready", version=version, extra={"symbols": symbols_path.name})
 
+    print(f"   └─ 已输出选股文件 ({len(req_df)} 只) ✅\n")
+
     # ========== 第十四步：等待 iQuant 导出实时行情 quotes_live.csv ==========
 
     # 等待 iQuant 写入 state.json: phase=quotes_ready（表示行情已导出）
-    print(f"[live] 等待 quotes_ready (version={version}) ...")
+    print(f"💱 [Phase 1.5] 获取实时行情")
+    print(f"   ├─ 等待 iQuant 导出...")
     _wait_for_phase(state_path, expect_phase="quotes_ready", expect_version=version, timeout=wait_secs)
 
     # 读取 iQuant 导出的 quotes_live.csv（实时行情：last/bid1/ask1/涨跌停等）
     quotes_live = _read_quotes(quotes_path)
     # 将实时行情注入 Pipeline（Phase2 需要使用）
     pipeline.quotes_live = quotes_live
+    print(f"   └─ 已获取 {len(quotes_live)} 只股票行情 ✅\n")
 
     # ========== 第十五步：Phase2 - 注入实时行情，生成订单 ==========
 
+    print(f"📝 [Phase 2] 生成交易订单")
     # 调用 _generate_trading_orders，使用 LiveExchange + quotes_live 生成订单
     trading_result = pipeline._generate_trading_orders(pred_df)
     # 提取订单 DataFrame（如果生成失败则为空 DataFrame）
@@ -1208,7 +1449,7 @@ def main(argv=None) -> bool:
     orders_path = Path(orders_out)
     orders_path.parent.mkdir(parents=True, exist_ok=True)  # 确保父目录存在
     orders_path.write_text(orders_df.to_csv(index=False), encoding="utf-8-sig")
-    print(f"[live] orders_to_exec -> {orders_path}")
+    print(f"\n✅ [完成] 已输出订单文件 ({len(orders_df)} 条)\n   路径: {orders_path}")
 
     # 写入 state.json: phase=orders_ready（告知 iQuant 订单已生成，可以执行下单了）
     _write_state(state_path, phase="orders_ready", version=version, extra={"orders": orders_path.name})

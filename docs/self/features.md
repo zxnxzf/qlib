@@ -747,5 +747,275 @@ git commit: feat: qlib 与 iQuant 数据一致性验证
 
 ---
 
+## LiveTopkStrategy - 小资金优化策略
+
+**实现时间**: 2025-11-26
+**状态**: ✅ 已完成
+
+### 功能概述
+
+为小资金账户创建优化策略，通过**两轮预算分配**机制最大化买入股票数量和资金利用率，解决小资金账户买不起高价股导致资金闲置的问题。
+
+### 核心问题
+
+**原有策略（TopkDropoutStrategy）的局限**:
+- 等分预算买入topk只股票
+- 高价股可能买不到1手（100股），直接跳过
+- 导致资金闲置，买入股票数量少
+
+**示例问题**:
+```
+总资金: 10万, topk=10, risk_degree=0.95
+预算: 9.5万 / 10 = 9,500元/股
+
+候选股票价格:
+- 贵州茅台: 1,680元 → 可买 5股 < 100股 ❌ 跳过
+- 比亚迪: 300元 → 可买 31股 < 100股 ❌ 跳过
+- 宁德时代: 200元 → 可买 47股 < 100股 ❌ 跳过
+...
+
+结果: 10只候选中只买到2-3只，资金使用率不足50%
+```
+
+### 解决方案：两轮预算分配
+
+**核心思路**: 先筛选可负担股票，再重新等分预算
+
+#### Round 1 - 可负担性筛选
+```python
+# 假设等分预算
+initial_budget = total_cash * risk_degree / topk
+
+# 筛选能买到至少100股的股票
+affordable_stocks = []
+for stock in candidates:
+    shares = initial_budget / price[stock]
+    shares = round_to_lot(shares)  # 整手取整
+    if shares >= 100:  # 至少1手
+        affordable_stocks.append(stock)
+```
+
+#### Round 2 - 预算重新分配
+```python
+# 用总预算重新等分给筛选出的股票
+final_budget = total_cash * risk_degree / len(affordable_stocks)
+
+# 用更高的单股预算买入
+for stock in affordable_stocks:
+    shares = final_budget / price[stock]
+    shares = round_to_lot(shares)
+    place_order(stock, shares)
+```
+
+#### 效果对比
+
+**示例场景**: 总资金10万，topk=20，risk_degree=0.95
+
+| 策略 | Round1筛选 | Round2重分配 | 结果 |
+|-----|-----------|------------|------|
+| **TopkDropoutStrategy** | N/A | 9.5万/20=4,750元/股 | 只买到5只，资金使用率45% |
+| **LiveTopkStrategy** | 4,750元/股筛选 → 保留8只 | 9.5万/8=11,875元/股 | 买到8只，资金使用率95% |
+
+**提升**:
+- ✅ 买入股票数: 5只 → 8只 (+60%)
+- ✅ 资金使用率: 45% → 95% (+111%)
+- ✅ 单股预算: 4,750元 → 11,875元 (+150%)
+
+### 实现细节
+
+#### 1. 创建 LiveTopkStrategy 类
+
+**文件**: `qlib/contrib/strategy/live_strategy.py`
+
+```python
+from .signal_strategy import TopkDropoutStrategy
+
+class LiveTopkStrategy(TopkDropoutStrategy):
+    def __init__(
+        self,
+        *,
+        min_affordable_shares: int = 100,        # 最小可负担股数（1手）
+        enable_affordability_filter: bool = True, # 启用两轮分配
+        **kwargs  # 父类所有参数
+    ):
+        super().__init__(**kwargs)
+        self.min_affordable_shares = min_affordable_shares
+        self.enable_affordability_filter = enable_affordability_filter
+
+    def generate_trade_decision(self, execute_result=None):
+        # 如果禁用，直接使用父类逻辑
+        if not self.enable_affordability_filter:
+            return super().generate_trade_decision(execute_result)
+
+        # ... Round 1: 筛选可负担股票 ...
+        # ... Round 2: 重新分配预算 ...
+```
+
+#### 2. 配置参数
+
+**DEFAULT_CONFIG 配置** (`live_daily_predict.py`):
+```python
+"trading": {
+    # ... 其他配置 ...
+    "risk_degree": 0.05,  # 小资金时，通过调整 risk_degree 控制实际使用金额
+
+    # LiveTopkStrategy 相关配置
+    "use_live_topk_strategy": False,  # 是否启用（默认关闭）
+    "min_affordable_shares": 100,     # 最小可负担股数（1手）
+}
+```
+
+**TradingConfig 类** (`daily_predict.py`):
+```python
+@dataclass
+class TradingConfig:
+    # ... 其他字段 ...
+
+    # LiveTopkStrategy 相关参数
+    use_live_topk_strategy: bool = False
+    min_affordable_shares: int = 100
+```
+
+#### 3. 策略实例化
+
+**自动选择策略** (`live_daily_predict.py` 约760行):
+```python
+# 根据配置选择策略类
+use_live_topk = self.trading_cfg.use_live_topk_strategy
+min_afford_shares = self.trading_cfg.min_affordable_shares
+
+if use_live_topk:
+    from qlib.contrib.strategy.live_strategy import LiveTopkStrategy
+    print("[live] 使用 LiveTopkStrategy（两轮预算分配优化）")
+    strategy = LiveTopkStrategy(
+        signal=signal,
+        topk=self.prediction_cfg.top_k,
+        n_drop=self.trading_cfg.n_drop,
+        # ... 其他父类参数 ...
+        min_affordable_shares=min_afford_shares,
+        enable_affordability_filter=True,
+    )
+else:
+    from qlib.contrib.strategy.signal_strategy import TopkDropoutStrategy
+    print("[live] 使用 TopkDropoutStrategy（标准策略）")
+    strategy = TopkDropoutStrategy(...)
+```
+
+### 使用方法
+
+#### 方式1: 修改 DEFAULT_CONFIG（推荐）
+
+**编辑** `examples/live_daily_predict.py`:
+```python
+DEFAULT_CONFIG = {
+    # ... 其他配置 ...
+    "trading": {
+        "total_cash": 50000,  # 或从 iQuant 自动获取
+        "risk_degree": 0.05,  # 控制实际使用资金（100万*0.05=5万）
+        "use_live_topk_strategy": True,  # ✅ 启用 LiveTopkStrategy
+        "min_affordable_shares": 100,
+    }
+}
+```
+
+**运行**:
+```bash
+python examples/live_daily_predict.py
+```
+
+#### 方式2: 使用外部配置文件
+
+**创建** `config_live_small_cap.json`:
+```json
+{
+  "trading": {
+    "total_cash": 50000,
+    "risk_degree": 0.95,
+    "use_live_topk_strategy": true,
+    "min_affordable_shares": 100
+  }
+}
+```
+
+**运行**:
+```bash
+python examples/live_daily_predict.py --config config_live_small_cap.json
+```
+
+### 预期日志输出
+
+```
+[live] 使用 LiveTopkStrategy（两轮预算分配优化）
+
+[LiveTopk] Round 1: 可负担性筛选
+   现金: 50000.00, 风险度: 0.95, 候选数: 20
+   初始单股预算: 2375.00 元
+   [过滤] SH600519: 价格=1680.00, 可买=1股 < 100
+   [过滤] SZ002594: 价格=300.00, 可买=7股 < 100
+   ... (12只过滤)
+
+[LiveTopk] Round 2: 预算重新分配
+   20 候选 → 8 可买入
+   预算调整: 2375 → 5938 元/股
+
+[live] 生成买入订单: 8 条
+[live] 预计买入金额: 47,504 元
+[live] 资金使用率: 95.0%
+```
+
+### 关键文件
+
+| 文件 | 说明 |
+|------|------|
+| `qlib/contrib/strategy/live_strategy.py` | LiveTopkStrategy 核心实现 |
+| `qlib/contrib/strategy/__init__.py` | 导出 LiveTopkStrategy |
+| `examples/daily_predict.py` | TradingConfig 类定义（新增字段） |
+| `examples/live_daily_predict.py` | 配置和策略实例化逻辑 |
+
+### 适用场景
+
+✅ **适合**:
+- 小资金账户（<10万）
+- 高价股较多的股票池（如沪深300）
+- 希望提高资金使用率和分散度
+
+⚠️ **不适合**:
+- 大资金账户（>50万）
+- 全是低价股的股票池
+- 需要严格控制持仓数量的策略
+
+### 权衡考虑
+
+**优点**:
+- ✅ 提高买入股票数量（更好的分散度）
+- ✅ 减少资金闲置（更高的资金使用率）
+- ✅ 灵活适配小资金场景
+
+**缺点**:
+- ⚠️ 可能跳过高质量但价格昂贵的股票
+- ⚠️ 如果可负担股票太少，仍可能集中持仓
+- ⚠️ 两轮筛选增加少量计算开销
+
+### 经验教训
+
+1. **资金来源**: total_cash 来自 iQuant 实际账户（positions_live.csv 的 CASH 行），通过 risk_degree 控制实际使用比例
+2. **配置灵活性**: 通过 enable_affordability_filter 参数可随时切换回标准策略
+3. **向后兼容**: 继承 TopkDropoutStrategy，保留所有父类功能（T+1限制、卖出逻辑等）
+
+### Git 提交
+
+```bash
+git commit: feat: 实现 LiveTopkStrategy 小资金优化策略
+```
+
+**主要改动**:
+- 新增 `qlib/contrib/strategy/live_strategy.py` (~350行)
+- 更新 `qlib/contrib/strategy/__init__.py` 导出
+- 修改 `examples/daily_predict.py` TradingConfig 添加字段
+- 修改 `examples/live_daily_predict.py` 配置和策略实例化
+- 更新文档 `docs/self/features.md`
+
+---
+
 *最后更新: 2025-11-25*
 **文档维护**: 每次实现新功能并验证通过后，及时更新本文档。
