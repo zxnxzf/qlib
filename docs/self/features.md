@@ -237,6 +237,159 @@ else:
 
 ---
 
+#### Bug #2: hold_thresh (T+1) 在实盘中失效
+
+**发现时间**: 2025-11-26
+**修复提交**: `d5d3dc05` - fix: 修复 hold_thresh (T+1) 在实盘中失效的问题
+
+**问题描述**:
+
+Qlib 的 `hold_thresh` 参数用于控制最短持有天数（实现 A 股 T+1 限制），但在实盘场景下完全失效：
+
+- **回测场景**: Position 对象包含 `count_day` 字段，T+1 限制正常工作 ✅
+- **实盘场景**: 从 iQuant 读取的持仓缺少 `count_day` 信息，导致 `get_stock_count()` 返回 0 ❌
+
+**实际影响**:
+
+```python
+# TopkDropoutStrategy 卖出前检查持有天数
+if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
+    continue  # 持有天数不足，跳过卖出
+
+# 实盘场景
+- 新买入股票: count_day 缺失 → 返回 0 < 1 → 跳过卖出 ✅ 正确
+- 老持仓股票: count_day 缺失 → 返回 0 < 1 → 跳过卖出 ❌ 错误！（老持仓应该可以卖）
+```
+
+**根本原因**:
+
+实盘初始化 Position 时，只设置了 `amount`，没有设置 `count_day`：
+
+```python
+# 修复前
+position = Position(
+    cash=total_cash,
+    position_dict={code: {"amount": amount} for code, amount in holdings.items()},
+    # ❌ 缺少 count_day 字段
+)
+```
+
+**解决方案**:
+
+**核心思路**: 本地维护 `holdings_history.json`，记录**由 qlib 买入的股票**及其买入日期：
+- ✅ **老持仓**（history 中没有记录）→ 默认可卖（`hold_days = 101`）
+- ✅ **新买入**（history 中有记录）→ 计算实际持有天数，严格遵守 T+1
+
+**实现细节**:
+
+1. **持仓历史文件** (`predictions/holdings_history.json`):
+```json
+{
+    "601318.SH": {
+        "buy_date": "2025-01-15",
+        "amount": 200
+    }
+}
+```
+
+2. **计算持有天数** (老持仓默认可卖):
+```python
+def _calculate_hold_days(current_holdings, today_str, hold_thresh=1):
+    history = _load_holdings_history()
+
+    # 自动清理已卖出的股票
+    for code in list(history.keys()):
+        if code not in current_holdings:
+            del history[code]  # 已卖出，删除记录
+
+    # 计算持有天数
+    for code, amount in current_holdings.items():
+        if code in history:
+            # 有记录：计算实际持有天数
+            buy_date = history[code]["buy_date"]
+            hold_days = (today - buy_date).days
+        else:
+            # 无记录：老持仓，默认可卖
+            hold_days = hold_thresh + 100  # 101 天
+```
+
+3. **初始化 Position 时设置 count_day**:
+```python
+# 修复后
+hold_days_dict = _calculate_hold_days(holdings, today, hold_thresh=1)
+
+position_dict = {}
+for code, amount in holdings.items():
+    position_dict[code] = {
+        "amount": amount,
+        "count_day": hold_days_dict[code],  # ✅ 设置持有天数
+    }
+
+position = Position(cash=total_cash, position_dict=position_dict)
+```
+
+4. **记录买入订单**:
+```python
+# 生成订单后，记录买入到历史
+buy_orders = orders_df[orders_df["action"] == "买入"]
+if len(buy_orders) > 0:
+    _update_holdings_history_after_buy(buy_orders, today)
+```
+
+**更新时机**:
+
+| 操作 | 时机 | 说明 |
+|------|------|------|
+| 📖 **读取** | Phase2 开始 | 计算持有天数时读取 |
+| ✏️ **新增** | 生成买入订单后 | 记录买入日期 |
+| 🗑️ **删除** | Phase2 开始（自动） | 清理已卖出股票 |
+
+**测试场景**:
+
+**Day 1 - 首次运行（老持仓）**:
+```
+持仓: 600519.SH (100股)
+历史: (空)
+结果: hold_days=101，可以卖出 ✅
+
+生成订单: 买入 601318.SH (200股)
+更新历史: {"601318.SH": {"buy_date": "2025-01-15", ...}}
+```
+
+**Day 2 - T+1 检查**:
+```
+持仓: 601318.SH (200股)
+历史: {"601318.SH": {"buy_date": "2025-01-15", ...}}
+结果: hold_days=1，满足 hold_thresh=1，可以卖出 ✅
+```
+
+**Day 3 - 自动清理**:
+```
+持仓: (601318.SH 已卖出)
+历史: {"601318.SH": ...}
+执行: 自动检测并删除 601318.SH
+输出: [清理] 已卖出股票: 601318.SH
+```
+
+**核心优势**:
+
+- ✅ **首次运行友好**: 老持仓可以正常卖出
+- ✅ **严格 T+1 限制**: 新买入必须持有满足天数
+- ✅ **自动维护**: 无需手动清理，防止文件膨胀
+- ✅ **健壮性强**: 文件丢失不影响系统运行（默认可卖）
+- ✅ **更新时机合理**: 订单生成后立即记录，保守安全
+
+**相关文件**:
+- `examples/live_daily_predict.py` - 添加持仓历史管理逻辑
+- `predictions/holdings_history.json` - 自动生成的持仓历史文件
+
+**经验教训**:
+- 实盘场景下，Position 对象的初始化需要完整设置所有必要字段
+- 对于缺失的历史数据，应采用保守策略（宁可多限制，不可违规）
+- 自动清理机制避免了状态文件的无限增长
+
+---
+
 ## 后续规划
 
 - [ ] 支持更多订单类型（限价单、止损单等）
