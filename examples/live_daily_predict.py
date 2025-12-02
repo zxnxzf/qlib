@@ -21,17 +21,19 @@ import numpy as np  # 数值计算
 import pandas as pd  # 数据处理
 from pandas.tseries.offsets import BDay
 
+# 确保优先使用项目根目录下的 qlib 包，避免被 examples/qlib 命名空间遮蔽
+_EXAMPLES_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _EXAMPLES_DIR.parent
+for _path in (str(_REPO_ROOT), str(_EXAMPLES_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
 from qlib.utils import get_pre_trading_date  # 获取前一交易日
 from qlib.backtest.decision import OrderDir  # 订单方向枚举
 from qlib.backtest.live_exchange import LiveExchange  # 实时报价 Exchange
 from qlib.data import D
 
-# 调整 sys.path，保证能导入同级 daily_predict（examples 目录）
-_EXAMPLES_DIR = Path(__file__).resolve().parent
-if str(_EXAMPLES_DIR) not in sys.path:
-    sys.path.insert(0, str(_EXAMPLES_DIR))
-
-# 从同级 daily_predict 导入原有配置和 Pipeline
+# 从同级 daily_predict 导入原有配置和 Pipeline（路径已在上方插入）
 from daily_predict import (  # noqa: E402  # 延迟导入
     DailyPredictionPipeline,
     PredictionConfig,
