@@ -51,3 +51,11 @@ class LiveExchange(Exchange):
             return price
         # 否则回退父类逻辑（历史价）
         return super().get_deal_price(stock_id, start_time=start_time, end_time=end_time, direction=direction, **kwargs)
+
+    def get_factor(self, stock_id, start_time, end_time):
+        """
+        实盘场景下，quotes_live 中的价格来自 iQuant，为未复权价。
+        为避免与 qlib 离线数据中的复权因子混用，这里统一返回 1.0，
+        相当于关闭复权缩放，只保留“一手=trade_unit 股”的约束。
+        """
+        return 1.0

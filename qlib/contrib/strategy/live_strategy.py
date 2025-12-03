@@ -276,14 +276,19 @@ class LiveTopkStrategy(TopkDropoutStrategy):
             )
             rounded_shares = self.trade_exchange.round_amount_by_trade_unit(potential_shares, factor)
 
-            # 筛选：保留能买到至少1手的股票
-            if rounded_shares >= self.min_affordable_shares:
+            # 在回测中，rounded_shares 是“复权股数”，乘以 factor 后近似为真实股数
+            raw_shares = rounded_shares
+            if factor is not None and not pd.isna(factor):
+                raw_shares = rounded_shares * factor
+
+            # 筛选：保留能买到至少 min_affordable_shares 股（真实股数）的股票
+            if raw_shares >= self.min_affordable_shares:
                 affordable_stocks.append(code)
             else:
                 if trade_step == 0:
                     print(
                         f"[LiveTopk][过滤] {code}: 价格={buy_price:.2f}, "
-                        f"可买={rounded_shares}股 < {self.min_affordable_shares}"
+                        f"可买≈{raw_shares:.0f}股 < {self.min_affordable_shares}"
                     )
 
         # Round 2: 预算重新分配
