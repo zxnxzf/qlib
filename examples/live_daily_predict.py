@@ -82,6 +82,7 @@ DEFAULT_CONFIG = {
         "enable_trading": True,  # 是否生成交易
         "use_exchange_system": True,  # 是否使用 Exchange 系统
         "total_cash": 50000,  # 资金规模
+        "reserve_cash": 199800000.0,  # 预留资金（实盘从总现金中扣除）
         "min_shares": 100,  # 单笔最小股数
         "price_search_days": 5,  # 回溯价格天数
         "risk_degree": 0.0001,  # 可用资金比例，账户有20万 * 10 ^ 3，预计使用20万
@@ -1307,6 +1308,7 @@ def main(argv=None) -> bool:
 
     # 决定使用的现金金额：优先使用从 iQuant 读取的实际值，否则使用配置默认值
     config_cash = trading_raw.get("total_cash", 50000)
+    reserve_cash = float(trading_raw.get("reserve_cash", 0.0))
     if cash_from_iquant is not None:
         # 使用从 iQuant 读取的实际账户现金
         actual_cash = cash_from_iquant
@@ -1316,6 +1318,14 @@ def main(argv=None) -> bool:
         actual_cash = config_cash
         print(f"[live] ⚠️  使用配置文件的默认总资金: {actual_cash:.2f} 元（建议检查 iQuant 账户现金获取逻辑）")
 
+    if reserve_cash > 0:
+        effective_cash = max(actual_cash - reserve_cash, 0.0)
+        print(
+            f"[live] 资金预扣: 原始现金 {actual_cash:,.2f} 元 | 预留 {reserve_cash:,.2f} 元 | 可用 {effective_cash:,.2f} 元"
+        )
+    else:
+        effective_cash = actual_cash
+
     # 构建交易配置对象
     base_trading_cfg = TradingConfig(
         # 是否启用交易生成
@@ -1323,7 +1333,7 @@ def main(argv=None) -> bool:
         # 是否使用 Exchange 系统（用于模拟撮合和价格获取）
         use_exchange_system=trading_raw.get("use_exchange_system", True),
         # 总现金（使用从 iQuant 读取的实际值）
-        total_cash=actual_cash,
+        total_cash=effective_cash,
         # 最小购买份额（A 股最小 100 股）
         min_shares=trading_raw.get("min_shares", 100),
         # 价格搜索天数（回溯多少天寻找有效价格）
