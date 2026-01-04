@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
     "runtime": {
         "version": None,  # 运行批次号
         "wait_secs": 300,  # 等待下一阶段超时时间
-        "loop": False,  # 是否启用日频循环
+        "loop": True,  # 是否启用日频循环
         "loop_interval": 300,  # 循环检查间隔（秒）
     },
     "prediction": {
