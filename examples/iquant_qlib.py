@@ -7,6 +7,7 @@
 import os
 import json
 import time
+from datetime import datetime
 import pandas as pd
 
 # ===== Paths (edit to your environment) =====
@@ -35,6 +36,9 @@ _ORDER_DF = None
 _DONE_IDS = set()
 _ERROR_ONCE = False
 _FIRED = False
+_LAST_RUN_KEY = None
+_CURRENT_RUN_KEY = None
+_LAST_BAR_DATE = None
 
 
 def _normalize_code(code: str) -> str:
@@ -121,6 +125,17 @@ def _write_state(phase: str, version: str, extra: dict = None):
         json.dump(payload, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_JSON_PATH)
     print("[DEBUG] write state =>", payload)
+
+
+def _reset_runtime_state(ContextInfo, reason: str):
+    global _ORDER_DF, _DONE_IDS, _ERROR_ONCE, _FIRED
+    _ORDER_DF = None
+    _DONE_IDS = set()
+    _ERROR_ONCE = False
+    _FIRED = False
+    if hasattr(ContextInfo, "_polling_started"):
+        ContextInfo._polling_started = False
+    print(f"[iQuant][RESET] {reason}")
 
 
 def _sign_by_action(action: str, qty: int) -> int:
@@ -634,7 +649,7 @@ def _export_quotes(ContextInfo, version: str) -> bool:
 # ---------- 主动轮询处理函数 ----------
 def _process_state(ContextInfo):
     """处理当前 state，返回 True 表示需要继续轮询，False 表示已完成"""
-    global _ERROR_ONCE, _FIRED
+    global _ERROR_ONCE, _FIRED, _LAST_RUN_KEY
 
     state = _read_state()
     phase = state.get("phase")
@@ -709,6 +724,7 @@ def _process_state(ContextInfo):
             _place_orders(df, ContextInfo, expect_ver or "")
             _FIRED = True
             _write_state("exec_done", expect_ver or "", {"status": "ok"})
+            _LAST_RUN_KEY = expect_ver
             print("[iQuant] 订单执行完毕，流程结束")
             return False  # 停止轮询
         except Exception as exc:
@@ -718,6 +734,7 @@ def _process_state(ContextInfo):
                 traceback.print_exc()
                 _ERROR_ONCE = True
             _write_state("exec_failed", expect_ver or "", {"error": str(exc)})
+            _LAST_RUN_KEY = expect_ver
             return False  # 停止轮询
 
     # 其他 phase（positions_ready, quotes_ready, exec_done, exec_failed 等）
@@ -749,6 +766,7 @@ def init(ContextInfo):
 
 def handlebar(ContextInfo):
     """每个 bar 调用一次，首次调用时启动主动轮询"""
+    global _LAST_BAR_DATE, _CURRENT_RUN_KEY, _LAST_RUN_KEY
     # ========== 关键 DEBUG：bar 状态诊断 ==========
     ts_func = getattr(ContextInfo, 'get_bar_timetag', None)
     ts = ts_func(ContextInfo.barpos) if callable(ts_func) else None
@@ -764,6 +782,22 @@ def handlebar(ContextInfo):
         return
 
     print(f"[DEBUG][handlebar] ✅ 确认为实时 bar，继续执行")
+
+    bar_date = datetime.now().strftime("%Y%m%d")
+
+    if _LAST_BAR_DATE != bar_date:
+        _LAST_BAR_DATE = bar_date
+        _reset_runtime_state(ContextInfo, f"new_day={bar_date}")
+
+    state = _read_state()
+    version = state.get("version")
+    if version:
+        if _LAST_RUN_KEY == version:
+            print(f"[iQuant][INFO] version={version} 已处理，跳过")
+            return
+        if _CURRENT_RUN_KEY != version:
+            _CURRENT_RUN_KEY = version
+            _reset_runtime_state(ContextInfo, f"new_version={version}")
 
     # 只在首次调用时启动轮询
     if getattr(ContextInfo, "_polling_started", False):

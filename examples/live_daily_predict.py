@@ -61,6 +61,8 @@ DEFAULT_CONFIG = {
     "runtime": {
         "version": None,  # 运行批次号
         "wait_secs": 300,  # 等待下一阶段超时时间
+        "loop": False,  # 是否启用日频循环
+        "loop_interval": 300,  # 循环检查间隔（秒）
     },
     "prediction": {
         "experiment_id": "866149675032491302",  # 实验 ID
@@ -101,6 +103,8 @@ DEFAULT_CONFIG = {
         "enable_auto_update": True,  # 是否自动更新数据
         "data_source_url": "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",  # 数据源 URL
         "download_timeout": 600,  # 下载超时
+        "retry_count": 3,  # 下载失败重试次数
+        "retry_interval": 10,  # 重试间隔（秒）
         "temp_dir": None,  # 临时目录
     },
 }
@@ -252,6 +256,8 @@ class DataUpdateConfig:
     enable_auto_update: bool = True  # 是否启用自动更新逻辑
     data_source_url: str = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"  # 默认数据源
     download_timeout: int = 600  # 下载超时时间
+    retry_count: int = 3  # 下载失败重试次数
+    retry_interval: int = 10  # 重试间隔（秒）
     temp_dir: Optional[str] = None  # 临时目录位置
 
     def get_temp_dir(self) -> Path:
@@ -305,36 +311,50 @@ def _is_data_outdated(data_path: Path, target_date: str, instruments) -> tuple:
 
 
 def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
-    try:
-        temp_dir = cfg.get_temp_dir()
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        download_path = temp_dir / "qlib_bin.tar.gz"
-        print("[数据] 开始下载最新数据包...")
-        print(f"   来源: {cfg.data_source_url}")
-        urlretrieve(cfg.data_source_url, download_path)
-        print(f"[成功] 下载完成，文件大小 {download_path.stat().st_size / (1024 * 1024):.1f} MB")
-        extract_dir = temp_dir / "extracted"
-        if extract_dir.exists():
-            shutil.rmtree(extract_dir)
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(download_path, "r:gz") as tar:
-            tar.extractall(extract_dir)
-        qlib_bin_dir = extract_dir / "qlib_bin"
-        if not qlib_bin_dir.exists():
-            print("[错误] 解压后的目录缺少 qlib_bin 目录")
-            return False
-        for dirname in ("features", "instruments", "calendars"):
-            if not (qlib_bin_dir / dirname).exists():
-                print(f"[错误] 缺少必要目录: {dirname}")
+    temp_dir = cfg.get_temp_dir()
+    download_path = temp_dir / "qlib_bin.tar.gz"
+    extract_dir = temp_dir / "extracted"
+    retry_count = max(int(cfg.retry_count), 1)
+    retry_interval = max(int(cfg.retry_interval), 0)
+
+    for attempt in range(1, retry_count + 1):
+        try:
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            if retry_count > 1:
+                print(f"[数据] 下载尝试 {attempt}/{retry_count}")
+            print("[数据] 开始下载最新数据包...")
+            print(f"   来源: {cfg.data_source_url}")
+            urlretrieve(cfg.data_source_url, download_path)
+            print(f"[成功] 下载完成，文件大小 {download_path.stat().st_size / (1024 * 1024):.1f} MB")
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir)
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(download_path, "r:gz") as tar:
+                tar.extractall(extract_dir)
+            qlib_bin_dir = extract_dir / "qlib_bin"
+            if not qlib_bin_dir.exists():
+                print("[错误] 解压后的目录缺少 qlib_bin 目录")
                 return False
-        if target_path.exists():
-            shutil.rmtree(target_path)
-        shutil.copytree(qlib_bin_dir, target_path)
-        print("[成功] 数据更新完成")
-        return True
-    except Exception as err:
-        print(f"[错误] 数据更新失败: {err}")
-        return False
+            for dirname in ("features", "instruments", "calendars"):
+                if not (qlib_bin_dir / dirname).exists():
+                    print(f"[错误] 缺少必要目录: {dirname}")
+                    return False
+            if target_path.exists():
+                shutil.rmtree(target_path)
+            shutil.copytree(qlib_bin_dir, target_path)
+            print("[成功] 数据更新完成")
+            return True
+        except Exception as err:
+            print(f"[错误] 数据更新失败: {err}")
+            if download_path.exists():
+                download_path.unlink()
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir)
+            if attempt < retry_count:
+                print(f"[数据] {retry_interval} 秒后重试...")
+                time.sleep(retry_interval)
+            else:
+                return False
 
 
 def _ensure_data_ready(provider_uri: str, instruments, target_date: str, cfg: DataUpdateConfig):
@@ -376,6 +396,26 @@ def _resolve_trading_date(target_ts: pd.Timestamp) -> str:
                 return cal[-1].strftime("%Y-%m-%d")
             window *= 2
         raise ValueError(f"无法在 {date_str} 之前找到交易日，请检查数据目录是否完整")
+
+
+def _compute_target_pred_date(pred_cfg_raw: Dict[str, object]) -> str:
+    pred_cfg_date = pred_cfg_raw.get("prediction_date")
+    if not pred_cfg_date or str(pred_cfg_date).lower() == "auto":
+        today_ts = pd.Timestamp.utcnow().normalize()
+        return today_ts.strftime("%Y-%m-%d")
+    return pd.Timestamp(pred_cfg_date).strftime("%Y-%m-%d")
+
+
+def _is_trading_day(provider_uri: str, date_str: str) -> bool:
+    data_path = _provider_path_from_uri(provider_uri)
+    cal_file = data_path / "calendars" / "day.txt"
+    if not cal_file.exists():
+        return True
+    with cal_file.open("r") as f:
+        for line in f:
+            if line.strip() == date_str:
+                return True
+    return False
 
 
 def _read_positions(path: Optional[str]) -> Dict[str, float]:
@@ -1103,40 +1143,7 @@ class LiveDailyPredictionPipeline(DailyPredictionPipeline):
         )
 
 
-def main(argv=None) -> bool:
-    """
-    命令行入口：实盘交易的主流程（两阶段握手）
-
-    完整流程：
-    1. Phase0: 请求持仓 → 等待 iQuant 导出 positions_live.csv
-    2. Phase1: 模型推理 + Topk 选股 → 输出 symbols_req.csv
-    3. 等待 iQuant 导出 quotes_live.csv（实时行情）
-    4. Phase2: 注入实时行情 + 生成订单 → 输出 orders_to_exec.csv
-    5. iQuant 读取订单并执行实盘下单
-    """
-    # ========== 第一步：命令行参数解析和配置加载 ==========
-
-    # 创建命令行参数解析器
-    parser = argparse.ArgumentParser(description="Qlib live daily predict (two-phase, live quotes, config-driven)")
-    # 添加 --config 参数：可选的 JSON 配置文件路径
-    parser.add_argument("--config", type=str, required=False, help="JSON 配置路径；不传则使用代码内 DEFAULT_CONFIG")
-    # 解析命令行参数
-    args = parser.parse_args(argv)
-
-    # 根据是否提供配置文件，决定使用外部配置还是默认配置
-    if args.config:
-        # 使用外部 JSON 配置文件
-        cfg_path = Path(args.config)
-        if not cfg_path.exists():
-            raise FileNotFoundError(f"未找到配置文件: {cfg_path}")
-        # 读取并解析 JSON 配置
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        print(f"[live] 使用外部配置: {cfg_path}")
-    else:
-        # 使用文件顶部定义的 DEFAULT_CONFIG
-        cfg = DEFAULT_CONFIG
-        print("[live] 未提供 --config，使用 DEFAULT_CONFIG（请根据需要修改文件顶部配置）")
-
+def _run_once(cfg: Dict[str, object], target_pred_date: str, version: str) -> bool:
     # ========== 第二步：从配置中提取各部分配置项 ==========
 
     # 提取 qlib 初始化配置
@@ -1145,17 +1152,6 @@ def main(argv=None) -> bool:
     pred_cfg_raw = cfg.get("prediction", {})
     # 提取数据更新配置（自动下载等）
     data_update_raw = cfg.get("data_update", {})
-
-    # 获取当前日期（UTC，归一化为日期）
-    today_ts = pd.Timestamp.utcnow().normalize()
-    # 从配置中获取预测日期
-    pred_cfg_date = pred_cfg_raw.get("prediction_date")
-    # 如果配置中未指定或为 "auto"，则使用今天作为预测日期
-    if not pred_cfg_date or str(pred_cfg_date).lower() == "auto":
-        target_pred_date = today_ts.strftime("%Y-%m-%d")
-    else:
-        # 使用配置中指定的日期
-        target_pred_date = pd.Timestamp(pred_cfg_date).strftime("%Y-%m-%d")
 
     # ========== 第三步：构建数据更新配置对象 ==========
 
@@ -1171,6 +1167,10 @@ def main(argv=None) -> bool:
         data_source_url=data_update_raw.get("data_source_url", default_update_cfg.data_source_url),
         # 下载超时时间（秒）
         download_timeout=int(data_update_raw.get("download_timeout", default_update_cfg.download_timeout)),
+        # 下载失败重试次数
+        retry_count=int(data_update_raw.get("retry_count", default_update_cfg.retry_count)),
+        # 重试间隔（秒）
+        retry_interval=int(data_update_raw.get("retry_interval", default_update_cfg.retry_interval)),
         # 临时文件存储目录
         temp_dir=data_update_raw.get("temp_dir", default_update_cfg.temp_dir),
     )
@@ -1231,8 +1231,6 @@ def main(argv=None) -> bool:
     runtime = cfg.get("runtime", {})
     # 等待超时时间（秒），用于等待 iQuant 响应
     wait_secs = int(runtime.get("wait_secs", 300))
-    # 版本号（用于握手时识别批次，默认使用当前时间戳）
-    version = runtime.get("version") or pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
 
     # ========== 第七步：启动时重置 state.json（清理旧状态） ==========
 
@@ -1471,6 +1469,98 @@ def main(argv=None) -> bool:
     # 返回 True 表示整个流程执行成功
     # 后续 iQuant 会读取 orders_to_exec.csv 并执行实盘下单
     return True
+
+
+def main(argv=None) -> bool:
+    """
+    命令行入口：实盘交易的主流程（两阶段握手）
+
+    完整流程：
+    1. Phase0: 请求持仓 → 等待 iQuant 导出 positions_live.csv
+    2. Phase1: 模型推理 + Topk 选股 → 输出 symbols_req.csv
+    3. 等待 iQuant 导出 quotes_live.csv（实时行情）
+    4. Phase2: 注入实时行情 + 生成订单 → 输出 orders_to_exec.csv
+    5. iQuant 读取订单并执行实盘下单
+    """
+    # ========== 第一步：命令行参数解析和配置加载 ==========
+
+    # 创建命令行参数解析器
+    parser = argparse.ArgumentParser(description="Qlib live daily predict (two-phase, live quotes, config-driven)")
+    # 添加 --config 参数：可选的 JSON 配置文件路径
+    parser.add_argument("--config", type=str, required=False, help="JSON 配置路径；不传则使用代码内 DEFAULT_CONFIG")
+    # 解析命令行参数
+    args = parser.parse_args(argv)
+
+    # 根据是否提供配置文件，决定使用外部配置还是默认配置
+    if args.config:
+        # 使用外部 JSON 配置文件
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"未找到配置文件: {cfg_path}")
+        # 读取并解析 JSON 配置
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        print(f"[live] 使用外部配置: {cfg_path}")
+    else:
+        # 使用文件顶部定义的 DEFAULT_CONFIG
+        cfg = DEFAULT_CONFIG
+        print("[live] 未提供 --config，使用 DEFAULT_CONFIG（请根据需要修改文件顶部配置）")
+
+    # ========== 日频循环配置 ==========
+    # runtime.loop: True -> 常驻循环，每天自动跑一次
+    # runtime.loop: False -> 只跑一次就退出（默认行为）
+    runtime = cfg.get("runtime", {})
+    loop_enabled = bool(runtime.get("loop", False))
+    # 循环模式下的检查间隔（秒），用于控制“隔多久再检查是否新的一天”
+    loop_interval = int(runtime.get("loop_interval", 300))
+    # 记录上一次已完成的“预测日期”（YYYY-MM-DD），避免同一天重复执行
+    last_run_date = None
+
+    while True:
+        # 每一轮循环都重新读取 prediction 配置，支持外部配置热更新
+        pred_cfg_raw = cfg.get("prediction", {})
+        # 计算目标预测日（自动模式为今天；手动模式按配置日期）
+        target_pred_date = _compute_target_pred_date(pred_cfg_raw)
+
+        # 循环模式下：如果当天已经跑过，则跳过并等待下一次检查
+        if loop_enabled and last_run_date == target_pred_date:
+            print(f"[live] 已完成 {target_pred_date}，等待 {loop_interval} 秒...")
+            time.sleep(loop_interval)
+            continue
+
+        qlib_init_cfg = cfg.get("qlib_init", {})
+        provider_uri = pred_cfg_raw.get("provider_uri") or qlib_init_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data")
+        if loop_enabled and not _is_trading_day(provider_uri, target_pred_date):
+            print(f"[live] {target_pred_date} 非交易日，等待 {loop_interval} 秒...")
+            time.sleep(loop_interval)
+            continue
+
+        # 版本号用于握手同步（iQuant 侧会根据 version 识别新一轮）
+        # - 循环模式：默认用日期 YYYYMMDD（同一天只跑一次）
+        # - 非循环模式：默认用时间戳 YYYYMMDDHHMMSS（每次运行都唯一）
+        # - 如果 runtime.version 被显式设置且不是循环模式，则使用该值
+        runtime_version = runtime.get("version")
+        if runtime_version and not loop_enabled:
+            version = runtime_version
+        else:
+            if loop_enabled:
+                version = target_pred_date.replace("-", "")
+            else:
+                version = pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
+
+        # 执行一次完整流程（positions -> symbols -> quotes -> orders）
+        ok = _run_once(cfg, target_pred_date, version)
+        if not loop_enabled:
+            return ok
+
+        # 循环模式：成功则记录当天已跑过；失败则下一轮继续重试
+        if ok:
+            last_run_date = target_pred_date
+        else:
+            print("[live] 本轮执行失败，将在下一次循环重试")
+
+        # 等待下一轮检查
+        print(f"[live] 等待下一次循环: {loop_interval} 秒")
+        time.sleep(loop_interval)
 
 
 if __name__ == "__main__":
