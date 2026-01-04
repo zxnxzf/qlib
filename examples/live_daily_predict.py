@@ -13,7 +13,7 @@ import time  # 等待 state 用
 from dataclasses import dataclass, replace  # 覆盖配置的便捷方法
 from datetime import datetime  # 持仓历史日期计算
 from pathlib import Path  # 路径处理
-from typing import Dict, Optional  # 类型注解
+from typing import Dict, List, Optional  # 类型注解
 from urllib.request import urlretrieve
 import sys  # 修改 sys.path 便于导入
 
@@ -101,7 +101,11 @@ DEFAULT_CONFIG = {
     },
     "data_update": {
         "enable_auto_update": True,  # 是否自动更新数据
-        "data_source_url": "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",  # 数据源 URL
+        "data_source_url": "https://ghfast.top/https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",  # 数据源 URL
+        "data_source_urls": [
+            "https://ghfast.top/https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",
+            "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",
+        ],  # 备用下载源（依次尝试）
         "download_timeout": 600,  # 下载超时
         "retry_count": 3,  # 下载失败重试次数
         "retry_interval": 10,  # 重试间隔（秒）
@@ -254,7 +258,8 @@ class DataUpdateConfig:
     """描述数据自动更新所需的各项参数。"""
 
     enable_auto_update: bool = True  # 是否启用自动更新逻辑
-    data_source_url: str = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"  # 默认数据源
+    data_source_url: str = "https://ghfast.top/https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"  # 默认数据源
+    data_source_urls: Optional[List[str]] = None  # 备用下载源（按顺序尝试）
     download_timeout: int = 600  # 下载超时时间
     retry_count: int = 3  # 下载失败重试次数
     retry_interval: int = 10  # 重试间隔（秒）
@@ -316,45 +321,50 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
     extract_dir = temp_dir / "extracted"
     retry_count = max(int(cfg.retry_count), 1)
     retry_interval = max(int(cfg.retry_interval), 0)
+    urls = cfg.data_source_urls or [cfg.data_source_url]
+    urls = [u for u in urls if u]
 
-    for attempt in range(1, retry_count + 1):
-        try:
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            if retry_count > 1:
-                print(f"[数据] 下载尝试 {attempt}/{retry_count}")
-            print("[数据] 开始下载最新数据包...")
-            print(f"   来源: {cfg.data_source_url}")
-            urlretrieve(cfg.data_source_url, download_path)
-            print(f"[成功] 下载完成，文件大小 {download_path.stat().st_size / (1024 * 1024):.1f} MB")
-            if extract_dir.exists():
-                shutil.rmtree(extract_dir)
-            extract_dir.mkdir(parents=True, exist_ok=True)
-            with tarfile.open(download_path, "r:gz") as tar:
-                tar.extractall(extract_dir)
-            qlib_bin_dir = extract_dir / "qlib_bin"
-            if not qlib_bin_dir.exists():
-                print("[错误] 解压后的目录缺少 qlib_bin 目录")
-                return False
-            for dirname in ("features", "instruments", "calendars"):
-                if not (qlib_bin_dir / dirname).exists():
-                    print(f"[错误] 缺少必要目录: {dirname}")
+    for url in urls:
+        for attempt in range(1, retry_count + 1):
+            try:
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                if retry_count > 1:
+                    print(f"[数据] 下载尝试 {attempt}/{retry_count}")
+                print("[数据] 开始下载最新数据包...")
+                print(f"   来源: {url}")
+                urlretrieve(url, download_path)
+                print(f"[成功] 下载完成，文件大小 {download_path.stat().st_size / (1024 * 1024):.1f} MB")
+                if extract_dir.exists():
+                    shutil.rmtree(extract_dir)
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(download_path, "r:gz") as tar:
+                    tar.extractall(extract_dir)
+                qlib_bin_dir = extract_dir / "qlib_bin"
+                if not qlib_bin_dir.exists():
+                    print("[错误] 解压后的目录缺少 qlib_bin 目录")
                     return False
-            if target_path.exists():
-                shutil.rmtree(target_path)
-            shutil.copytree(qlib_bin_dir, target_path)
-            print("[成功] 数据更新完成")
-            return True
-        except Exception as err:
-            print(f"[错误] 数据更新失败: {err}")
-            if download_path.exists():
-                download_path.unlink()
-            if extract_dir.exists():
-                shutil.rmtree(extract_dir)
-            if attempt < retry_count:
-                print(f"[数据] {retry_interval} 秒后重试...")
-                time.sleep(retry_interval)
-            else:
-                return False
+                for dirname in ("features", "instruments", "calendars"):
+                    if not (qlib_bin_dir / dirname).exists():
+                        print(f"[错误] 缺少必要目录: {dirname}")
+                        return False
+                if target_path.exists():
+                    shutil.rmtree(target_path)
+                shutil.copytree(qlib_bin_dir, target_path)
+                print("[成功] 数据更新完成")
+                return True
+            except Exception as err:
+                print(f"[错误] 数据更新失败: {err}")
+                if download_path.exists():
+                    download_path.unlink()
+                if extract_dir.exists():
+                    shutil.rmtree(extract_dir)
+                if attempt < retry_count:
+                    print(f"[数据] {retry_interval} 秒后重试...")
+                    time.sleep(retry_interval)
+        if len(urls) > 1:
+            print("[数据] 切换到下一个下载源...")
+
+    return False
 
 
 def _ensure_data_ready(provider_uri: str, instruments, target_date: str, cfg: DataUpdateConfig):
@@ -1165,6 +1175,8 @@ def _run_once(cfg: Dict[str, object], target_pred_date: str, version: str) -> bo
         ),
         # 数据源 URL（从哪里下载数据）
         data_source_url=data_update_raw.get("data_source_url", default_update_cfg.data_source_url),
+        # 备用下载源（按顺序尝试）
+        data_source_urls=data_update_raw.get("data_source_urls", default_update_cfg.data_source_urls),
         # 下载超时时间（秒）
         download_timeout=int(data_update_raw.get("download_timeout", default_update_cfg.download_timeout)),
         # 下载失败重试次数
