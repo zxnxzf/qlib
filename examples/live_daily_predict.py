@@ -416,18 +416,6 @@ def _compute_target_pred_date(pred_cfg_raw: Dict[str, object]) -> str:
     return pd.Timestamp(pred_cfg_date).strftime("%Y-%m-%d")
 
 
-def _is_trading_day(provider_uri: str, date_str: str) -> bool:
-    data_path = _provider_path_from_uri(provider_uri)
-    cal_file = data_path / "calendars" / "day.txt"
-    if not cal_file.exists():
-        return True
-    with cal_file.open("r") as f:
-        for line in f:
-            if line.strip() == date_str:
-                return True
-    return False
-
-
 def _read_positions(path: Optional[str]) -> Dict[str, float]:
     """读取 positions_live.csv -> {code: position}。必须包含 code, position/pos 列。"""
     if not path:
@@ -1526,6 +1514,8 @@ def main(argv=None) -> bool:
     loop_interval = int(runtime.get("loop_interval", 300))
     # 记录上一次已完成的“预测日期”（YYYY-MM-DD），避免同一天重复执行
     last_run_date = None
+    paths = cfg.get("paths", {})
+    state_path = Path(paths.get("state", "predictions/state.json"))
 
     while True:
         # 每一轮循环都重新读取 prediction 配置，支持外部配置热更新
@@ -1533,16 +1523,24 @@ def main(argv=None) -> bool:
         # 计算目标预测日（自动模式为今天；手动模式按配置日期）
         target_pred_date = _compute_target_pred_date(pred_cfg_raw)
 
+        market_version = None
+        if loop_enabled:
+            state = _read_state(state_path)
+            state_phase = state.get("phase")
+            state_version = state.get("version")
+            print(f"[live] state.json: phase={state_phase}, version={state_version}")
+            if state_phase != "market_open" or not state_version:
+                print(f"[live] 等待 iQuant 开盘信号（market_open）... {loop_interval} 秒后重试")
+                time.sleep(loop_interval)
+                continue
+            market_version = str(state_version)
+            if market_version.isdigit() and len(market_version) == 8:
+                target_pred_date = f"{market_version[:4]}-{market_version[4:6]}-{market_version[6:]}"
+                print(f"[live] 采用 iQuant 版本日期作为预测日: {target_pred_date}")
+
         # 循环模式下：如果当天已经跑过，则跳过并等待下一次检查
         if loop_enabled and last_run_date == target_pred_date:
             print(f"[live] 已完成 {target_pred_date}，等待 {loop_interval} 秒...")
-            time.sleep(loop_interval)
-            continue
-
-        qlib_init_cfg = cfg.get("qlib_init", {})
-        provider_uri = pred_cfg_raw.get("provider_uri") or qlib_init_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data")
-        if loop_enabled and not _is_trading_day(provider_uri, target_pred_date):
-            print(f"[live] {target_pred_date} 非交易日，等待 {loop_interval} 秒...")
             time.sleep(loop_interval)
             continue
 
@@ -1551,13 +1549,12 @@ def main(argv=None) -> bool:
         # - 非循环模式：默认用时间戳 YYYYMMDDHHMMSS（每次运行都唯一）
         # - 如果 runtime.version 被显式设置且不是循环模式，则使用该值
         runtime_version = runtime.get("version")
-        if runtime_version and not loop_enabled:
+        if loop_enabled:
+            version = market_version or target_pred_date.replace("-", "")
+        elif runtime_version:
             version = runtime_version
         else:
-            if loop_enabled:
-                version = target_pred_date.replace("-", "")
-            else:
-                version = pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
+            version = pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
 
         # 执行一次完整流程（positions -> symbols -> quotes -> orders）
         ok = _run_once(cfg, target_pred_date, version)

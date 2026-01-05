@@ -790,7 +790,12 @@ def handlebar(ContextInfo):
         _reset_runtime_state(ContextInfo, f"new_day={bar_date}")
 
     state = _read_state()
+    state_phase = state.get("phase")
     version = state.get("version")
+    if version != bar_date and state_phase in (None, "", "exec_done", "exec_failed", "market_open"):
+        _write_state("market_open", bar_date, {"source": "iquant"})
+        state_phase = "market_open"
+        version = bar_date
     if version:
         if _LAST_RUN_KEY == version:
             print(f"[iQuant][INFO] version={version} 已处理，跳过")
