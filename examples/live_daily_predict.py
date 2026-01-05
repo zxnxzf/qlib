@@ -117,8 +117,33 @@ DEFAULT_CONFIG = {
 
 # ================= 持仓历史管理（T+1 限制支持） =================
 
-# 持仓历史文件路径
-HOLDINGS_HISTORY_PATH = Path("predictions/holdings_history.json")
+# 持仓历史文件路径（默认与 examples 同级 predictions 目录对齐）
+HOLDINGS_HISTORY_PATH = _EXAMPLES_DIR / "predictions" / "holdings_history.json"
+
+
+def _resolve_path(path_str: Optional[str], base_dir: Path) -> Optional[Path]:
+    if not path_str:
+        return None
+    p = Path(path_str).expanduser()
+    if p.is_absolute():
+        return p
+    return (base_dir / p).resolve()
+
+
+def _resolve_paths(cfg: Dict[str, object]) -> Dict[str, Path]:
+    paths = cfg.get("paths", {})
+    base_dir_raw = paths.get("base_dir")
+    base_dir = Path(base_dir_raw).expanduser() if base_dir_raw else _EXAMPLES_DIR
+    if not base_dir.is_absolute():
+        base_dir = (_EXAMPLES_DIR / base_dir).resolve()
+    return {
+        "base_dir": base_dir,
+        "positions": _resolve_path(paths.get("positions", "predictions/positions_live.csv"), base_dir),
+        "quotes": _resolve_path(paths.get("quotes", "predictions/quotes_live.csv"), base_dir),
+        "symbols_out": _resolve_path(paths.get("symbols_out", "predictions/symbols_req.csv"), base_dir),
+        "orders_out": _resolve_path(paths.get("orders_out", "predictions/orders_to_exec.csv"), base_dir),
+        "state": _resolve_path(paths.get("state", "predictions/state.json"), base_dir),
+    }
 
 
 def _load_holdings_history():
@@ -1214,18 +1239,20 @@ def _run_once(cfg: Dict[str, object], target_pred_date: str, version: str) -> bo
 
     # ========== 第六步：读取文件路径和运行时配置 ==========
 
-    # 提取路径配置
-    paths = cfg.get("paths", {})
+    # 提取并解析路径配置（相对路径默认挂载到 examples/）
+    paths = _resolve_paths(cfg)
     # positions_live.csv 的路径（iQuant 导出的持仓文件）
-    positions_path = paths.get("positions")
+    positions_path = paths["positions"]
     # quotes_live.csv 的路径（iQuant 导出的实时行情）
-    quotes_path = paths.get("quotes")
+    quotes_path = paths["quotes"]
     # symbols_req.csv 的输出路径（qlib 输出给 iQuant 的选股请求）
-    symbols_out = paths.get("symbols_out", "predictions/symbols_req.csv")
+    symbols_out = paths["symbols_out"]
     # orders_to_exec.csv 的输出路径（qlib 输出给 iQuant 的订单文件）
-    orders_out = paths.get("orders_out", "predictions/orders_to_exec.csv")
+    orders_out = paths["orders_out"]
     # state.json 的路径（握手状态文件，用于阶段同步）
-    state_path = Path(paths.get("state", "predictions/state.json"))
+    state_path = paths["state"]
+    print(f"[live] paths.base_dir={paths['base_dir']}")
+    print(f"[live] state.json={state_path}")
 
     # 提取运行时配置
     runtime = cfg.get("runtime", {})
@@ -1514,8 +1541,8 @@ def main(argv=None) -> bool:
     loop_interval = int(runtime.get("loop_interval", 300))
     # 记录上一次已完成的“预测日期”（YYYY-MM-DD），避免同一天重复执行
     last_run_date = None
-    paths = cfg.get("paths", {})
-    state_path = Path(paths.get("state", "predictions/state.json"))
+    paths = _resolve_paths(cfg)
+    state_path = paths["state"]
 
     while True:
         # 每一轮循环都重新读取 prediction 配置，支持外部配置热更新

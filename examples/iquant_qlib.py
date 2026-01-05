@@ -792,10 +792,21 @@ def handlebar(ContextInfo):
     state = _read_state()
     state_phase = state.get("phase")
     version = state.get("version")
-    if version != bar_date and state_phase in (None, "", "exec_done", "exec_failed", "market_open"):
-        _write_state("market_open", bar_date, {"source": "iquant"})
+    version_str = str(version) if version is not None else None
+
+    should_force_market_open = (not TARGET_VERSION) and (
+        not state_phase or state_phase in {"exec_done", "exec_failed", "market_open"}
+    )
+    if should_force_market_open and version_str != bar_date:
+        _write_state(
+            "market_open",
+            bar_date,
+            {"source": "iquant", "prev_phase": state_phase, "prev_version": version},
+        )
         state_phase = "market_open"
         version = bar_date
+    elif state_phase:
+        print(f"[DEBUG][handlebar] keep state phase={state_phase}, version={version_str}")
     if version:
         if _LAST_RUN_KEY == version:
             print(f"[iQuant][INFO] version={version} 已处理，跳过")
