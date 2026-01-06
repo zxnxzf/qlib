@@ -794,10 +794,20 @@ def handlebar(ContextInfo):
     version = state.get("version")
     version_str = str(version) if version is not None else None
 
+    version_date = None
+    if version_str and version_str[:8].isdigit():
+        version_date = version_str[:8]
+
     should_force_market_open = (not TARGET_VERSION) and (
         not state_phase or state_phase in {"exec_done", "exec_failed", "market_open"}
     )
-    if should_force_market_open and version_str != bar_date:
+    stale_version = (not TARGET_VERSION) and bool(version_date and version_date != bar_date)
+    if (should_force_market_open or stale_version) and version_str != bar_date:
+        if stale_version and not should_force_market_open:
+            print(
+                f"[DEBUG][handlebar] stale state detected, "
+                f"phase={state_phase}, version_date={version_date}, bar_date={bar_date}"
+            )
         _write_state(
             "market_open",
             bar_date,
@@ -805,6 +815,7 @@ def handlebar(ContextInfo):
         )
         state_phase = "market_open"
         version = bar_date
+        version_str = bar_date
     elif state_phase:
         print(f"[DEBUG][handlebar] keep state phase={state_phase}, version={version_str}")
     if version:
