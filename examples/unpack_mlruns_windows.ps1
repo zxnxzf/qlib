@@ -28,7 +28,7 @@ $scriptDir = (Split-Path -Parent $MyInvocation.MyCommand.Path)
 if (-not $TarPath) {
   $modelDir = Join-Path $scriptDir "models"
   if (Test-Path -LiteralPath $modelDir) {
-    $candidates = Get-ChildItem -LiteralPath $modelDir -Filter "qlib_run_*.tar.gz" | Sort-Object LastWriteTime -Descending
+    $candidates = @(Get-ChildItem -LiteralPath $modelDir -Filter "qlib_run_*.tar.gz" | Sort-Object LastWriteTime -Descending)
     if ($candidates.Count -gt 0) {
       $TarPath = $candidates[0].FullName
       Write-Host "Auto selected: $TarPath"
