@@ -1,6 +1,6 @@
 param(
   [Alias("h", "help")]
-  [switch]$Help,
+  [switch]$ShowHelp,
   [string]$TarPath = "",
   [string]$TargetDir = (Split-Path -Parent $MyInvocation.MyCommand.Path)
 )
@@ -18,7 +18,7 @@ Notes:
   - Default TargetDir is the script directory (typically examples\).
 "@
 
-if ($Help) {
+if ($ShowHelp) {
   Write-Host $usage
   exit 0
 }
