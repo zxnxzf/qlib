@@ -790,34 +790,7 @@ def handlebar(ContextInfo):
         _reset_runtime_state(ContextInfo, f"new_day={bar_date}")
 
     state = _read_state()
-    state_phase = state.get("phase")
     version = state.get("version")
-    version_str = str(version) if version is not None else None
-
-    version_date = None
-    if version_str and version_str[:8].isdigit():
-        version_date = version_str[:8]
-
-    should_force_market_open = (not TARGET_VERSION) and (
-        not state_phase or state_phase in {"exec_done", "exec_failed", "market_open"}
-    )
-    stale_version = (not TARGET_VERSION) and bool(version_date and version_date != bar_date)
-    if (should_force_market_open or stale_version) and version_str != bar_date:
-        if stale_version and not should_force_market_open:
-            print(
-                f"[DEBUG][handlebar] stale state detected, "
-                f"phase={state_phase}, version_date={version_date}, bar_date={bar_date}"
-            )
-        _write_state(
-            "market_open",
-            bar_date,
-            {"source": "iquant", "prev_phase": state_phase, "prev_version": version},
-        )
-        state_phase = "market_open"
-        version = bar_date
-        version_str = bar_date
-    elif state_phase:
-        print(f"[DEBUG][handlebar] keep state phase={state_phase}, version={version_str}")
     if version:
         if _LAST_RUN_KEY == version:
             print(f"[iQuant][INFO] version={version} 已处理，跳过")

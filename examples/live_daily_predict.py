@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
     "runtime": {
         "version": None,  # 运行批次号
         "wait_secs": 300,  # 等待下一阶段超时时间
-        "loop": True,  # 是否启用日频循环
+        "loop": False,  # 是否启用日频循环
         "loop_interval": 300,  # 循环检查间隔（秒）
     },
     "prediction": {
@@ -117,33 +117,8 @@ DEFAULT_CONFIG = {
 
 # ================= 持仓历史管理（T+1 限制支持） =================
 
-# 持仓历史文件路径（默认与 examples 同级 predictions 目录对齐）
-HOLDINGS_HISTORY_PATH = _EXAMPLES_DIR / "predictions" / "holdings_history.json"
-
-
-def _resolve_path(path_str: Optional[str], base_dir: Path) -> Optional[Path]:
-    if not path_str:
-        return None
-    p = Path(path_str).expanduser()
-    if p.is_absolute():
-        return p
-    return (base_dir / p).resolve()
-
-
-def _resolve_paths(cfg: Dict[str, object]) -> Dict[str, Path]:
-    paths = cfg.get("paths", {})
-    base_dir_raw = paths.get("base_dir")
-    base_dir = Path(base_dir_raw).expanduser() if base_dir_raw else _EXAMPLES_DIR
-    if not base_dir.is_absolute():
-        base_dir = (_EXAMPLES_DIR / base_dir).resolve()
-    return {
-        "base_dir": base_dir,
-        "positions": _resolve_path(paths.get("positions", "predictions/positions_live.csv"), base_dir),
-        "quotes": _resolve_path(paths.get("quotes", "predictions/quotes_live.csv"), base_dir),
-        "symbols_out": _resolve_path(paths.get("symbols_out", "predictions/symbols_req.csv"), base_dir),
-        "orders_out": _resolve_path(paths.get("orders_out", "predictions/orders_to_exec.csv"), base_dir),
-        "state": _resolve_path(paths.get("state", "predictions/state.json"), base_dir),
-    }
+# 持仓历史文件路径
+HOLDINGS_HISTORY_PATH = Path("predictions/holdings_history.json")
 
 
 def _load_holdings_history():
@@ -439,6 +414,18 @@ def _compute_target_pred_date(pred_cfg_raw: Dict[str, object]) -> str:
         today_ts = pd.Timestamp.utcnow().normalize()
         return today_ts.strftime("%Y-%m-%d")
     return pd.Timestamp(pred_cfg_date).strftime("%Y-%m-%d")
+
+
+def _is_trading_day(provider_uri: str, date_str: str) -> bool:
+    data_path = _provider_path_from_uri(provider_uri)
+    cal_file = data_path / "calendars" / "day.txt"
+    if not cal_file.exists():
+        return True
+    with cal_file.open("r") as f:
+        for line in f:
+            if line.strip() == date_str:
+                return True
+    return False
 
 
 def _read_positions(path: Optional[str]) -> Dict[str, float]:
@@ -1239,20 +1226,18 @@ def _run_once(cfg: Dict[str, object], target_pred_date: str, version: str) -> bo
 
     # ========== 第六步：读取文件路径和运行时配置 ==========
 
-    # 提取并解析路径配置（相对路径默认挂载到 examples/）
-    paths = _resolve_paths(cfg)
+    # 提取路径配置
+    paths = cfg.get("paths", {})
     # positions_live.csv 的路径（iQuant 导出的持仓文件）
-    positions_path = paths["positions"]
+    positions_path = paths.get("positions")
     # quotes_live.csv 的路径（iQuant 导出的实时行情）
-    quotes_path = paths["quotes"]
+    quotes_path = paths.get("quotes")
     # symbols_req.csv 的输出路径（qlib 输出给 iQuant 的选股请求）
-    symbols_out = paths["symbols_out"]
+    symbols_out = paths.get("symbols_out", "predictions/symbols_req.csv")
     # orders_to_exec.csv 的输出路径（qlib 输出给 iQuant 的订单文件）
-    orders_out = paths["orders_out"]
+    orders_out = paths.get("orders_out", "predictions/orders_to_exec.csv")
     # state.json 的路径（握手状态文件，用于阶段同步）
-    state_path = paths["state"]
-    print(f"[live] paths.base_dir={paths['base_dir']}")
-    print(f"[live] state.json={state_path}")
+    state_path = Path(paths.get("state", "predictions/state.json"))
 
     # 提取运行时配置
     runtime = cfg.get("runtime", {})
@@ -1541,8 +1526,6 @@ def main(argv=None) -> bool:
     loop_interval = int(runtime.get("loop_interval", 300))
     # 记录上一次已完成的“预测日期”（YYYY-MM-DD），避免同一天重复执行
     last_run_date = None
-    paths = _resolve_paths(cfg)
-    state_path = paths["state"]
 
     while True:
         # 每一轮循环都重新读取 prediction 配置，支持外部配置热更新
@@ -1550,24 +1533,16 @@ def main(argv=None) -> bool:
         # 计算目标预测日（自动模式为今天；手动模式按配置日期）
         target_pred_date = _compute_target_pred_date(pred_cfg_raw)
 
-        market_version = None
-        if loop_enabled:
-            state = _read_state(state_path)
-            state_phase = state.get("phase")
-            state_version = state.get("version")
-            print(f"[live] state.json: phase={state_phase}, version={state_version}")
-            if state_phase != "market_open" or not state_version:
-                print(f"[live] 等待 iQuant 开盘信号（market_open）... {loop_interval} 秒后重试")
-                time.sleep(loop_interval)
-                continue
-            market_version = str(state_version)
-            if market_version.isdigit() and len(market_version) == 8:
-                target_pred_date = f"{market_version[:4]}-{market_version[4:6]}-{market_version[6:]}"
-                print(f"[live] 采用 iQuant 版本日期作为预测日: {target_pred_date}")
-
         # 循环模式下：如果当天已经跑过，则跳过并等待下一次检查
         if loop_enabled and last_run_date == target_pred_date:
             print(f"[live] 已完成 {target_pred_date}，等待 {loop_interval} 秒...")
+            time.sleep(loop_interval)
+            continue
+
+        qlib_init_cfg = cfg.get("qlib_init", {})
+        provider_uri = pred_cfg_raw.get("provider_uri") or qlib_init_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data")
+        if loop_enabled and not _is_trading_day(provider_uri, target_pred_date):
+            print(f"[live] {target_pred_date} 非交易日，等待 {loop_interval} 秒...")
             time.sleep(loop_interval)
             continue
 
@@ -1576,12 +1551,13 @@ def main(argv=None) -> bool:
         # - 非循环模式：默认用时间戳 YYYYMMDDHHMMSS（每次运行都唯一）
         # - 如果 runtime.version 被显式设置且不是循环模式，则使用该值
         runtime_version = runtime.get("version")
-        if loop_enabled:
-            version = market_version or target_pred_date.replace("-", "")
-        elif runtime_version:
+        if runtime_version and not loop_enabled:
             version = runtime_version
         else:
-            version = pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
+            if loop_enabled:
+                version = target_pred_date.replace("-", "")
+            else:
+                version = pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
 
         # 执行一次完整流程（positions -> symbols -> quotes -> orders）
         ok = _run_once(cfg, target_pred_date, version)
