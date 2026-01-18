@@ -13,8 +13,8 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
-# 添加qlib路径
-sys.path.append('D:/code/qlib/qlib')
+# 添加qlib路径（相对项目根目录）
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 import plotly.graph_objects as go
 import plotly.express as px
@@ -131,11 +131,10 @@ class ArtifactsDataAnalyzer:
         print("Calculating enhanced metrics...")
 
         if self.pred_data is None:
-            print("[ERROR] No prediction data available")
-            return
-
-        # 计算滚动IC
-        self.metrics['rolling_ic'] = self._calculate_rolling_ic()
+            print("[WARNING] No prediction data available, skip IC calculation")
+        else:
+            # 计算滚动IC
+            self.metrics['rolling_ic'] = self._calculate_rolling_ic()
 
         # 计算累计收益
         self.metrics['cumulative_returns'] = self._calculate_cumulative_returns()
@@ -145,6 +144,9 @@ class ArtifactsDataAnalyzer:
 
         # 计算月度表现
         self.metrics['monthly_performance'] = self._calculate_monthly_performance()
+
+        # 计算摘要指标（用于卡片展示）
+        self.metrics['summary'] = self._calculate_summary_metrics()
 
         print("[OK] Enhanced metrics calculation completed")
 
@@ -403,16 +405,19 @@ class ArtifactsDataAnalyzer:
         """计算月度表现"""
         print("  Calculating monthly performance...")
 
-        cumulative_data = self.metrics['cumulative_returns']
-        if not cumulative_data['dates']:
-            return []
-
         try:
-            dates = pd.to_datetime(cumulative_data['dates'])
-            strategy_returns = pd.Series(cumulative_data['strategy'], index=dates)
-
-            # 计算月度收益
-            monthly_returns = strategy_returns.resample('M').last().pct_change()
+            if self.portfolio_report is not None and not self.portfolio_report.empty:
+                daily_returns = self.portfolio_report["return"]
+                # 月度收益 = 当月日收益连乘 - 1
+                monthly_returns = (1 + daily_returns).resample("M").prod() - 1
+            else:
+                cumulative_data = self.metrics.get("cumulative_returns", {})
+                if not cumulative_data.get("dates"):
+                    return []
+                dates = pd.to_datetime(cumulative_data["dates"])
+                strategy_returns = pd.Series(cumulative_data["strategy"], index=dates)
+                # 使用累计收益推导月度收益
+                monthly_returns = (1 + strategy_returns).resample("M").last().pct_change()
 
             monthly_data = []
             for date, ret in monthly_returns.items():
@@ -427,6 +432,46 @@ class ArtifactsDataAnalyzer:
         except Exception as e:
             print(f"    Could not calculate monthly performance: {e}")
             return []
+
+    def _get_risk_metric(self, analysis_type, metric):
+        """从风险分析结果中读取指标"""
+        if self.portfolio_metrics is None:
+            return None
+        try:
+            value = self.portfolio_metrics.loc[(analysis_type, metric), "risk"]
+            return float(value)
+        except Exception:
+            return None
+
+    def _calculate_summary_metrics(self):
+        """计算摘要指标（超额收益/信息比率/回撤）"""
+        summary = {}
+
+        if self.portfolio_report is not None and not self.portfolio_report.empty:
+            report = self.portfolio_report
+            cost = report["cost"] if "cost" in report.columns else 0.0
+            excess_daily = report["return"] - report["bench"] - cost
+
+            excess_curve = (1 + excess_daily).cumprod()
+            summary["excess_return_with_cost"] = float(excess_curve.iloc[-1] - 1)
+            summary["excess_max_drawdown"] = float((excess_curve / excess_curve.cummax() - 1).min())
+
+            strategy_curve = (1 + report["return"]).cumprod()
+            summary["strategy_max_drawdown"] = float((strategy_curve / strategy_curve.cummax() - 1).min())
+
+            if excess_daily.std() and not np.isclose(excess_daily.std(), 0):
+                summary["information_ratio"] = float(excess_daily.mean() / excess_daily.std() * np.sqrt(252))
+
+        # 优先使用 Qlib 风险分析输出（如果有）
+        info_ratio = self._get_risk_metric("excess_return_with_cost", "information_ratio")
+        if info_ratio is not None:
+            summary["information_ratio"] = info_ratio
+
+        excess_mdd = self._get_risk_metric("excess_return_with_cost", "max_drawdown")
+        if excess_mdd is not None:
+            summary["excess_max_drawdown"] = excess_mdd
+
+        return summary
 
     def generate_html_dashboard(self, output_file="recorder_dashboard.html"):
         """生成HTML仪表板"""
@@ -564,12 +609,16 @@ class ArtifactsDataAnalyzer:
             fill='tonexty'
         ))
 
-        # 获取两个不同的回撤值
-        strategy_dd = drawdown_data['max_drawdown']  # 策略回撤
-        excess_dd = -0.1208  # 超额收益回撤 (含成本)
+        summary = self.metrics.get("summary", {})
+        strategy_dd = summary.get("strategy_max_drawdown", drawdown_data.get("max_drawdown", 0))
+        excess_dd = summary.get("excess_max_drawdown")
 
         fig.update_layout(
-            title=f"回撤分析 (策略: {strategy_dd*100:.2f}%, 超额: {excess_dd*100:.2f}%)",
+            title=(
+                "回撤分析"
+                f" (策略: {strategy_dd*100:.2f}%, "
+                f"超额: {(excess_dd*100 if excess_dd is not None else 0):.2f}%)"
+            ),
             xaxis_title="Date",
             yaxis_title="Drawdown (%)",
             template='plotly_white'
@@ -607,7 +656,15 @@ class ArtifactsDataAnalyzer:
     def _create_html_template(self, charts):
         """创建HTML模板"""
         rolling_ic = self.metrics.get('rolling_ic', {})
-        basic_metrics = {'IC': rolling_ic.get('mean_ic', 0)} if rolling_ic else {'IC': 0}
+        summary = self.metrics.get("summary", {})
+
+        excess_return = summary.get("excess_return_with_cost")
+        info_ratio = summary.get("information_ratio")
+        excess_mdd = summary.get("excess_max_drawdown")
+
+        excess_return_text = f"{excess_return*100:.2f}%" if excess_return is not None else "N/A"
+        info_ratio_text = f"{info_ratio:.3f}" if info_ratio is not None else "N/A"
+        excess_mdd_text = f"{excess_mdd*100:.2f}%" if excess_mdd is not None else "N/A"
 
         html_template = f"""
 <!DOCTYPE html>
@@ -726,19 +783,19 @@ class ArtifactsDataAnalyzer:
             </div>
             <div class="col-md-3">
                 <div class="metric-card">
-                    <div class="metric-value">12.08%</div>
+                    <div class="metric-value">{excess_return_text}</div>
                     <div class="metric-label">超额收益(含成本)<br><small style="font-size: 0.8em; color: #888;">相对基准</small></div>
                 </div>
             </div>
             <div class="col-md-3">
                 <div class="metric-card">
-                    <div class="metric-value">1.945</div>
+                    <div class="metric-value">{info_ratio_text}</div>
                     <div class="metric-label">信息比率</div>
                 </div>
             </div>
             <div class="col-md-3">
                 <div class="metric-card">
-                    <div class="metric-value">12.08%</div>
+                    <div class="metric-value">{excess_mdd_text}</div>
                     <div class="metric-label">最大回撤<br><small style="font-size: 0.8em; color: #888;">超额收益</small></div>
                 </div>
             </div>
@@ -1835,4 +1892,3 @@ if __name__ == "__main__":
         elif full_drawdown.get('unrecovered_days') is not None:
             return -full_drawdown['unrecovered_days']  # 未恢复天数用负数表示
         return 0
-
