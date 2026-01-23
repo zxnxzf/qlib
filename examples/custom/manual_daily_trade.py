@@ -872,7 +872,32 @@ def main() -> int:
         return 0
     required_pred_date = _previous_trade_date(trade_date, calendar_dates)
 
-    pred_raw = cfg.get("prediction", {})
+    pred_raw = dict(cfg.get("prediction", {}) or {})
+    align_cfg = cfg.get("workflow_alignment", {}) or {}
+    if align_cfg.get("enabled"):
+        market = align_cfg.get("market")
+        if market:
+            pred_raw["instruments"] = market
+        handler_cfg = align_cfg.get("handler", {}) or {}
+        if handler_cfg:
+            handler_kwargs = dict(pred_raw.get("handler_kwargs", {}) or {})
+            for key in ("start_time", "fit_start_time", "fit_end_time"):
+                value = handler_cfg.get(key)
+                if value:
+                    handler_kwargs[key] = value
+            end_value = handler_cfg.get("end_time")
+            if end_value:
+                end_text = str(end_value).lower()
+                if end_text not in ("pred_date", "auto"):
+                    handler_kwargs["end_time"] = end_value
+            pred_raw["handler_kwargs"] = handler_kwargs
+        print(
+            "[INFO] workflow_alignment enabled: "
+            f"market={pred_raw.get('instruments')}, "
+            f"handler_start_time={handler_cfg.get('start_time')}, "
+            f"fit_start_time={handler_cfg.get('fit_start_time')}, "
+            f"fit_end_time={handler_cfg.get('fit_end_time')}"
+        )
     provider_uri = pred_raw.get("provider_uri", "~/.qlib/qlib_data/cn_data")
     instruments = pred_raw.get("instruments", "csi300")
 
