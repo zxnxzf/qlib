@@ -9,6 +9,7 @@ Key behavior:
 - Output adjusted and raw (unadjusted) price/share columns for manual execution.
 """
 
+import copy
 import json
 import math
 import shutil
@@ -38,9 +39,8 @@ from qlib.utils import get_pre_trading_date, init_instance_by_config
 from qlib.workflow import R
 from qlib.workflow.record_temp import SignalRecord
 from qlib.backtest import Exchange
-from qlib.backtest.decision import OrderDir
+from qlib.backtest.decision import Order, OrderDir
 from qlib.backtest.position import Position
-from qlib.contrib.strategy.order_generator import OrderGenWOInteract
 
 
 DEFAULT_CONFIG = {
@@ -73,11 +73,21 @@ DEFAULT_CONFIG = {
             "fit_end_time": "2022-12-31",
         },
     },
+    "strategy": {
+        "enabled": True,
+        "top_k": 50,
+        "n_drop": 2,
+        "method_sell": "bottom",
+        "method_buy": "top",
+        "hold_thresh": 2,
+        "only_tradable": None,
+        "forbid_all_trade_at_limit": True,
+    },
     "prediction": {
         "experiment_id": "1",
         "recorder_id": "c8f7a66693244c94bb2b8ddf5df17a3d",
         "prediction_date": "auto",
-        "top_k": 20,
+        "top_k": 50,
         "min_score_threshold": 0.0,
         "weight_method": "equal",
         "pred_date_search_days": 10,
@@ -105,7 +115,7 @@ DEFAULT_CONFIG = {
         "min_cost": 1.0,
         "impact_cost": 0.0,
         "limit_threshold": None,
-        "hold_thresh": 1,
+        "hold_thresh": 2,
         "only_tradable": True,
     },
     "data_update": {
@@ -531,6 +541,173 @@ def _select_topk(pred_df: pd.DataFrame, top_k: int) -> pd.DataFrame:
     return pred_df.sort_values("score", ascending=False).head(top_k).reset_index(drop=True)
 
 
+def _build_pred_score(pred_df: pd.DataFrame, pred_date: str) -> pd.Series:
+    if pred_df is None or pred_df.empty:
+        return pd.Series(dtype=float)
+    df = pred_df
+    if "datetime" in df.columns and pred_date:
+        df = df[df["datetime"] == pred_date]
+    if df.empty:
+        return pd.Series(dtype=float)
+    df = df.copy()
+    df["instrument"] = df["instrument"].astype(str)
+    if df.duplicated(subset="instrument").any():
+        df = df.drop_duplicates(subset="instrument", keep="last")
+    return pd.Series(df["score"].values, index=df["instrument"])
+
+
+def _generate_orders_topk_dropout(
+    pred_score: pd.Series,
+    position: Position,
+    exchange: Exchange,
+    trade_start: pd.Timestamp,
+    trade_end: pd.Timestamp,
+    risk_degree: float,
+    top_k: int,
+    n_drop: int,
+    method_sell: str,
+    method_buy: str,
+    only_tradable: bool,
+    forbid_all_trade_at_limit: bool,
+) -> Tuple[List[Order], List[str]]:
+    if pred_score is None or pred_score.empty:
+        return [], []
+
+    top_k = max(int(top_k or 0), 0)
+    n_drop = max(int(n_drop or 0), 0)
+    if top_k <= 0:
+        return [], []
+
+    current_temp = copy.deepcopy(position)
+    current_stock_list = current_temp.get_stock_list()
+
+    def _is_tradable_for_select(stock_id: str) -> bool:
+        try:
+            return exchange.is_stock_tradable(stock_id, trade_start, trade_end)
+        except Exception:
+            return False
+
+    def _trade_dir(direction: OrderDir) -> Optional[OrderDir]:
+        return None if forbid_all_trade_at_limit else direction
+
+    def _is_tradable_for_trade(stock_id: str, direction: OrderDir) -> bool:
+        try:
+            return exchange.is_stock_tradable(
+                stock_id=stock_id,
+                start_time=trade_start,
+                end_time=trade_end,
+                direction=_trade_dir(direction),
+            )
+        except Exception:
+            return False
+
+    def get_first_n(li, n, reverse: bool = False) -> List[str]:
+        items = list(li)
+        if n <= 0 or not items:
+            return []
+        if not only_tradable:
+            return list(reversed(items))[:n][::-1] if reverse else items[:n]
+        res = []
+        iterable = reversed(items) if reverse else items
+        for si in iterable:
+            if _is_tradable_for_select(si):
+                res.append(si)
+                if len(res) >= n:
+                    break
+        return list(reversed(res)) if reverse else res
+
+    def get_last_n(li, n) -> List[str]:
+        return get_first_n(li, n, reverse=True)
+
+    def filter_stock(li) -> List[str]:
+        if not only_tradable:
+            return list(li)
+        return [si for si in li if _is_tradable_for_select(si)]
+
+    last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
+
+    if method_buy == "top":
+        candidates = pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index
+        today = get_first_n(candidates, n_drop + top_k - len(last))
+    elif method_buy == "random":
+        topk_candi = get_first_n(pred_score.sort_values(ascending=False).index, top_k)
+        candi = list(filter(lambda x: x not in last, topk_candi))
+        n = n_drop + top_k - len(last)
+        if n <= 0:
+            today = []
+        else:
+            try:
+                today = np.random.choice(candi, n, replace=False)
+            except ValueError:
+                today = candi
+    else:
+        raise ValueError(f"unsupported method_buy: {method_buy}")
+
+    comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+
+    if method_sell == "bottom":
+        sell = last[last.isin(get_last_n(comb, n_drop))]
+    elif method_sell == "random":
+        candi = filter_stock(last)
+        try:
+            sell = pd.Index(np.random.choice(candi, n_drop, replace=False) if len(last) else [])
+        except ValueError:
+            sell = pd.Index(candi)
+    else:
+        raise ValueError(f"unsupported method_sell: {method_sell}")
+
+    buy = list(today[: len(sell) + top_k - len(last)])
+
+    sell_order_list: List[Order] = []
+    buy_order_list: List[Order] = []
+    cash = current_temp.get_cash()
+
+    for code in current_stock_list:
+        if not _is_tradable_for_trade(code, OrderDir.SELL):
+            continue
+        if code in sell:
+            sell_amount = current_temp.get_stock_amount(code=code)
+            sell_order = Order(
+                stock_id=code,
+                amount=sell_amount,
+                start_time=trade_start,
+                end_time=trade_end,
+                direction=OrderDir.SELL,
+            )
+            if exchange.check_order(sell_order):
+                sell_order_list.append(sell_order)
+                trade_val, trade_cost, _ = exchange.deal_order(sell_order, position=current_temp)
+                cash += trade_val - trade_cost
+
+    value = cash * risk_degree / len(buy) if len(buy) > 0 else 0.0
+
+    for code in buy:
+        if not _is_tradable_for_trade(code, OrderDir.BUY):
+            continue
+        buy_price = exchange.get_deal_price(
+            stock_id=code, start_time=trade_start, end_time=trade_end, direction=OrderDir.BUY
+        )
+        if buy_price is None or pd.isna(buy_price) or buy_price <= 0:
+            continue
+        buy_amount = value / buy_price
+        factor = exchange.get_factor(stock_id=code, start_time=trade_start, end_time=trade_end)
+        buy_amount = exchange.round_amount_by_trade_unit(
+            buy_amount, factor=factor, stock_id=code, start_time=trade_start, end_time=trade_end
+        )
+        if buy_amount <= 0:
+            continue
+        buy_order = Order(
+            stock_id=code,
+            amount=buy_amount,
+            start_time=trade_start,
+            end_time=trade_end,
+            direction=OrderDir.BUY,
+        )
+        buy_order_list.append(buy_order)
+
+    return sell_order_list + buy_order_list, buy
+
+
 def _fetch_prices(instruments: Sequence[str], pred_date: str, price_search_days: int, freq: str) -> pd.DataFrame:
     if not instruments:
         return pd.DataFrame(columns=["instrument", "price"])
@@ -947,14 +1124,38 @@ def main() -> int:
     dataset = _build_dataset(pred_cfg)
     predictions = _generate_predictions(model, dataset, recorder)
     pred_df = _prepare_predictions(predictions, pred_cfg)
-    pred_df = _select_topk(pred_df, int(pred_cfg.top_k or 0))
-    if pred_df.empty:
+    pred_score = _build_pred_score(pred_df, pred_date)
+    if pred_score.empty:
         print("[WARN] empty predictions, exit")
         return 0
-    pred_df["target_weight"] = _compute_weights(pred_df["score"], pred_cfg.weight_method)
+    if "datetime" in pred_df.columns:
+        pred_df = pred_df[pred_df["datetime"] == pred_date].copy()
+    else:
+        pred_df = pred_df.copy()
+    if pred_df.empty:
+        print("[WARN] empty predictions for pred_date, exit")
+        return 0
+    pred_df = pred_df.drop_duplicates(subset="instrument", keep="last").reset_index(drop=True)
+    pred_df["target_weight"] = 0.0
 
     positions_path = _resolve_path(cfg.get("paths", {}).get("positions", ""))
     holdings_raw, cash = _read_positions(positions_path, trading_cfg.total_cash)
+
+    strategy_cfg = cfg.get("strategy", {}) or {}
+    if not strategy_cfg.get("enabled", True):
+        print("[WARN] strategy disabled, exit")
+        return 0
+    top_k = int(strategy_cfg.get("top_k", pred_cfg.top_k or 0))
+    n_drop = int(strategy_cfg.get("n_drop", 0))
+    method_buy = strategy_cfg.get("method_buy", "top")
+    method_sell = strategy_cfg.get("method_sell", "bottom")
+    hold_thresh = int(strategy_cfg.get("hold_thresh", trading_cfg.hold_thresh or 0))
+    if hold_thresh > 0:
+        trading_cfg.hold_thresh = hold_thresh
+    only_tradable = strategy_cfg.get("only_tradable")
+    if only_tradable is None:
+        only_tradable = trading_cfg.only_tradable
+    forbid_all_trade_at_limit = bool(strategy_cfg.get("forbid_all_trade_at_limit", True))
 
     codes = sorted(set(pred_df["instrument"].tolist()) | set(holdings_raw.keys()))
     trade_start = pd.Timestamp(pred_date)
@@ -977,21 +1178,6 @@ def main() -> int:
     price_df = _fetch_prices(codes, pred_date, trading_cfg.price_search_days, trading_cfg.trade_freq)
     price_map = dict(zip(price_df["instrument"], price_df["price"]))
 
-    if trading_cfg.only_tradable:
-        tradable_mask = []
-        for code in pred_df["instrument"]:
-            try:
-                tradable = exchange.is_stock_tradable(code, trade_start, trade_end)
-            except Exception:
-                tradable = False
-            tradable_mask.append(bool(tradable))
-        pred_df = pred_df[pd.Series(tradable_mask, index=pred_df.index)]
-        if pred_df.empty:
-            print("[WARN] no tradable stocks after filtering, exit")
-            return 0
-        pred_df = pred_df.sort_values("score", ascending=False).reset_index(drop=True)
-        pred_df["target_weight"] = _compute_weights(pred_df["score"], pred_cfg.weight_method)
-
     holdings_adj: Dict[str, float] = {}
     for code, raw_amount in holdings_raw.items():
         factor = exchange.get_factor(code, trade_start, trade_end)
@@ -1009,18 +1195,19 @@ def main() -> int:
             print(f"[WARN] fill_stock_value failed: {err}")
         _ensure_position_prices(position, exchange, trade_start, trade_end, price_map)
 
-    target_weight_position = dict(zip(pred_df["instrument"], pred_df["target_weight"]))
-
-    order_generator = OrderGenWOInteract()
-    orders = order_generator.generate_order_list_from_target_weight_position(
-        current=position,
-        trade_exchange=exchange,
-        target_weight_position=target_weight_position,
+    orders, buy_list = _generate_orders_topk_dropout(
+        pred_score=pred_score,
+        position=position,
+        exchange=exchange,
+        trade_start=trade_start,
+        trade_end=trade_end,
         risk_degree=trading_cfg.risk_degree,
-        pred_start_time=trade_start,
-        pred_end_time=trade_end,
-        trade_start_time=trade_start,
-        trade_end_time=trade_end,
+        top_k=top_k,
+        n_drop=n_drop,
+        method_sell=method_sell,
+        method_buy=method_buy,
+        only_tradable=bool(only_tradable),
+        forbid_all_trade_at_limit=forbid_all_trade_at_limit,
     )
 
     history_path = _resolve_path(cfg.get("paths", {}).get("holdings_history", ""))
@@ -1034,6 +1221,9 @@ def main() -> int:
         hold_thresh=trading_cfg.hold_thresh,
     )
     orders = _filter_sell_orders_by_hold(orders, hold_days, trading_cfg.hold_thresh)
+    if buy_list:
+        target_weight = 1.0 / len(buy_list)
+        pred_df.loc[pred_df["instrument"].isin(buy_list), "target_weight"] = target_weight
 
     orders_df = _orders_to_frame(
         orders=orders,
