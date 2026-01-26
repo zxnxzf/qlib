@@ -9,6 +9,7 @@ Key behavior:
 - Output adjusted and raw (unadjusted) price/share columns for manual execution.
 """
 
+import argparse
 import copy
 import json
 import math
@@ -1035,10 +1036,17 @@ def _update_history_after_buy(history: Dict[str, dict], orders_df: pd.DataFrame,
             history[code]["amount"] = shares_raw
 
 
-def main() -> int:
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Manual daily trading for Qlib.")
+    parser.add_argument("--trade-date", default=None, help="Trade date, e.g. 2025-01-06; default is today.")
+    return parser.parse_args()
+
+
+def main(trade_date_override: Optional[str] = None) -> int:
     cfg = DEFAULT_CONFIG
 
-    trade_date = _resolve_trade_date(cfg.get("runtime", {}).get("trade_date", "auto"))
+    trade_date_value = trade_date_override or cfg.get("runtime", {}).get("trade_date", "auto")
+    trade_date = _resolve_trade_date(trade_date_value)
     calendar_path = _resolve_path(cfg.get("calendar", {}).get("path", ""))
     if not calendar_path.exists():
         print(f"[ERROR] calendar csv not found: {calendar_path}")
@@ -1278,4 +1286,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    args = _parse_args()
+    raise SystemExit(main(trade_date_override=args.trade_date))
