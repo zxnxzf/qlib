@@ -1252,6 +1252,20 @@ def main() -> int:
     orders_out.write_text(orders_df.to_csv(index=False), encoding=encoding)
     print(f"[OK] orders saved: {orders_out}")
 
+    if not orders_df.empty:
+        print("[ORDERS]")
+        for action in ("买入", "卖出"):
+            subset = orders_df[orders_df["action"] == action].copy()
+            if subset.empty:
+                continue
+            subset = subset.sort_values(["amount_raw"], ascending=False)
+            print(f"  {action}({len(subset)}):")
+            for _, row in subset.iterrows():
+                print(
+                    f"    {row['stock']} shares_raw={int(row['shares_raw'])} "
+                    f"price_raw={row['price_raw']:.4f} amount_raw={row['amount_raw']:.2f}"
+                )
+
     positions_next_path = _resolve_path(cfg.get("paths", {}).get("positions_next", ""))
     next_holdings, next_cash = _apply_orders_to_positions(holdings_raw, cash, orders_df)
     _write_positions_csv(positions_next_path, next_holdings, next_cash, encoding)
