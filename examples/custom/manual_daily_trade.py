@@ -381,6 +381,26 @@ def _load_trade_calendar(path: Path) -> List[str]:
     return dates
 
 
+def _load_qlib_calendar_dates(provider_uri: str, freq: str) -> List[str]:
+    data_path = _provider_path_from_uri(provider_uri)
+    cal_dir = data_path / "calendars"
+    if freq != "day":
+        freq = "day"
+    day_file = cal_dir / f"{freq}.txt"
+    day_future_file = cal_dir / f"{freq}_future.txt"
+    dates: List[str] = []
+    for path in (day_file, day_future_file):
+        if not path.exists():
+            continue
+        with path.open("r") as f:
+            for line in f:
+                value = line.strip()
+                if value:
+                    dates.append(value)
+    dates = sorted(set(dates))
+    return dates
+
+
 def _previous_trade_date(trade_date: str, calendar_dates: List[str]) -> str:
     if trade_date not in calendar_dates:
         return trade_date
@@ -1047,11 +1067,17 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     trade_date_value = trade_date_override or cfg.get("runtime", {}).get("trade_date", "auto")
     trade_date = _resolve_trade_date(trade_date_value)
-    calendar_path = _resolve_path(cfg.get("calendar", {}).get("path", ""))
-    if not calendar_path.exists():
-        print(f"[ERROR] calendar csv not found: {calendar_path}")
-        return 1
-    calendar_dates = _load_trade_calendar(calendar_path)
+    qlib_calendar_provider = cfg.get("qlib_init", {}).get("provider_uri", "~/.qlib/qlib_data/cn_data")
+    calendar_dates = _load_qlib_calendar_dates(qlib_calendar_provider, "day")
+    calendar_source = "qlib"
+    if not calendar_dates:
+        calendar_path = _resolve_path(cfg.get("calendar", {}).get("path", ""))
+        if not calendar_path.exists():
+            print(f"[ERROR] calendar csv not found: {calendar_path}")
+            return 1
+        calendar_dates = _load_trade_calendar(calendar_path)
+        calendar_source = "local"
+    print(f"[INFO] calendar_source: {calendar_source}")
     if trade_date not in calendar_dates:
         print(f"[WARN] {trade_date} is not a trading day in calendar, exit.")
         return 0
