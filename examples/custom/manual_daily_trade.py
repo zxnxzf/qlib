@@ -111,13 +111,13 @@ DEFAULT_CONFIG = {
         "price_search_days": 5,
         "trade_freq": "day",
         "deal_price": "close",
-        "open_cost": 0.0003,
-        "close_cost": 0.0013,
-        "min_cost": 1.0,
+        "open_cost": 0.0005,
+        "close_cost": 0.0015,
+        "min_cost": 5.0,
         "impact_cost": 0.0,
-        "limit_threshold": None,
+        "limit_threshold": 0.095,
         "hold_thresh": 2,
-        "only_tradable": True,
+        "only_tradable": False,
     },
     "data_update": {
         "enable_auto_update": True,
@@ -202,13 +202,13 @@ class TradingConfig:
     price_search_days: int = 5
     trade_freq: str = "day"
     deal_price: str = "close"
-    open_cost: float = 0.0003
-    close_cost: float = 0.0013
-    min_cost: float = 1.0
+    open_cost: float = 0.0005
+    close_cost: float = 0.0015
+    min_cost: float = 5.0
     impact_cost: float = 0.0
-    limit_threshold: Optional[Union[Tuple[str, str], float]] = None
+    limit_threshold: Optional[Union[Tuple[str, str], float]] = 0.095
     hold_thresh: int = 1
-    only_tradable: bool = True
+    only_tradable: bool = False
 
 
 @dataclass
