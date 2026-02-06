@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
     },
     "workflow_alignment": {
         "enabled": True,
+        "mode": "align",
         "market": "all",
         "handler": {
             "start_time": "2020-01-01",
@@ -77,6 +78,7 @@ DEFAULT_CONFIG = {
         "use_required_pred_date": True,
         "use_position_count": True,
         "use_recorder_pred": True,
+        "use_backtest_window": True,
         "use_execution_simulator": True,
     },
     "strategy": {
@@ -1168,7 +1170,21 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     pred_raw = dict(cfg.get("prediction", {}) or {})
     align_cfg = cfg.get("workflow_alignment", {}) or {}
-    if align_cfg.get("enabled"):
+    align_enabled = bool(align_cfg.get("enabled", False))
+    mode = str(align_cfg.get("mode", "align")).lower()
+    if mode not in ("align", "live"):
+        print(f"[WARN] workflow_alignment.mode={mode} not recognized, fallback to align")
+        mode = "align"
+    use_required_pred_date = bool(align_cfg.get("use_required_pred_date", False)) if align_enabled else False
+    use_position_count = bool(align_cfg.get("use_position_count", False)) if align_enabled else False
+    use_recorder_pred = bool(align_cfg.get("use_recorder_pred", False)) if align_enabled else False
+    use_backtest_window = bool(align_cfg.get("use_backtest_window", False)) if align_enabled else False
+    use_execution_simulator = bool(align_cfg.get("use_execution_simulator", False)) if align_enabled else False
+    if align_enabled and mode == "live":
+        use_position_count = False
+        use_recorder_pred = False
+        use_backtest_window = False
+    if align_enabled:
         market = align_cfg.get("market")
         if market:
             pred_raw["instruments"] = market
@@ -1187,10 +1203,16 @@ def main(trade_date_override: Optional[str] = None) -> int:
             pred_raw["handler_kwargs"] = handler_kwargs
         print(
             "[INFO] workflow_alignment enabled: "
+            f"mode={mode}, "
             f"market={pred_raw.get('instruments')}, "
             f"handler_start_time={handler_cfg.get('start_time')}, "
             f"fit_start_time={handler_cfg.get('fit_start_time')}, "
-            f"fit_end_time={handler_cfg.get('fit_end_time')}"
+            f"fit_end_time={handler_cfg.get('fit_end_time')}, "
+            f"use_required_pred_date={use_required_pred_date}, "
+            f"use_recorder_pred={use_recorder_pred}, "
+            f"use_position_count={use_position_count}, "
+            f"use_backtest_window={use_backtest_window}, "
+            f"use_execution_simulator={use_execution_simulator}"
         )
     provider_uri = pred_raw.get("provider_uri", "~/.qlib/qlib_data/cn_data")
     instruments = pred_raw.get("instruments", "csi300")
@@ -1215,7 +1237,6 @@ def main(trade_date_override: Optional[str] = None) -> int:
     pred_date_search_days = pred_raw.get("pred_date_search_days", 0)
     qlib_latest_date = _resolve_pred_date(trade_date, trading_cfg.trade_freq)
     print(f"[INFO] qlib_latest_date: {qlib_latest_date}")
-    use_required_pred_date = bool(align_cfg.get("use_required_pred_date", False))
     if use_required_pred_date and required_pred_date:
         try:
             pred_date = _resolve_pred_date_with_data(
@@ -1253,7 +1274,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
         return 1
 
     predictions = None
-    if align_cfg.get("use_recorder_pred"):
+    if use_recorder_pred:
         try:
             predictions = recorder.load_object("pred.pkl")
             print("[INFO] loaded pred.pkl from recorder")
@@ -1280,7 +1301,6 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     positions_path = _resolve_path(cfg.get("paths", {}).get("positions", ""))
     holdings_raw, cash = _read_positions(positions_path, trading_cfg.total_cash)
-    use_position_count = bool(align_cfg.get("use_position_count", False))
     position_counts: Dict[str, float] = {}
     if use_position_count:
         position_counts = _load_workflow_position_counts(recorder, pred_date, trading_cfg.trade_freq)
@@ -1311,7 +1331,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
     start_date = (trade_start - pd.Timedelta(days=max(trading_cfg.price_search_days, 1))).strftime("%Y-%m-%d")
     end_date = trade_end.strftime("%Y-%m-%d")
     backtest_window = None
-    if align_cfg.get("use_execution_simulator") or align_cfg.get("use_recorder_pred"):
+    if use_backtest_window:
         backtest_window = _load_backtest_window(recorder)
     if backtest_window:
         start_date, end_date = backtest_window
@@ -1388,7 +1408,6 @@ def main(trade_date_override: Optional[str] = None) -> int:
         target_weight = 1.0 / len(buy_list)
         pred_df.loc[pred_df["instrument"].isin(buy_list), "target_weight"] = target_weight
 
-    use_execution_simulator = bool(align_cfg.get("use_execution_simulator", False))
     executed_position = None
     if use_execution_simulator:
         exec_position = copy.deepcopy(position)
