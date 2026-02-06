@@ -40,6 +40,7 @@ from qlib.utils import get_pre_trading_date, init_instance_by_config
 from qlib.workflow import R
 from qlib.workflow.record_temp import SignalRecord
 from qlib.backtest import Exchange
+from qlib.backtest.utils import epsilon_change
 from qlib.backtest.decision import Order, OrderDir
 from qlib.backtest.position import Position
 
@@ -73,6 +74,10 @@ DEFAULT_CONFIG = {
             "fit_start_time": "2020-01-01",
             "fit_end_time": "2022-12-31",
         },
+        "use_required_pred_date": True,
+        "use_position_count": True,
+        "use_recorder_pred": True,
+        "use_execution_simulator": True,
     },
     "strategy": {
         "enabled": True,
@@ -86,7 +91,7 @@ DEFAULT_CONFIG = {
     },
     "prediction": {
         "experiment_id": "1",
-        "recorder_id": "c8f7a66693244c94bb2b8ddf5df17a3d",
+        "recorder_id": "e45264e7bf9348a28829a6089f06153c",
         "prediction_date": "auto",
         "top_k": 50,
         "min_score_threshold": 0.0,
@@ -588,6 +593,8 @@ def _generate_orders_topk_dropout(
     n_drop: int,
     method_sell: str,
     method_buy: str,
+    hold_thresh: int,
+    trade_freq: str,
     only_tradable: bool,
     forbid_all_trade_at_limit: bool,
 ) -> Tuple[List[Order], List[str]]:
@@ -600,67 +607,61 @@ def _generate_orders_topk_dropout(
         return [], []
 
     current_temp = copy.deepcopy(position)
+    sell_order_list: List[Order] = []
+    buy_order_list: List[Order] = []
+    cash = current_temp.get_cash()
     current_stock_list = current_temp.get_stock_list()
-
-    def _is_tradable_for_select(stock_id: str) -> bool:
-        try:
-            return exchange.is_stock_tradable(stock_id, trade_start, trade_end)
-        except Exception:
-            return False
 
     def _trade_dir(direction: OrderDir) -> Optional[OrderDir]:
         return None if forbid_all_trade_at_limit else direction
 
-    def _is_tradable_for_trade(stock_id: str, direction: OrderDir) -> bool:
-        try:
-            return exchange.is_stock_tradable(
-                stock_id=stock_id,
-                start_time=trade_start,
-                end_time=trade_end,
-                direction=_trade_dir(direction),
-            )
-        except Exception:
-            return False
+    if only_tradable:
+        def get_first_n(li, n, reverse: bool = False):
+            cur_n = 0
+            res = []
+            for si in reversed(li) if reverse else li:
+                if exchange.is_stock_tradable(stock_id=si, start_time=trade_start, end_time=trade_end):
+                    res.append(si)
+                    cur_n += 1
+                    if cur_n >= n:
+                        break
+            return res[::-1] if reverse else res
 
-    def get_first_n(li, n, reverse: bool = False) -> List[str]:
-        items = list(li)
-        if n <= 0 or not items:
-            return []
-        if not only_tradable:
-            return list(reversed(items))[:n][::-1] if reverse else items[:n]
-        res = []
-        iterable = reversed(items) if reverse else items
-        for si in iterable:
-            if _is_tradable_for_select(si):
-                res.append(si)
-                if len(res) >= n:
-                    break
-        return list(reversed(res)) if reverse else res
+        def get_last_n(li, n):
+            return get_first_n(li, n, reverse=True)
 
-    def get_last_n(li, n) -> List[str]:
-        return get_first_n(li, n, reverse=True)
+        def filter_stock(li):
+            return [
+                si
+                for si in li
+                if exchange.is_stock_tradable(stock_id=si, start_time=trade_start, end_time=trade_end)
+            ]
 
-    def filter_stock(li) -> List[str]:
-        if not only_tradable:
-            return list(li)
-        return [si for si in li if _is_tradable_for_select(si)]
+    else:
+        def get_first_n(li, n):
+            return list(li)[:n]
+
+        def get_last_n(li, n):
+            return list(li)[-n:]
+
+        def filter_stock(li):
+            return li
 
     last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
 
     if method_buy == "top":
-        candidates = pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index
-        today = get_first_n(candidates, n_drop + top_k - len(last))
+        today = get_first_n(
+            pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index,
+            n_drop + top_k - len(last),
+        )
     elif method_buy == "random":
         topk_candi = get_first_n(pred_score.sort_values(ascending=False).index, top_k)
         candi = list(filter(lambda x: x not in last, topk_candi))
         n = n_drop + top_k - len(last)
-        if n <= 0:
-            today = []
-        else:
-            try:
-                today = np.random.choice(candi, n, replace=False)
-            except ValueError:
-                today = candi
+        try:
+            today = np.random.choice(candi, n, replace=False)
+        except ValueError:
+            today = candi
     else:
         raise ValueError(f"unsupported method_buy: {method_buy}")
 
@@ -673,20 +674,23 @@ def _generate_orders_topk_dropout(
         try:
             sell = pd.Index(np.random.choice(candi, n_drop, replace=False) if len(last) else [])
         except ValueError:
-            sell = pd.Index(candi)
+            sell = candi
     else:
         raise ValueError(f"unsupported method_sell: {method_sell}")
 
-    buy = list(today[: len(sell) + top_k - len(last)])
-
-    sell_order_list: List[Order] = []
-    buy_order_list: List[Order] = []
-    cash = current_temp.get_cash()
+    buy = today[: len(sell) + top_k - len(last)]
 
     for code in current_stock_list:
-        if not _is_tradable_for_trade(code, OrderDir.SELL):
+        if not exchange.is_stock_tradable(
+            stock_id=code,
+            start_time=trade_start,
+            end_time=trade_end,
+            direction=_trade_dir(OrderDir.SELL),
+        ):
             continue
         if code in sell:
+            if hold_thresh > 0 and current_temp.get_stock_count(code, bar=trade_freq) < hold_thresh:
+                continue
             sell_amount = current_temp.get_stock_amount(code=code)
             sell_order = Order(
                 stock_id=code,
@@ -703,7 +707,12 @@ def _generate_orders_topk_dropout(
     value = cash * risk_degree / len(buy) if len(buy) > 0 else 0.0
 
     for code in buy:
-        if not _is_tradable_for_trade(code, OrderDir.BUY):
+        if not exchange.is_stock_tradable(
+            stock_id=code,
+            start_time=trade_start,
+            end_time=trade_end,
+            direction=_trade_dir(OrderDir.BUY),
+        ):
             continue
         buy_price = exchange.get_deal_price(
             stock_id=code, start_time=trade_start, end_time=trade_end, direction=OrderDir.BUY
@@ -726,7 +735,7 @@ def _generate_orders_topk_dropout(
         )
         buy_order_list.append(buy_order)
 
-    return sell_order_list + buy_order_list, buy
+    return sell_order_list + buy_order_list, list(buy)
 
 
 def _fetch_prices(instruments: Sequence[str], pred_date: str, price_search_days: int, freq: str) -> pd.DataFrame:
@@ -811,6 +820,43 @@ def _load_holdings_history(path: Path) -> Dict[str, dict]:
 def _save_holdings_history(path: Path, history: Dict[str, dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_backtest_window(recorder) -> Optional[Tuple[str, str]]:
+    for obj_name in ("portfolio_analysis/report_normal_1day.pkl", "report_normal_1day.pkl"):
+        try:
+            report = recorder.load_object(obj_name)
+        except Exception:
+            continue
+        if isinstance(report, pd.DataFrame) and not report.empty:
+            idx = pd.to_datetime(report.index)
+            return idx.min().strftime("%Y-%m-%d"), idx.max().strftime("%Y-%m-%d")
+    return None
+
+
+def _load_workflow_position_counts(recorder, date_str: str, bar: str) -> Dict[str, float]:
+    try:
+        positions_dict = recorder.load_object("portfolio_analysis/positions_normal_1day.pkl")
+    except Exception as err:
+        print(f"[WARN] cannot load workflow positions: {err}")
+        return {}
+    if positions_dict is None:
+        print("[WARN] workflow positions empty")
+        return {}
+    target_date = pd.Timestamp(date_str)
+    position = positions_dict.get(target_date)
+    if position is None:
+        print(f"[WARN] workflow positions missing date: {date_str}")
+        return {}
+    counts: Dict[str, float] = {}
+    for code in position.get_stock_list():
+        try:
+            counts[code] = float(position.get_stock_count(code, bar=bar))
+        except Exception:
+            continue
+    if counts:
+        print(f"[INFO] loaded workflow position counts: {len(counts)}")
+    return counts
 
 
 def _cleanup_holdings_history(history: Dict[str, dict], holdings: Dict[str, float]) -> Dict[str, dict]:
@@ -945,10 +991,15 @@ def _orders_to_frame(
     min_lot = max(int(min_shares or 1), 1)
 
     for order in orders:
+        amount = getattr(order, "deal_amount", None)
+        if amount is None or not np.isfinite(amount) or amount <= 0:
+            amount = order.amount
+        if amount is None or not np.isfinite(amount) or amount <= 0:
+            continue
         factor = exchange.get_factor(order.stock_id, trade_start, trade_end)
         if factor is None or not np.isfinite(factor) or factor <= 0:
             factor = 1.0
-        raw_shares = float(order.amount) * float(factor)
+        raw_shares = float(amount) * float(factor)
         raw_shares = math.floor(raw_shares / min_lot) * min_lot
         if raw_shares < min_lot:
             continue
@@ -998,6 +1049,38 @@ def _orders_to_frame(
             ]
         )
     return pd.DataFrame(rows)
+
+
+def _simulate_execution(
+    orders: List[Order],
+    position: Position,
+    exchange: Exchange,
+) -> Tuple[List[Order], Position]:
+    executed: List[Order] = []
+    for order in orders:
+        exchange.deal_order(order, position=position)
+        if getattr(order, "deal_amount", 0) > 0:
+            executed.append(order)
+    return executed, position
+
+
+def _position_to_raw_holdings(
+    position: Position,
+    exchange: Exchange,
+    trade_start: pd.Timestamp,
+    trade_end: pd.Timestamp,
+) -> Tuple[Dict[str, float], float]:
+    holdings: Dict[str, float] = {}
+    for code in position.get_stock_list():
+        amount_adj = float(position.get_stock_amount(code))
+        factor = exchange.get_factor(code, trade_start, trade_end)
+        if factor is None or not np.isfinite(factor) or factor <= 0:
+            factor = 1.0
+        raw = int(round(amount_adj * factor))
+        if raw != 0:
+            holdings[code] = float(raw)
+    cash = float(position.get_cash())
+    return holdings, cash
 
 
 def _apply_orders_to_positions(
@@ -1132,12 +1215,26 @@ def main(trade_date_override: Optional[str] = None) -> int:
     pred_date_search_days = pred_raw.get("pred_date_search_days", 0)
     qlib_latest_date = _resolve_pred_date(trade_date, trading_cfg.trade_freq)
     print(f"[INFO] qlib_latest_date: {qlib_latest_date}")
-    pred_date = _resolve_pred_date_with_data(
-        trade_date,
-        trading_cfg.trade_freq,
-        instruments,
-        pred_date_search_days,
-    )
+    use_required_pred_date = bool(align_cfg.get("use_required_pred_date", False))
+    if use_required_pred_date and required_pred_date:
+        try:
+            pred_date = _resolve_pred_date_with_data(
+                required_pred_date,
+                trading_cfg.trade_freq,
+                instruments,
+                0,
+            )
+        except ValueError as err:
+            print(f"[WARN] required_pred_date {required_pred_date} has no data: {err}")
+            return 0
+        print(f"[INFO] pred_date aligned to required_pred_date: {pred_date}")
+    else:
+        pred_date = _resolve_pred_date_with_data(
+            trade_date,
+            trading_cfg.trade_freq,
+            instruments,
+            pred_date_search_days,
+        )
     if pred_date != trade_date:
         print(f"[INFO] trade_date={trade_date}, pred_date={pred_date}")
     print(f"[INFO] required_pred_date (calendar): {required_pred_date}")
@@ -1155,8 +1252,17 @@ def main(trade_date_override: Optional[str] = None) -> int:
     if model is None:
         return 1
 
-    dataset = _build_dataset(pred_cfg)
-    predictions = _generate_predictions(model, dataset, recorder)
+    predictions = None
+    if align_cfg.get("use_recorder_pred"):
+        try:
+            predictions = recorder.load_object("pred.pkl")
+            print("[INFO] loaded pred.pkl from recorder")
+        except Exception as err:
+            print(f"[WARN] cannot load recorder pred.pkl: {err}")
+            predictions = None
+    if predictions is None:
+        dataset = _build_dataset(pred_cfg)
+        predictions = _generate_predictions(model, dataset, recorder)
     pred_df = _prepare_predictions(predictions, pred_cfg)
     pred_score = _build_pred_score(pred_df, pred_date)
     if pred_score.empty:
@@ -1174,6 +1280,13 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     positions_path = _resolve_path(cfg.get("paths", {}).get("positions", ""))
     holdings_raw, cash = _read_positions(positions_path, trading_cfg.total_cash)
+    use_position_count = bool(align_cfg.get("use_position_count", False))
+    position_counts: Dict[str, float] = {}
+    if use_position_count:
+        position_counts = _load_workflow_position_counts(recorder, pred_date, trading_cfg.trade_freq)
+        if not position_counts:
+            print("[WARN] workflow position counts unavailable, fallback to history-based hold filter")
+            use_position_count = False
 
     strategy_cfg = cfg.get("strategy", {}) or {}
     if not strategy_cfg.get("enabled", True):
@@ -1192,14 +1305,22 @@ def main(trade_date_override: Optional[str] = None) -> int:
     forbid_all_trade_at_limit = bool(strategy_cfg.get("forbid_all_trade_at_limit", True))
 
     codes = sorted(set(pred_df["instrument"].tolist()) | set(holdings_raw.keys()))
-    trade_start = pd.Timestamp(pred_date)
-    trade_end = trade_start + pd.Timedelta(days=1)
+    trade_base_date = trade_date if use_required_pred_date else pred_date
+    trade_start = pd.Timestamp(trade_base_date)
+    trade_end = epsilon_change(trade_start + pd.Timedelta(days=1))
     start_date = (trade_start - pd.Timedelta(days=max(trading_cfg.price_search_days, 1))).strftime("%Y-%m-%d")
+    end_date = trade_end.strftime("%Y-%m-%d")
+    backtest_window = None
+    if align_cfg.get("use_execution_simulator") or align_cfg.get("use_recorder_pred"):
+        backtest_window = _load_backtest_window(recorder)
+    if backtest_window:
+        start_date, end_date = backtest_window
+        print(f"[INFO] backtest_window from recorder: {start_date} -> {end_date}")
 
     exchange = Exchange(
         codes=codes,
         start_time=start_date,
-        end_time=trade_end.strftime("%Y-%m-%d"),
+        end_time=end_date,
         deal_price=trading_cfg.deal_price,
         freq=trading_cfg.trade_freq,
         open_cost=trading_cfg.open_cost,
@@ -1209,7 +1330,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
         limit_threshold=trading_cfg.limit_threshold,
     )
 
-    price_df = _fetch_prices(codes, pred_date, trading_cfg.price_search_days, trading_cfg.trade_freq)
+    price_df = _fetch_prices(codes, trade_base_date, trading_cfg.price_search_days, trading_cfg.trade_freq)
     price_map = dict(zip(price_df["instrument"], price_df["price"]))
 
     holdings_adj: Dict[str, float] = {}
@@ -1222,9 +1343,13 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     position_dict = {code: {"amount": amount} for code, amount in holdings_adj.items()}
     position = Position(cash=cash, position_dict=position_dict)
+    if position_counts:
+        for code in holdings_adj:
+            count = position_counts.get(code, 0.0)
+            position.update_stock_count(code, trading_cfg.trade_freq, count)
     if holdings_adj:
         try:
-            position.fill_stock_value(start_time=pred_date, freq=trading_cfg.trade_freq)
+            position.fill_stock_value(start_time=trade_base_date, freq=trading_cfg.trade_freq)
         except Exception as err:
             print(f"[WARN] fill_stock_value failed: {err}")
         _ensure_position_prices(position, exchange, trade_start, trade_end, price_map)
@@ -1240,24 +1365,34 @@ def main(trade_date_override: Optional[str] = None) -> int:
         n_drop=n_drop,
         method_sell=method_sell,
         method_buy=method_buy,
+        hold_thresh=trading_cfg.hold_thresh,
+        trade_freq=trading_cfg.trade_freq,
         only_tradable=bool(only_tradable),
         forbid_all_trade_at_limit=forbid_all_trade_at_limit,
     )
 
+    history = None
     history_path = _resolve_path(cfg.get("paths", {}).get("holdings_history", ""))
-    history = _load_holdings_history(history_path)
-    history = _cleanup_holdings_history(history, holdings_raw)
-    hold_days = _calculate_hold_days(
-        holdings=holdings_raw,
-        history=history,
-        trade_date=trade_date,
-        cal_index=_calendar_index(calendar_dates),
-        hold_thresh=trading_cfg.hold_thresh,
-    )
-    orders = _filter_sell_orders_by_hold(orders, hold_days, trading_cfg.hold_thresh)
+    if not use_position_count:
+        history = _load_holdings_history(history_path)
+        history = _cleanup_holdings_history(history, holdings_raw)
+        hold_days = _calculate_hold_days(
+            holdings=holdings_raw,
+            history=history,
+            trade_date=trade_date,
+            cal_index=_calendar_index(calendar_dates),
+            hold_thresh=trading_cfg.hold_thresh,
+        )
+        orders = _filter_sell_orders_by_hold(orders, hold_days, trading_cfg.hold_thresh)
     if buy_list:
         target_weight = 1.0 / len(buy_list)
         pred_df.loc[pred_df["instrument"].isin(buy_list), "target_weight"] = target_weight
+
+    use_execution_simulator = bool(align_cfg.get("use_execution_simulator", False))
+    executed_position = None
+    if use_execution_simulator:
+        exec_position = copy.deepcopy(position)
+        orders, executed_position = _simulate_execution(orders, exec_position, exchange)
 
     orders_df = _orders_to_frame(
         orders=orders,
@@ -1301,12 +1436,16 @@ def main(trade_date_override: Optional[str] = None) -> int:
                 )
 
     positions_next_path = _resolve_path(cfg.get("paths", {}).get("positions_next", ""))
-    next_holdings, next_cash = _apply_orders_to_positions(holdings_raw, cash, orders_df)
+    if use_execution_simulator and executed_position is not None:
+        next_holdings, next_cash = _position_to_raw_holdings(executed_position, exchange, trade_start, trade_end)
+    else:
+        next_holdings, next_cash = _apply_orders_to_positions(holdings_raw, cash, orders_df)
     _write_positions_csv(positions_next_path, next_holdings, next_cash, encoding)
     print(f"[OK] next positions saved: {positions_next_path}")
 
-    _update_history_after_buy(history, orders_df, trade_date)
-    _save_holdings_history(history_path, history)
+    if history is not None:
+        _update_history_after_buy(history, orders_df, trade_date)
+        _save_holdings_history(history_path, history)
 
     return 0
 
