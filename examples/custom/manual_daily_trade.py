@@ -68,7 +68,7 @@ DEFAULT_CONFIG = {
     },
     "workflow_alignment": {
         "enabled": True,
-        "mode": "align",
+        "mode": "live",
         "market": "all",
         "handler": {
             "start_time": "2020-01-01",
@@ -771,7 +771,18 @@ def _fetch_prices(instruments: Sequence[str], pred_date: str, price_search_days:
             return price_df
 
         attempt += 1
-        prev_date = get_pre_trading_date(date_str)
+        prev_date = None
+        try:
+            prev_date = get_pre_trading_date(date_str)
+        except Exception:
+            prev_date = None
+        if not prev_date:
+            try:
+                calendar = D.calendar(end_time=date_str, freq=freq)
+                if calendar is not None and len(calendar) > 0:
+                    prev_date = pd.Timestamp(calendar[-1]).strftime("%Y-%m-%d")
+            except Exception:
+                prev_date = None
         if not prev_date or prev_date in tried_dates:
             break
         tried_dates.add(prev_date)
@@ -1326,6 +1337,12 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     codes = sorted(set(pred_df["instrument"].tolist()) | set(holdings_raw.keys()))
     trade_base_date = trade_date if use_required_pred_date else pred_date
+    if pd.Timestamp(trade_base_date) > pd.Timestamp(qlib_latest_date):
+        print(
+            "[WARN] trade_base_date beyond qlib_latest_date, "
+            f"use pred_date instead: {trade_base_date} -> {pred_date}"
+        )
+        trade_base_date = pred_date
     trade_start = pd.Timestamp(trade_base_date)
     trade_end = epsilon_change(trade_start + pd.Timedelta(days=1))
     start_date = (trade_start - pd.Timedelta(days=max(trading_cfg.price_search_days, 1))).strftime("%Y-%m-%d")
