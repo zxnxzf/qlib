@@ -27,6 +27,12 @@ import pandas as pd
 
 import sys
 
+# Optional dependency for workflow config loading.
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
+
 # Ensure local repo import precedence.
 _EXAMPLES_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _EXAMPLES_DIR.parents[1]
@@ -69,6 +75,8 @@ DEFAULT_CONFIG = {
     "workflow_alignment": {
         "enabled": True,
         "mode": "live",
+        "workflow_config_path": "../benchmarks/LightGBM/workflow_config_lightgbm_Alpha158_2020_2025.yaml",
+        "handler_end_time_policy": "pred_date",
         "market": "all",
         "handler": {
             "start_time": "2020-01-01",
@@ -80,6 +88,11 @@ DEFAULT_CONFIG = {
         "use_recorder_pred": True,
         "use_backtest_window": True,
         "use_execution_simulator": True,
+    },
+    "bootstrap": {
+        "initial_cash": 50000.0,
+        "auto_init_positions": True,
+        "auto_init_history": True,
     },
     "strategy": {
         "enabled": True,
@@ -128,10 +141,10 @@ DEFAULT_CONFIG = {
     },
     "data_update": {
         "enable_auto_update": True,
-        "data_source_url": "https://ghfast.top/https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",
+        "data_source_url": "https://ghfast.top/https://github.com/jzhongsun/investment_data/releases/latest/download/qlib_bin.tar.gz",
         "data_source_urls": [
-            "https://ghfast.top/https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",
-            "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz",
+            "https://ghfast.top/https://github.com/jzhongsun/investment_data/releases/latest/download/qlib_bin.tar.gz",
+            "https://github.com/jzhongsun/investment_data/releases/latest/download/qlib_bin.tar.gz",
         ],
         "download_timeout": 600,
         "retry_count": 3,
@@ -265,6 +278,20 @@ def _resolve_mlruns_uri(value: str) -> str:
     if not path.is_absolute():
         path = (_EXAMPLES_DIR / path).resolve()
     return f"file:{path}"
+
+
+def _load_workflow_config(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        print(f"[WARN] workflow config not found: {path}")
+        return {}
+    if yaml is None:
+        print("[WARN] PyYAML not available, skip workflow config loading")
+        return {}
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as err:
+        print(f"[WARN] failed to load workflow config {path}: {err}")
+        return {}
 
 
 def _missing_required_data(data_path: Path, instruments) -> List[str]:
@@ -1181,11 +1208,16 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     pred_raw = dict(cfg.get("prediction", {}) or {})
     align_cfg = cfg.get("workflow_alignment", {}) or {}
+    handler_cfg = dict(align_cfg.get("handler", {}) or {})
     align_enabled = bool(align_cfg.get("enabled", False))
     mode = str(align_cfg.get("mode", "align")).lower()
     if mode not in ("align", "live"):
         print(f"[WARN] workflow_alignment.mode={mode} not recognized, fallback to align")
         mode = "align"
+    handler_end_time_policy = str(align_cfg.get("handler_end_time_policy", "pred_date")).lower()
+    if handler_end_time_policy not in ("pred_date", "workflow"):
+        print(f"[WARN] handler_end_time_policy={handler_end_time_policy} not recognized, use pred_date")
+        handler_end_time_policy = "pred_date"
     use_required_pred_date = bool(align_cfg.get("use_required_pred_date", False)) if align_enabled else False
     use_position_count = bool(align_cfg.get("use_position_count", False)) if align_enabled else False
     use_recorder_pred = bool(align_cfg.get("use_recorder_pred", False)) if align_enabled else False
@@ -1196,21 +1228,35 @@ def main(trade_date_override: Optional[str] = None) -> int:
         use_recorder_pred = False
         use_backtest_window = False
     if align_enabled:
-        market = align_cfg.get("market")
+        workflow_path_value = align_cfg.get("workflow_config_path")
+        if workflow_path_value:
+            workflow_path = _resolve_path(str(workflow_path_value))
+            workflow_cfg = _load_workflow_config(workflow_path)
+            if workflow_cfg:
+                workflow_handler = workflow_cfg.get("data_handler_config", {}) or {}
+                workflow_market = workflow_cfg.get("market")
+                for key in ("start_time", "fit_start_time", "fit_end_time", "end_time", "instruments"):
+                    value = workflow_handler.get(key)
+                    if value:
+                        handler_cfg[key] = value
+                if workflow_market and not handler_cfg.get("instruments"):
+                    handler_cfg["instruments"] = workflow_market
+                print(f"[INFO] loaded workflow config: {workflow_path}")
+        market = handler_cfg.get("instruments") or align_cfg.get("market")
         if market:
             pred_raw["instruments"] = market
-        handler_cfg = align_cfg.get("handler", {}) or {}
         if handler_cfg:
             handler_kwargs = dict(pred_raw.get("handler_kwargs", {}) or {})
             for key in ("start_time", "fit_start_time", "fit_end_time"):
                 value = handler_cfg.get(key)
                 if value:
                     handler_kwargs[key] = value
-            end_value = handler_cfg.get("end_time")
-            if end_value:
-                end_text = str(end_value).lower()
-                if end_text not in ("pred_date", "auto"):
-                    handler_kwargs["end_time"] = end_value
+            if handler_end_time_policy == "workflow":
+                end_value = handler_cfg.get("end_time")
+                if end_value:
+                    end_text = str(end_value).lower()
+                    if end_text not in ("pred_date", "auto"):
+                        handler_kwargs["end_time"] = end_value
             pred_raw["handler_kwargs"] = handler_kwargs
         print(
             "[INFO] workflow_alignment enabled: "
@@ -1219,6 +1265,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
             f"handler_start_time={handler_cfg.get('start_time')}, "
             f"fit_start_time={handler_cfg.get('fit_start_time')}, "
             f"fit_end_time={handler_cfg.get('fit_end_time')}, "
+            f"handler_end_time_policy={handler_end_time_policy}, "
             f"use_required_pred_date={use_required_pred_date}, "
             f"use_recorder_pred={use_recorder_pred}, "
             f"use_position_count={use_position_count}, "
@@ -1271,6 +1318,12 @@ def main(trade_date_override: Optional[str] = None) -> int:
         print(f"[INFO] trade_date={trade_date}, pred_date={pred_date}")
     print(f"[INFO] required_pred_date (calendar): {required_pred_date}")
 
+    if align_enabled and handler_end_time_policy == "pred_date":
+        handler_kwargs = dict(pred_raw.get("handler_kwargs", {}) or {})
+        handler_kwargs["end_time"] = pred_date
+        pred_raw["handler_kwargs"] = handler_kwargs
+        print(f"[INFO] handler_end_time_policy=pred_date, end_time={pred_date}")
+
     pred_kwargs = dict(pred_raw)
     pred_kwargs.pop("prediction_date", None)
     pred_cfg = PredictionConfig(**pred_kwargs, prediction_date=pred_date)
@@ -1310,7 +1363,13 @@ def main(trade_date_override: Optional[str] = None) -> int:
     pred_df = pred_df.drop_duplicates(subset="instrument", keep="last").reset_index(drop=True)
     pred_df["target_weight"] = 0.0
 
+    encoding = cfg.get("output", {}).get("encoding", "utf-8-sig")
     positions_path = _resolve_path(cfg.get("paths", {}).get("positions", ""))
+    bootstrap_cfg = cfg.get("bootstrap", {}) or {}
+    initial_cash = float(bootstrap_cfg.get("initial_cash", trading_cfg.total_cash or 0.0))
+    if bootstrap_cfg.get("auto_init_positions", True) and not positions_path.exists():
+        _write_positions_csv(positions_path, {}, initial_cash, encoding)
+        print(f"[INFO] auto init positions: CASH={initial_cash:.2f} -> {positions_path}")
     holdings_raw, cash = _read_positions(positions_path, trading_cfg.total_cash)
     position_counts: Dict[str, float] = {}
     if use_position_count:
@@ -1410,6 +1469,9 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     history = None
     history_path = _resolve_path(cfg.get("paths", {}).get("holdings_history", ""))
+    if bootstrap_cfg.get("auto_init_history", True) and not history_path.exists():
+        _save_holdings_history(history_path, {})
+        print(f"[INFO] auto init holdings_history: {history_path}")
     if not use_position_count:
         history = _load_holdings_history(history_path)
         history = _cleanup_holdings_history(history, holdings_raw)
@@ -1453,7 +1515,6 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     orders_out = _resolve_path(cfg.get("paths", {}).get("orders_out", ""))
     orders_out.parent.mkdir(parents=True, exist_ok=True)
-    encoding = cfg.get("output", {}).get("encoding", "utf-8-sig")
     orders_out.write_text(orders_df.to_csv(index=False), encoding=encoding)
     print(f"[OK] orders saved: {orders_out}")
 
