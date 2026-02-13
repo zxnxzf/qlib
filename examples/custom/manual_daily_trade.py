@@ -57,7 +57,10 @@ DEFAULT_CONFIG = {
         "region": "cn",
         "kernels": 64,
         "joblib_backend": "multiprocessing",
-        "maxtasksperchild": 1,
+        "maxtasksperchild": None,
+        "dataset_cache": "SimpleDatasetCache",
+        "expression_cache": None,
+        "local_cache_path": "~/.cache/qlib_simple_cache",
     },
     "calendar": {
         "path": "trade_calendar_base.csv",
@@ -1293,7 +1296,10 @@ def main(trade_date_override: Optional[str] = None) -> int:
         "[INFO] qlib_init: "
         f"kernels={qlib_cfg.get('kernels', 1)}, "
         f"joblib_backend={qlib_cfg.get('joblib_backend', 'threading')}, "
-        f"maxtasksperchild={qlib_cfg.get('maxtasksperchild', 1)}"
+        f"maxtasksperchild={qlib_cfg.get('maxtasksperchild', 1)}, "
+        f"dataset_cache={qlib_cfg.get('dataset_cache')}, "
+        f"expression_cache={qlib_cfg.get('expression_cache')}, "
+        f"local_cache_path={qlib_cfg.get('local_cache_path')}"
     )
     qlib.init(
         provider_uri=qlib_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data"),
@@ -1301,6 +1307,9 @@ def main(trade_date_override: Optional[str] = None) -> int:
         kernels=qlib_cfg.get("kernels", 1),
         joblib_backend=qlib_cfg.get("joblib_backend", "threading"),
         maxtasksperchild=qlib_cfg.get("maxtasksperchild", 1),
+        dataset_cache=qlib_cfg.get("dataset_cache"),
+        expression_cache=qlib_cfg.get("expression_cache"),
+        local_cache_path=qlib_cfg.get("local_cache_path"),
     )
 
     trading_cfg = TradingConfig(**cfg.get("trading", {}))
