@@ -55,8 +55,8 @@ DEFAULT_CONFIG = {
     "qlib_init": {
         "provider_uri": "~/.qlib/qlib_data/cn_data",
         "region": "cn",
-        "kernels": 1,
-        "joblib_backend": "threading",
+        "kernels": 64,
+        "joblib_backend": "multiprocessing",
         "maxtasksperchild": 1,
     },
     "calendar": {
@@ -106,12 +106,13 @@ DEFAULT_CONFIG = {
     },
     "prediction": {
         "experiment_id": "1",
-        "recorder_id": "e45264e7bf9348a28829a6089f06153c",
+        "recorder_id": "c8f7a66693244c94bb2b8ddf5df17a3d",
         "prediction_date": "auto",
         "top_k": 50,
         "min_score_threshold": 0.0,
         "weight_method": "equal",
         "pred_date_search_days": 10,
+        "empty_pred_action": "exit",
         "provider_uri": "~/.qlib/qlib_data/cn_data",
         "region": "cn",
         "instruments": "csi300",
@@ -1187,6 +1188,11 @@ def _parse_args() -> argparse.Namespace:
 
 def main(trade_date_override: Optional[str] = None) -> int:
     cfg = DEFAULT_CONFIG
+    # Allow external scripts to override DEFAULT_CONFIG in this module.
+    try:
+        cfg = globals().get("DEFAULT_CONFIG", DEFAULT_CONFIG)
+    except Exception:
+        cfg = DEFAULT_CONFIG
 
     trade_date_value = trade_date_override or cfg.get("runtime", {}).get("trade_date", "auto")
     trade_date = _resolve_trade_date(trade_date_value)
@@ -1283,6 +1289,12 @@ def main(trade_date_override: Optional[str] = None) -> int:
         return 1
 
     qlib_cfg = cfg.get("qlib_init", {})
+    print(
+        "[INFO] qlib_init: "
+        f"kernels={qlib_cfg.get('kernels', 1)}, "
+        f"joblib_backend={qlib_cfg.get('joblib_backend', 'threading')}, "
+        f"maxtasksperchild={qlib_cfg.get('maxtasksperchild', 1)}"
+    )
     qlib.init(
         provider_uri=qlib_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data"),
         region=qlib_cfg.get("region", "cn"),
@@ -1326,6 +1338,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
     pred_kwargs = dict(pred_raw)
     pred_kwargs.pop("prediction_date", None)
+    pred_kwargs.pop("empty_pred_action", None)
     pred_cfg = PredictionConfig(**pred_kwargs, prediction_date=pred_date)
     mlruns_uri = _resolve_mlruns_uri(cfg.get("paths", {}).get("mlruns_uri", "auto"))
     R.set_uri(mlruns_uri)
@@ -1350,18 +1363,16 @@ def main(trade_date_override: Optional[str] = None) -> int:
         predictions = _generate_predictions(model, dataset, recorder)
     pred_df = _prepare_predictions(predictions, pred_cfg)
     pred_score = _build_pred_score(pred_df, pred_date)
-    if pred_score.empty:
-        print("[WARN] empty predictions, exit")
-        return 0
+    pred_empty = pred_score.empty
     if "datetime" in pred_df.columns:
         pred_df = pred_df[pred_df["datetime"] == pred_date].copy()
     else:
         pred_df = pred_df.copy()
     if pred_df.empty:
-        print("[WARN] empty predictions for pred_date, exit")
-        return 0
-    pred_df = pred_df.drop_duplicates(subset="instrument", keep="last").reset_index(drop=True)
-    pred_df["target_weight"] = 0.0
+        pred_empty = True
+    else:
+        pred_df = pred_df.drop_duplicates(subset="instrument", keep="last").reset_index(drop=True)
+        pred_df["target_weight"] = 0.0
 
     encoding = cfg.get("output", {}).get("encoding", "utf-8-sig")
     positions_path = _resolve_path(cfg.get("paths", {}).get("positions", ""))
@@ -1377,6 +1388,42 @@ def main(trade_date_override: Optional[str] = None) -> int:
         if not position_counts:
             print("[WARN] workflow position counts unavailable, fallback to history-based hold filter")
             use_position_count = False
+    empty_pred_action = str(pred_raw.get("empty_pred_action", "exit")).lower()
+    if empty_pred_action not in ("exit", "hold", "carry", "skip"):
+        print(f"[WARN] empty_pred_action={empty_pred_action} not recognized, use exit")
+        empty_pred_action = "exit"
+    if pred_empty:
+        if empty_pred_action in ("hold", "carry", "skip"):
+            print("[WARN] empty predictions for pred_date, keep positions (no trade)")
+            orders_df = pd.DataFrame(
+                columns=[
+                    "order_id",
+                    "stock",
+                    "action",
+                    "shares",
+                    "price",
+                    "amount",
+                    "score",
+                    "weight",
+                    "price_raw",
+                    "shares_raw",
+                    "amount_raw",
+                ]
+            )
+            orders_out = _resolve_path(cfg.get("paths", {}).get("orders_out", ""))
+            orders_out.parent.mkdir(parents=True, exist_ok=True)
+            orders_out.write_text(orders_df.to_csv(index=False), encoding=encoding)
+            print(f"[OK] orders saved: {orders_out}")
+            positions_next = _resolve_path(cfg.get("paths", {}).get("positions_next", "positions_manual_next.csv"))
+            _write_positions_csv(positions_next, holdings_raw, cash, encoding)
+            print(f"[OK] next positions saved: {positions_next}")
+            history_path = _resolve_path(cfg.get("paths", {}).get("holdings_history", ""))
+            if bootstrap_cfg.get("auto_init_history", True) and not history_path.exists():
+                _save_holdings_history(history_path, {})
+                print(f"[INFO] auto init holdings_history: {history_path}")
+            return 0
+        print("[WARN] empty predictions for pred_date, exit")
+        return 0
 
     strategy_cfg = cfg.get("strategy", {}) or {}
     if not strategy_cfg.get("enabled", True):
@@ -1450,6 +1497,15 @@ def main(trade_date_override: Optional[str] = None) -> int:
             print(f"[WARN] fill_stock_value failed: {err}")
         _ensure_position_prices(position, exchange, trade_start, trade_end, price_map)
 
+    gen_hold_thresh = trading_cfg.hold_thresh
+    if not use_position_count:
+        gen_hold_thresh = 0
+        if trading_cfg.hold_thresh > 0:
+            print(
+                "[INFO] use_position_count=False -> disable stock_count check in order generation; "
+                "hold_thresh will be enforced by holdings_history"
+            )
+
     orders, buy_list = _generate_orders_topk_dropout(
         pred_score=pred_score,
         position=position,
@@ -1461,7 +1517,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
         n_drop=n_drop,
         method_sell=method_sell,
         method_buy=method_buy,
-        hold_thresh=trading_cfg.hold_thresh,
+        hold_thresh=gen_hold_thresh,
         trade_freq=trading_cfg.trade_freq,
         only_tradable=bool(only_tradable),
         forbid_all_trade_at_limit=forbid_all_trade_at_limit,
