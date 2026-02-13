@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
         "kernels": 64,
         "joblib_backend": "multiprocessing",
         "maxtasksperchild": None,
-        "dataset_cache": "SimpleDatasetCache",
+        "dataset_cache": None,
         "expression_cache": None,
         "local_cache_path": "~/.cache/qlib_simple_cache",
     },
