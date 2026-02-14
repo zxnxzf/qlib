@@ -596,8 +596,9 @@ def _prepare_predictions(predictions: pd.DataFrame, pred_cfg: PredictionConfig) 
     df["datetime"] = pd.to_datetime(df["datetime"]).dt.strftime("%Y-%m-%d")
     df = df.dropna(subset=["score"])
 
-    if pred_cfg.min_score_threshold > 0:
-        df = df[df["score"] >= pred_cfg.min_score_threshold]
+    threshold = pred_cfg.min_score_threshold
+    if threshold is not None and threshold > 0:
+        df = df[df["score"] >= threshold]
 
     df = df.sort_values("score", ascending=False).reset_index(drop=True)
     return df
