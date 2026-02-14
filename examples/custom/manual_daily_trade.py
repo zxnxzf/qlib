@@ -1382,6 +1382,9 @@ def main(trade_date_override: Optional[str] = None) -> int:
             f"use_backtest_window={use_backtest_window}, "
             f"use_execution_simulator={use_execution_simulator}"
         )
+        if pred_raw.get("min_score_threshold") is not None:
+            pred_raw["min_score_threshold"] = None
+            print("[INFO] workflow_alignment: disable min_score_threshold to match workflow signal ranking")
     provider_uri = pred_raw.get("provider_uri", "~/.qlib/qlib_data/cn_data")
     instruments = pred_raw.get("instruments", "csi300")
 
