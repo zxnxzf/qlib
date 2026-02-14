@@ -74,6 +74,7 @@ DEFAULT_CONFIG = {
         "holdings_history": "holdings_history_manual.json",
         "mlruns_uri": "auto",
         "positions_next": "positions_manual_next.csv",
+        "pnl_history": "pnl_history.csv",
     },
     "workflow_alignment": {
         "enabled": True,
@@ -159,6 +160,14 @@ DEFAULT_CONFIG = {
         "encoding": "utf-8-sig",
     },
 }
+
+PNL_COLUMNS = [
+    "date",
+    "total_asset",
+    "daily_pnl",
+    "daily_return",
+    "cum_return",
+]
 
 
 @dataclass
@@ -866,6 +875,97 @@ def _save_holdings_history(path: Path, history: Dict[str, dict]) -> None:
     path.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _load_pnl_history(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame(columns=["date", "total_asset"])
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig")
+    except Exception as err:
+        print(f"[WARN] failed to load pnl_history: {path} ({err})")
+        return pd.DataFrame(columns=["date", "total_asset"])
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date", "total_asset"])
+    df = df.rename(columns=str.lower)
+    if "date" not in df.columns:
+        print(f"[WARN] pnl_history missing date column: {path}, reset")
+        return pd.DataFrame(columns=["date", "total_asset"])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = df.dropna(subset=["date"])
+    if "total_asset" not in df.columns:
+        df["total_asset"] = np.nan
+    df["total_asset"] = pd.to_numeric(df["total_asset"], errors="coerce")
+    return df[["date", "total_asset"]].copy()
+
+
+def _append_pnl_record(df: pd.DataFrame, record_date: str, total_asset: float) -> pd.DataFrame:
+    base = df.copy() if df is not None else pd.DataFrame(columns=["date", "total_asset"])
+    record_date = pd.Timestamp(record_date).strftime("%Y-%m-%d")
+    if not base.empty:
+        base = base[base["date"] != record_date]
+    base = pd.concat(
+        [base, pd.DataFrame([{"date": record_date, "total_asset": float(total_asset)}])],
+        ignore_index=True,
+    )
+    base["date"] = pd.to_datetime(base["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    base = base.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    if base.empty:
+        return pd.DataFrame(columns=PNL_COLUMNS)
+    total = pd.to_numeric(base["total_asset"], errors="coerce").fillna(0.0)
+    base["total_asset"] = total
+    daily_pnl = total.diff().fillna(0.0)
+    daily_return = daily_pnl / total.shift(1)
+    daily_return = daily_return.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    first_total = float(total.iloc[0]) if len(total) else 0.0
+    if first_total == 0:
+        cum_return = pd.Series([0.0] * len(total))
+    else:
+        cum_return = total / first_total - 1.0
+    base["daily_pnl"] = daily_pnl
+    base["daily_return"] = daily_return
+    base["cum_return"] = cum_return
+    return base[PNL_COLUMNS]
+
+
+def _save_pnl_history(path: Path, pnl_df: pd.DataFrame, encoding: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pnl_df.to_csv(path, index=False, encoding=encoding)
+
+
+def _compute_total_asset(
+    holdings_raw: Dict[str, float],
+    cash: float,
+    exchange: Exchange,
+    trade_start: pd.Timestamp,
+    trade_end: pd.Timestamp,
+    price_map: Dict[str, float],
+) -> float:
+    total = float(cash)
+    if not holdings_raw:
+        return total
+    missing_prices = []
+    for code, raw_shares in holdings_raw.items():
+        if raw_shares is None or not np.isfinite(raw_shares) or raw_shares <= 0:
+            continue
+        factor = exchange.get_factor(code, trade_start, trade_end)
+        if factor is None or not np.isfinite(factor) or factor <= 0:
+            factor = 1.0
+        price_adj = price_map.get(code) if price_map is not None else None
+        if price_adj is None or pd.isna(price_adj) or float(price_adj) <= 0:
+            try:
+                price_adj = exchange.get_close(code, start_time=trade_start, end_time=trade_end)
+            except Exception:
+                price_adj = np.nan
+        if price_adj is None or pd.isna(price_adj) or float(price_adj) <= 0:
+            missing_prices.append(code)
+            continue
+        price_raw = float(price_adj) / float(factor)
+        total += float(raw_shares) * price_raw
+    if missing_prices:
+        preview = ", ".join(sorted(set(missing_prices))[:8])
+        print(f"[WARN] missing prices for holdings: {preview}")
+    return total
+
+
 def _load_backtest_window(recorder) -> Optional[Tuple[str, str]]:
     for obj_name in ("portfolio_analysis/report_normal_1day.pkl", "report_normal_1day.pkl"):
         try:
@@ -934,11 +1034,12 @@ def _calculate_hold_days(
             continue
         buy_date = entry["buy_date"]
         if trade_idx is not None and buy_date in cal_index:
-            delta = trade_idx - cal_index[buy_date]
+            # Qlib counts the buy day as day 1; align with Position.add_count_all behavior.
+            delta = trade_idx - cal_index[buy_date] + 1
             hold_days[code] = max(int(delta), 0)
         else:
             try:
-                delta = (pd.Timestamp(trade_date) - pd.Timestamp(buy_date)).days
+                delta = (pd.Timestamp(trade_date) - pd.Timestamp(buy_date)).days + 1
                 hold_days[code] = max(int(delta), 0)
             except Exception:
                 hold_days[code] = hold_thresh + 100
@@ -1424,12 +1525,56 @@ def main(trade_date_override: Optional[str] = None) -> int:
             orders_out.write_text(orders_df.to_csv(index=False), encoding=encoding)
             print(f"[OK] orders saved: {orders_out}")
             positions_next = _resolve_path(cfg.get("paths", {}).get("positions_next", "positions_manual_next.csv"))
-            _write_positions_csv(positions_next, holdings_raw, cash, encoding)
+            next_holdings = dict(holdings_raw)
+            next_cash = float(cash)
+            _write_positions_csv(positions_next, next_holdings, next_cash, encoding)
             print(f"[OK] next positions saved: {positions_next}")
             history_path = _resolve_path(cfg.get("paths", {}).get("holdings_history", ""))
             if bootstrap_cfg.get("auto_init_history", True) and not history_path.exists():
                 _save_holdings_history(history_path, {})
                 print(f"[INFO] auto init holdings_history: {history_path}")
+            pnl_path = _resolve_path(cfg.get("paths", {}).get("pnl_history", "pnl_history.csv"))
+            codes = sorted(set(next_holdings.keys()))
+            trade_base_date = trade_date if use_required_pred_date else pred_date
+            if pd.Timestamp(trade_base_date) > pd.Timestamp(qlib_latest_date):
+                print(
+                    "[WARN] trade_base_date beyond qlib_latest_date, "
+                    f"use pred_date instead: {trade_base_date} -> {pred_date}"
+                )
+                trade_base_date = pred_date
+            trade_start = pd.Timestamp(trade_base_date)
+            trade_end = epsilon_change(trade_start + pd.Timedelta(days=1))
+            start_date = (trade_start - pd.Timedelta(days=max(trading_cfg.price_search_days, 1))).strftime("%Y-%m-%d")
+            end_date = trade_end.strftime("%Y-%m-%d")
+            exchange = Exchange(
+                codes=codes,
+                start_time=start_date,
+                end_time=end_date,
+                deal_price=trading_cfg.deal_price,
+                freq=trading_cfg.trade_freq,
+                open_cost=trading_cfg.open_cost,
+                close_cost=trading_cfg.close_cost,
+                min_cost=trading_cfg.min_cost,
+                impact_cost=trading_cfg.impact_cost,
+                limit_threshold=trading_cfg.limit_threshold,
+            )
+            price_df = _fetch_prices(codes, trade_base_date, trading_cfg.price_search_days, trading_cfg.trade_freq)
+            price_map = dict(zip(price_df["instrument"], price_df["price"]))
+            total_asset = _compute_total_asset(
+                holdings_raw=next_holdings,
+                cash=next_cash,
+                exchange=exchange,
+                trade_start=trade_start,
+                trade_end=trade_end,
+                price_map=price_map,
+            )
+            pnl_df = _append_pnl_record(_load_pnl_history(pnl_path), trade_date, total_asset)
+            _save_pnl_history(pnl_path, pnl_df, encoding)
+            print(
+                f"[PNL] record_date={trade_date} valuation_date={trade_base_date} "
+                f"total_asset={total_asset:,.2f}"
+            )
+            print(f"[OK] pnl_history saved: {pnl_path}")
             return 0
         print("[WARN] empty predictions for pred_date, exit")
         return 0
@@ -1608,6 +1753,20 @@ def main(trade_date_override: Optional[str] = None) -> int:
     if history is not None:
         _update_history_after_buy(history, orders_df, trade_date)
         _save_holdings_history(history_path, history)
+
+    pnl_path = _resolve_path(cfg.get("paths", {}).get("pnl_history", "pnl_history.csv"))
+    total_asset = _compute_total_asset(
+        holdings_raw=next_holdings,
+        cash=next_cash,
+        exchange=exchange,
+        trade_start=trade_start,
+        trade_end=trade_end,
+        price_map=price_map,
+    )
+    pnl_df = _append_pnl_record(_load_pnl_history(pnl_path), trade_date, total_asset)
+    _save_pnl_history(pnl_path, pnl_df, encoding)
+    print(f"[PNL] record_date={trade_date} valuation_date={trade_base_date} total_asset={total_asset:,.2f}")
+    print(f"[OK] pnl_history saved: {pnl_path}")
 
     return 0
 
