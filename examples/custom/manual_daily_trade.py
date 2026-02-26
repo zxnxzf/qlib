@@ -14,6 +14,7 @@ import copy
 import json
 import math
 import shutil
+import subprocess
 import tarfile
 import time
 from dataclasses import dataclass, field
@@ -286,6 +287,44 @@ def _sync_instruments_file(source: Path, provider_uri: str, name: str) -> bool:
     return True
 
 
+def _rebuild_instruments_excluding_prefix(
+    provider_uri: str,
+    source_name: str,
+    target_name: str,
+    exclude_prefix: str,
+) -> bool:
+    target_dir = _provider_path_from_uri(provider_uri) / "instruments"
+    source = target_dir / f"{source_name}.txt"
+    target = target_dir / f"{target_name}.txt"
+    if not source.exists():
+        print(f"[ERROR] instruments source missing: {source}")
+        return False
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+        filtered = []
+        removed = 0
+        for line in lines:
+            text = line.strip()
+            if not text:
+                continue
+            if text.startswith(exclude_prefix):
+                removed += 1
+                continue
+            filtered.append(text)
+        if not filtered:
+            print(f"[ERROR] instruments rebuild result is empty: {target_name}")
+            return False
+        target.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+    except Exception as err:
+        print(f"[ERROR] failed to rebuild instruments {target_name}: {err}")
+        return False
+    print(
+        f"[INFO] rebuilt instruments: {target_name} from {source_name}, "
+        f"kept={len(filtered)}, removed_prefix_{exclude_prefix}={removed}"
+    )
+    return True
+
+
 def _resolve_path(path_str: str) -> Path:
     if not path_str:
         return Path("")
@@ -378,7 +417,10 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
                     print(f"[DATA] download attempt {attempt}/{retry_count}")
                 print("[DATA] downloading latest data package...")
                 print(f"   source: {url}")
-                urlretrieve(url, download_path)
+                curl_ok, curl_msg = _download_with_curl(url, download_path, cfg.download_timeout)
+                if not curl_ok:
+                    print(f"[DATA] curl unavailable or failed ({curl_msg}), fallback to urllib")
+                    urlretrieve(url, download_path)
                 size_mb = download_path.stat().st_size / (1024 * 1024)
                 print(f"[OK] download completed: {size_mb:.1f} MB")
                 if extract_dir.exists():
@@ -411,6 +453,41 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
         if len(urls) > 1:
             print("[DATA] switching to next download source...")
     return False
+
+
+def _download_with_curl(url: str, output_path: Path, timeout: int) -> Tuple[bool, str]:
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        return False, "curl not found"
+
+    cmd = [
+        curl_bin,
+        "-L",
+        "--http1.1",
+        "-C",
+        "-",
+        "--fail",
+        "--retry",
+        "5",
+        "--retry-all-errors",
+        "--retry-delay",
+        "3",
+        "--connect-timeout",
+        "15",
+        "-o",
+        str(output_path),
+        url,
+    ]
+    if timeout and int(timeout) > 0:
+        cmd.extend(["--max-time", str(int(timeout))])
+
+    try:
+        subprocess.run(cmd, check=True)
+        return True, "downloaded by curl"
+    except subprocess.CalledProcessError as err:
+        return False, f"curl failed with exit code {err.returncode}"
+    except Exception as err:
+        return False, f"curl failed: {err}"
 
 
 def _ensure_data_ready(
@@ -1406,6 +1483,10 @@ def main(trade_date_override: Optional[str] = None) -> int:
     provider_uri = pred_raw.get("provider_uri", "~/.qlib/qlib_data/cn_data")
     instruments = pred_raw.get("instruments", "csi300")
 
+    # Prebuild once to avoid "missing instruments file" on fresh environments.
+    if isinstance(instruments, str) and instruments == "all_no_bj":
+        _rebuild_instruments_excluding_prefix(provider_uri, "all", "all_no_bj", "BJ")
+
     data_update_cfg = DataUpdateConfig(**cfg.get("data_update", {}))
     try:
         _ensure_data_ready(provider_uri, instruments, required_pred_date, data_update_cfg)
@@ -1414,11 +1495,15 @@ def main(trade_date_override: Optional[str] = None) -> int:
         return 1
 
     if isinstance(instruments, str):
-        custom_instruments_dir = _EXAMPLES_DIR / "instruments"
-        custom_instruments_file = custom_instruments_dir / f"{instruments}.txt"
-        if custom_instruments_file.exists():
-            if not _sync_instruments_file(custom_instruments_file, provider_uri, instruments):
+        if instruments == "all_no_bj":
+            if not _rebuild_instruments_excluding_prefix(provider_uri, "all", "all_no_bj", "BJ"):
                 return 1
+        else:
+            custom_instruments_dir = _EXAMPLES_DIR / "instruments"
+            custom_instruments_file = custom_instruments_dir / f"{instruments}.txt"
+            if custom_instruments_file.exists():
+                if not _sync_instruments_file(custom_instruments_file, provider_uri, instruments):
+                    return 1
 
     qlib_cfg = cfg.get("qlib_init", {})
     print(
