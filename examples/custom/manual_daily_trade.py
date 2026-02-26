@@ -110,7 +110,7 @@ DEFAULT_CONFIG = {
     },
     "prediction": {
         "experiment_id": "1",
-        "recorder_id": "c8f7a66693244c94bb2b8ddf5df17a3d",
+        "recorder_id": "80e45c37511c42ab8497514f05f1d633",
         "prediction_date": "auto",
         "top_k": 50,
         "min_score_threshold": 0.0,
@@ -1414,7 +1414,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
         return 1
 
     if isinstance(instruments, str):
-        custom_instruments_dir = _EXAMPLES_DIR / "custom" / "instruments"
+        custom_instruments_dir = _EXAMPLES_DIR / "instruments"
         custom_instruments_file = custom_instruments_dir / f"{instruments}.txt"
         if custom_instruments_file.exists():
             if not _sync_instruments_file(custom_instruments_file, provider_uri, instruments):
