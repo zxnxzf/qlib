@@ -73,7 +73,7 @@ DEFAULT_CONFIG = {
         "positions": "positions_manual.csv",
         "orders_out": "orders_manual.csv",
         "holdings_history": "holdings_history_manual.json",
-        "mlruns_uri": "auto",
+        "mlruns_uri": "../benchmarks/LightGBM/mlruns",
         "positions_next": "positions_manual_next.csv",
         "pnl_history": "pnl_history.csv",
     },
