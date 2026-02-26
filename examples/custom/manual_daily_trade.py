@@ -269,6 +269,23 @@ def _provider_path_from_uri(uri: str) -> Path:
     return path
 
 
+def _sync_instruments_file(source: Path, provider_uri: str, name: str) -> bool:
+    if not source.exists():
+        print(f"[ERROR] instruments source missing: {source}")
+        return False
+    target_dir = _provider_path_from_uri(provider_uri) / "instruments"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{name}.txt"
+    try:
+        content = source.read_text(encoding="utf-8")
+        target.write_text(content, encoding="utf-8")
+    except Exception as err:
+        print(f"[ERROR] failed to sync instruments file: {err}")
+        return False
+    print(f"[INFO] synced instruments: {name} -> {target}")
+    return True
+
+
 def _resolve_path(path_str: str) -> Path:
     if not path_str:
         return Path("")
@@ -1388,6 +1405,13 @@ def main(trade_date_override: Optional[str] = None) -> int:
             print("[INFO] workflow_alignment: disable min_score_threshold to match workflow signal ranking")
     provider_uri = pred_raw.get("provider_uri", "~/.qlib/qlib_data/cn_data")
     instruments = pred_raw.get("instruments", "csi300")
+
+    if isinstance(instruments, str):
+        custom_instruments_dir = _EXAMPLES_DIR / "custom" / "instruments"
+        custom_instruments_file = custom_instruments_dir / f"{instruments}.txt"
+        if custom_instruments_file.exists():
+            if not _sync_instruments_file(custom_instruments_file, provider_uri, instruments):
+                return 1
 
     data_update_cfg = DataUpdateConfig(**cfg.get("data_update", {}))
     try:
