@@ -1406,19 +1406,19 @@ def main(trade_date_override: Optional[str] = None) -> int:
     provider_uri = pred_raw.get("provider_uri", "~/.qlib/qlib_data/cn_data")
     instruments = pred_raw.get("instruments", "csi300")
 
-    if isinstance(instruments, str):
-        custom_instruments_dir = _EXAMPLES_DIR / "custom" / "instruments"
-        custom_instruments_file = custom_instruments_dir / f"{instruments}.txt"
-        if custom_instruments_file.exists():
-            if not _sync_instruments_file(custom_instruments_file, provider_uri, instruments):
-                return 1
-
     data_update_cfg = DataUpdateConfig(**cfg.get("data_update", {}))
     try:
         _ensure_data_ready(provider_uri, instruments, required_pred_date, data_update_cfg)
     except RuntimeError as err:
         print(f"[ERROR] {err}")
         return 1
+
+    if isinstance(instruments, str):
+        custom_instruments_dir = _EXAMPLES_DIR / "custom" / "instruments"
+        custom_instruments_file = custom_instruments_dir / f"{instruments}.txt"
+        if custom_instruments_file.exists():
+            if not _sync_instruments_file(custom_instruments_file, provider_uri, instruments):
+                return 1
 
     qlib_cfg = cfg.get("qlib_init", {})
     print(
