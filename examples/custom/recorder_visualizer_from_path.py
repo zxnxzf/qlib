@@ -66,14 +66,18 @@ class ArtifactsDataAnalyzer:
         else:
             print(f"[WARNING] pred.pkl not found")
 
-        # 加载回测数据
-        backtest_file = self.artifacts_path / "port_analysis_1day.pkl"
-        if backtest_file.exists():
+        # 加载回测数据（兼容旧/新路径）
+        backtest_candidates = [
+            self.artifacts_path / "port_analysis_1day.pkl",
+            self.artifacts_path / "portfolio_analysis" / "port_analysis_1day.pkl",
+        ]
+        backtest_file = next((p for p in backtest_candidates if p.exists()), None)
+        if backtest_file is not None:
             with open(backtest_file, 'rb') as f:
                 self.backtest_data = pickle.load(f)
             print(f"[OK] Loaded backtest data: {type(self.backtest_data)}")
         else:
-            print(f"[WARNING] port_analysis_1day.pkl not found")
+            print(f"[WARNING] port_analysis_1day.pkl not found (checked root and portfolio_analysis/)")
 
         # 加载完整的组合报告数据
         portfolio_report_file = self.artifacts_path / "portfolio_analysis" / "report_normal_1day.pkl"
@@ -93,15 +97,36 @@ class ArtifactsDataAnalyzer:
         else:
             print(f"[WARNING] portfolio metrics not found")
 
-        # 加载信号分析数据
+        # 加载信号分析数据（兼容旧/新结构）
         signal_file = self.artifacts_path / "signal_analysis.pkl"
+        sig_ic_file = self.artifacts_path / "sig_analysis" / "ic.pkl"
+        sig_ric_file = self.artifacts_path / "sig_analysis" / "ric.pkl"
         if signal_file.exists():
             with open(signal_file, 'rb') as f:
                 signal_data = pickle.load(f)
             print(f"[OK] Loaded signal analysis: {type(signal_data)}")
             self._extract_metrics_from_signal(signal_data)
+        elif sig_ic_file.exists() or sig_ric_file.exists():
+            loaded_parts = []
+            if sig_ic_file.exists():
+                with open(sig_ic_file, "rb") as f:
+                    ic_data = pickle.load(f)
+                try:
+                    self.metrics.setdefault("basic", {})["IC"] = float(pd.Series(ic_data).mean())
+                except Exception:
+                    pass
+                loaded_parts.append("ic.pkl")
+            if sig_ric_file.exists():
+                with open(sig_ric_file, "rb") as f:
+                    ric_data = pickle.load(f)
+                try:
+                    self.metrics.setdefault("basic", {})["Rank IC"] = float(pd.Series(ric_data).mean())
+                except Exception:
+                    pass
+                loaded_parts.append("ric.pkl")
+            print(f"[OK] Loaded signal analysis files: {', '.join(loaded_parts)}")
         else:
-            print(f"[WARNING] signal_analysis.pkl not found")
+            print(f"[WARNING] signal analysis not found (checked signal_analysis.pkl and sig_analysis/)")
 
         # 加载模型参数
         params_file = self.artifacts_path / "params.pkl"
@@ -463,6 +488,10 @@ class ArtifactsDataAnalyzer:
                 summary["information_ratio"] = float(excess_daily.mean() / excess_daily.std() * np.sqrt(252))
 
         # 优先使用 Qlib 风险分析输出（如果有）
+        annualized_excess = self._get_risk_metric("excess_return_with_cost", "annualized_return")
+        if annualized_excess is not None:
+            summary["annualized_excess_return_with_cost"] = annualized_excess
+
         info_ratio = self._get_risk_metric("excess_return_with_cost", "information_ratio")
         if info_ratio is not None:
             summary["information_ratio"] = info_ratio
@@ -659,12 +688,52 @@ class ArtifactsDataAnalyzer:
         summary = self.metrics.get("summary", {})
 
         excess_return = summary.get("excess_return_with_cost")
+        annualized_excess = summary.get("annualized_excess_return_with_cost")
         info_ratio = summary.get("information_ratio")
         excess_mdd = summary.get("excess_max_drawdown")
 
         excess_return_text = f"{excess_return*100:.2f}%" if excess_return is not None else "N/A"
+        annualized_excess_text = f"{annualized_excess*100:.2f}%" if annualized_excess is not None else "N/A"
         info_ratio_text = f"{info_ratio:.3f}" if info_ratio is not None else "N/A"
         excess_mdd_text = f"{excess_mdd*100:.2f}%" if excess_mdd is not None else "N/A"
+
+        def _rate_annualized_excess(v):
+            if v is None:
+                return "N/A"
+            if v >= 0.20:
+                return "较强"
+            if v >= 0.10:
+                return "较好"
+            if v >= 0.00:
+                return "一般"
+            return "偏弱"
+
+        def _rate_ir(v):
+            if v is None:
+                return "N/A"
+            if v >= 2.0:
+                return "很强"
+            if v >= 1.0:
+                return "较好"
+            if v >= 0.0:
+                return "一般"
+            return "偏弱"
+
+        def _rate_mdd(v):
+            if v is None:
+                return "N/A"
+            dd = abs(float(v))
+            if dd <= 0.10:
+                return "控制良好"
+            if dd <= 0.20:
+                return "可接受"
+            return "偏大"
+
+        quick_eval_text = (
+            f"当前 run 快评：年化超额(含成本) {annualized_excess_text}（{_rate_annualized_excess(annualized_excess)}），"
+            f"IR {info_ratio_text}（{_rate_ir(info_ratio)}），"
+            f"最大回撤 {excess_mdd_text}（{_rate_mdd(excess_mdd)}）。"
+        )
 
         html_template = f"""
 <!DOCTYPE html>
@@ -784,7 +853,7 @@ class ArtifactsDataAnalyzer:
             <div class="col-md-3">
                 <div class="metric-card">
                     <div class="metric-value">{excess_return_text}</div>
-                    <div class="metric-label">超额收益(含成本)<br><small style="font-size: 0.8em; color: #888;">相对基准</small></div>
+                    <div class="metric-label">累计超额收益(含成本)<br><small style="font-size: 0.8em; color: #888;">相对基准</small></div>
                 </div>
             </div>
             <div class="col-md-3">
@@ -835,6 +904,17 @@ class ArtifactsDataAnalyzer:
         <div class="chart-container">
             <h3 class="section-title">Qlib 风险分析</h3>
             {charts.get('qlib_risk_chart', '<p>Qlib 风险分析图表生成中...</p>')}
+            <div class="mt-3" style="font-size: 0.95em; color: #495057; line-height: 1.6;">
+                <h5 style="color: #667eea;">指标说明（人话版）</h5>
+                <ul style="margin-bottom: 0;">
+                    <li><strong>mean</strong>: 日均超额收益，越大越好。</li>
+                    <li><strong>std</strong>: 日超额收益波动，越小越稳。</li>
+                    <li><strong>annualized_return</strong>: 年化超额收益（按 252 交易日折算），越大越好。</li>
+                    <li><strong>information_ratio (IR)</strong>: 超额收益性价比（mean/std*sqrt(252)），越大越好。经验上：&gt;1 较好，&gt;2 很强。</li>
+                    <li><strong>max_drawdown</strong>: 历史最大回撤（负数），绝对值越小越好。例如 -10% 好于 -20%。</li>
+                </ul>
+                <p style="margin-top: 10px; margin-bottom: 0;"><strong>{quick_eval_text}</strong></p>
+            </div>
         </div>
 
         <!-- 月度表现 -->
@@ -899,7 +979,7 @@ class ArtifactsDataAnalyzer:
                     <li>账户价值变化: {report['account'].iloc[0]:,.0f} → {report['account'].iloc[-1]:,.0f}</li>
                     <li>策略总收益: {(report['return'] + 1).prod() - 1:.4%}</li>
                     <li>基准总收益: {(report['bench'] + 1).prod() - 1:.4%}</li>
-                    <li>总交易成本: {report.get('total_cost', 0).sum():.0f}</li>
+                    <li>总交易成本(累计): {float(report['total_cost'].iloc[-1]) if 'total_cost' in report.columns else 0:.0f}</li>
                 </ul>
             </div>
             """
