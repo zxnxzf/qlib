@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
         "trade_date": "auto",
     },
     "paths": {
+        "state_dir": "manual_state",
         "positions": "positions_manual.csv",
         "orders_out": "orders_manual.csv",
         "holdings_history": "holdings_history_manual.json",
@@ -152,7 +153,7 @@ DEFAULT_CONFIG = {
             "https://ghfast.top/https://github.com/jzhongsun/investment_data/releases/latest/download/qlib_bin.tar.gz",
             "https://github.com/jzhongsun/investment_data/releases/latest/download/qlib_bin.tar.gz",
         ],
-        "download_timeout": 600,
+        "download_timeout": 1800,
         "retry_count": 3,
         "retry_interval": 10,
         "temp_dir": None,
@@ -334,6 +335,38 @@ def _resolve_path(path_str: str) -> Path:
     return (_EXAMPLES_DIR / path).resolve()
 
 
+def _resolve_state_file_path(path_str: str, state_dir: Optional[Path]) -> Path:
+    if not path_str:
+        return Path("")
+    path = Path(path_str).expanduser()
+    if path.is_absolute():
+        return path
+    if state_dir is not None:
+        return (state_dir / path).resolve()
+    return (_EXAMPLES_DIR / path).resolve()
+
+
+def _resolve_state_paths(paths_cfg: Dict[str, object]) -> Dict[str, Path]:
+    raw_state_dir = str(paths_cfg.get("state_dir", "") or "").strip()
+    state_dir = _resolve_path(raw_state_dir) if raw_state_dir else None
+    return {
+        "positions": _resolve_state_file_path(str(paths_cfg.get("positions", "") or ""), state_dir),
+        "orders_out": _resolve_state_file_path(str(paths_cfg.get("orders_out", "") or ""), state_dir),
+        "positions_next": _resolve_state_file_path(
+            str(paths_cfg.get("positions_next", "positions_manual_next.csv") or "positions_manual_next.csv"),
+            state_dir,
+        ),
+        "pnl_history": _resolve_state_file_path(
+            str(paths_cfg.get("pnl_history", "pnl_history.csv") or "pnl_history.csv"),
+            state_dir,
+        ),
+        "holdings_history": _resolve_state_file_path(
+            str(paths_cfg.get("holdings_history", "") or ""),
+            state_dir,
+        ),
+    }
+
+
 def _resolve_mlruns_uri(value: str) -> str:
     if not value or str(value).lower() == "auto":
         path = (_EXAMPLES_DIR.parent / "mlruns").resolve()
@@ -417,9 +450,20 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
                     print(f"[DATA] download attempt {attempt}/{retry_count}")
                 print("[DATA] downloading latest data package...")
                 print(f"   source: {url}")
-                curl_ok, curl_msg = _download_with_curl(url, download_path, cfg.download_timeout)
+                curl_ok, curl_msg = _download_with_curl(url, download_path, cfg.download_timeout, resume=True)
+                if (not curl_ok) and ("exit code 22" in curl_msg):
+                    # HTTP 416 usually means stale partial file / invalid range for resume.
+                    print("[DATA] curl resume failed (possible HTTP 416), retrying full download...")
+                    try:
+                        if download_path.exists():
+                            download_path.unlink()
+                    except Exception as cleanup_err:
+                        print(f"[WARN] failed to remove stale partial file: {cleanup_err}")
+                    curl_ok, curl_msg = _download_with_curl(url, download_path, cfg.download_timeout, resume=False)
                 if not curl_ok:
                     print(f"[DATA] curl unavailable or failed ({curl_msg}), fallback to urllib")
+                    if download_path.exists():
+                        download_path.unlink()
                     urlretrieve(url, download_path)
                 size_mb = download_path.stat().st_size / (1024 * 1024)
                 print(f"[OK] download completed: {size_mb:.1f} MB")
@@ -455,7 +499,7 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
     return False
 
 
-def _download_with_curl(url: str, output_path: Path, timeout: int) -> Tuple[bool, str]:
+def _download_with_curl(url: str, output_path: Path, timeout: int, resume: bool = True) -> Tuple[bool, str]:
     curl_bin = shutil.which("curl")
     if not curl_bin:
         return False, "curl not found"
@@ -464,20 +508,24 @@ def _download_with_curl(url: str, output_path: Path, timeout: int) -> Tuple[bool
         curl_bin,
         "-L",
         "--http1.1",
-        "-C",
-        "-",
-        "--fail",
-        "--retry",
-        "5",
-        "--retry-all-errors",
-        "--retry-delay",
-        "3",
-        "--connect-timeout",
-        "15",
-        "-o",
-        str(output_path),
-        url,
     ]
+    if resume:
+        cmd.extend(["-C", "-"])
+    cmd.extend(
+        [
+            "--fail",
+            "--retry",
+            "5",
+            "--retry-all-errors",
+            "--retry-delay",
+            "3",
+            "--connect-timeout",
+            "15",
+            "-o",
+            str(output_path),
+            url,
+        ]
+    )
     if timeout and int(timeout) > 0:
         cmd.extend(["--max-time", str(int(timeout))])
 
@@ -1393,6 +1441,12 @@ def main(trade_date_override: Optional[str] = None) -> int:
     except Exception:
         cfg = DEFAULT_CONFIG
 
+    paths_cfg = dict(cfg.get("paths", {}) or {})
+    state_paths = _resolve_state_paths(paths_cfg)
+    state_dir_value = str(paths_cfg.get("state_dir", "") or "").strip()
+    if state_dir_value:
+        print(f"[INFO] state_dir enabled: {_resolve_path(state_dir_value)}")
+
     trade_date_value = trade_date_override or cfg.get("runtime", {}).get("trade_date", "auto")
     trade_date = _resolve_trade_date(trade_date_value)
     qlib_calendar_provider = cfg.get("qlib_init", {}).get("provider_uri", "~/.qlib/qlib_data/cn_data")
@@ -1463,20 +1517,18 @@ def main(trade_date_override: Optional[str] = None) -> int:
                     if end_text not in ("pred_date", "auto"):
                         handler_kwargs["end_time"] = end_value
             pred_raw["handler_kwargs"] = handler_kwargs
-        print(
-            "[INFO] workflow_alignment enabled: "
-            f"mode={mode}, "
-            f"market={pred_raw.get('instruments')}, "
-            f"handler_start_time={handler_cfg.get('start_time')}, "
-            f"fit_start_time={handler_cfg.get('fit_start_time')}, "
-            f"fit_end_time={handler_cfg.get('fit_end_time')}, "
-            f"handler_end_time_policy={handler_end_time_policy}, "
-            f"use_required_pred_date={use_required_pred_date}, "
-            f"use_recorder_pred={use_recorder_pred}, "
-            f"use_position_count={use_position_count}, "
-            f"use_backtest_window={use_backtest_window}, "
-            f"use_execution_simulator={use_execution_simulator}"
-        )
+        print("[INFO] workflow_alignment enabled:")
+        print(f"  mode: {mode}")
+        print(f"  market: {pred_raw.get('instruments')}")
+        print(f"  handler_start_time: {handler_cfg.get('start_time')}")
+        print(f"  fit_start_time: {handler_cfg.get('fit_start_time')}")
+        print(f"  fit_end_time: {handler_cfg.get('fit_end_time')}")
+        print(f"  handler_end_time_policy: {handler_end_time_policy}")
+        print(f"  use_required_pred_date: {use_required_pred_date}")
+        print(f"  use_recorder_pred: {use_recorder_pred}")
+        print(f"  use_position_count: {use_position_count}")
+        print(f"  use_backtest_window: {use_backtest_window}")
+        print(f"  use_execution_simulator: {use_execution_simulator}")
         if pred_raw.get("min_score_threshold") is not None:
             pred_raw["min_score_threshold"] = None
             print("[INFO] workflow_alignment: disable min_score_threshold to match workflow signal ranking")
@@ -1563,7 +1615,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
     pred_kwargs.pop("prediction_date", None)
     pred_kwargs.pop("empty_pred_action", None)
     pred_cfg = PredictionConfig(**pred_kwargs, prediction_date=pred_date)
-    mlruns_uri = _resolve_mlruns_uri(cfg.get("paths", {}).get("mlruns_uri", "auto"))
+    mlruns_uri = _resolve_mlruns_uri(paths_cfg.get("mlruns_uri", "auto"))
     R.set_uri(mlruns_uri)
     recorder = R.get_recorder(
         experiment_id=pred_cfg.experiment_id,
@@ -1598,7 +1650,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
         pred_df["target_weight"] = 0.0
 
     encoding = cfg.get("output", {}).get("encoding", "utf-8-sig")
-    positions_path = _resolve_path(cfg.get("paths", {}).get("positions", ""))
+    positions_path = state_paths["positions"]
     bootstrap_cfg = cfg.get("bootstrap", {}) or {}
     initial_cash = float(bootstrap_cfg.get("initial_cash", trading_cfg.total_cash or 0.0))
     if bootstrap_cfg.get("auto_init_positions", True) and not positions_path.exists():
@@ -1633,20 +1685,20 @@ def main(trade_date_override: Optional[str] = None) -> int:
                     "amount_raw",
                 ]
             )
-            orders_out = _resolve_path(cfg.get("paths", {}).get("orders_out", ""))
+            orders_out = state_paths["orders_out"]
             orders_out.parent.mkdir(parents=True, exist_ok=True)
             orders_out.write_text(orders_df.to_csv(index=False), encoding=encoding)
             print(f"[OK] orders saved: {orders_out}")
-            positions_next = _resolve_path(cfg.get("paths", {}).get("positions_next", "positions_manual_next.csv"))
+            positions_next = state_paths["positions_next"]
             next_holdings = dict(holdings_raw)
             next_cash = float(cash)
             _write_positions_csv(positions_next, next_holdings, next_cash, encoding)
             print(f"[OK] next positions saved: {positions_next}")
-            history_path = _resolve_path(cfg.get("paths", {}).get("holdings_history", ""))
+            history_path = state_paths["holdings_history"]
             if bootstrap_cfg.get("auto_init_history", True) and not history_path.exists():
                 _save_holdings_history(history_path, {})
                 print(f"[INFO] auto init holdings_history: {history_path}")
-            pnl_path = _resolve_path(cfg.get("paths", {}).get("pnl_history", "pnl_history.csv"))
+            pnl_path = state_paths["pnl_history"]
             codes = sorted(set(next_holdings.keys()))
             trade_base_date = trade_date if use_required_pred_date else pred_date
             if pd.Timestamp(trade_base_date) > pd.Timestamp(qlib_latest_date):
@@ -1791,7 +1843,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
     )
 
     history = None
-    history_path = _resolve_path(cfg.get("paths", {}).get("holdings_history", ""))
+    history_path = state_paths["holdings_history"]
     if bootstrap_cfg.get("auto_init_history", True) and not history_path.exists():
         _save_holdings_history(history_path, {})
         print(f"[INFO] auto init holdings_history: {history_path}")
@@ -1836,7 +1888,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
     print(f"  buy_amount_raw: {total_buy:,.2f}")
     print(f"  sell_amount_raw: {total_sell:,.2f}")
 
-    orders_out = _resolve_path(cfg.get("paths", {}).get("orders_out", ""))
+    orders_out = state_paths["orders_out"]
     orders_out.parent.mkdir(parents=True, exist_ok=True)
     orders_out.write_text(orders_df.to_csv(index=False), encoding=encoding)
     print(f"[OK] orders saved: {orders_out}")
@@ -1855,7 +1907,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
                     f"price_raw={row['price_raw']:.4f} amount_raw={row['amount_raw']:.2f}"
                 )
 
-    positions_next_path = _resolve_path(cfg.get("paths", {}).get("positions_next", ""))
+    positions_next_path = state_paths["positions_next"]
     if use_execution_simulator and executed_position is not None:
         next_holdings, next_cash = _position_to_raw_holdings(executed_position, exchange, trade_start, trade_end)
     else:
@@ -1867,7 +1919,7 @@ def main(trade_date_override: Optional[str] = None) -> int:
         _update_history_after_buy(history, orders_df, trade_date)
         _save_holdings_history(history_path, history)
 
-    pnl_path = _resolve_path(cfg.get("paths", {}).get("pnl_history", "pnl_history.csv"))
+    pnl_path = state_paths["pnl_history"]
     total_asset = _compute_total_asset(
         holdings_raw=next_holdings,
         cash=next_cash,

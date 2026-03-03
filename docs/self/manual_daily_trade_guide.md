@@ -15,8 +15,17 @@
 
 ## 2. 日常实盘步骤
 
-1. **更新持仓与现金**
-   - 文件：`examples/custom/positions_manual.csv`
+1. **确认状态目录**
+   - 默认统一目录：`examples/custom/manual_state/`
+   - 交易状态文件（5个）：
+     - `positions_manual.csv`
+     - `orders_manual.csv`
+     - `positions_manual_next.csv`
+     - `pnl_history.csv`
+     - `holdings_history_manual.json`
+
+2. **更新持仓与现金**
+   - 文件：`examples/custom/manual_state/positions_manual.csv`
    - 格式示例：
      ```csv
      code,position
@@ -25,26 +34,27 @@
      SZ000001,200
      ```
 
-2. **运行脚本生成订单**
+3. **运行脚本生成订单**
    ```bash
    python /qlib/examples/custom/manual_daily_trade.py
    ```
 
-3. **查看输出**
-   - 订单：`examples/custom/orders_manual.csv`
+4. **查看输出**
+   - 订单：`examples/custom/manual_state/orders_manual.csv`
+   - 净值历史：`examples/custom/manual_state/pnl_history.csv`
    - 控制台也会打印买卖列表
 
-4. **手动下单**
+5. **手动下单**
    - 价格为未复权价格，直接用于真实下单参考。
 
-5. **更新下一日持仓**
-   - 自动生成：`examples/custom/positions_manual_next.csv`
+6. **更新下一日持仓**
+   - 自动生成：`examples/custom/manual_state/positions_manual_next.csv`
    - 确认成交后：
      ```bash
-     mv /qlib/examples/custom/positions_manual_next.csv /qlib/examples/custom/positions_manual.csv
+     mv /qlib/examples/custom/manual_state/positions_manual_next.csv /qlib/examples/custom/manual_state/positions_manual.csv
      ```
 
-6. **次日重复**
+7. **次日重复**
 
 ## 3. 关键配置位置
 
@@ -52,9 +62,11 @@
 
 - 交易日历：`DEFAULT_CONFIG["calendar"]`
 - 实盘路径：`DEFAULT_CONFIG["paths"]`
+- 状态目录：`DEFAULT_CONFIG["paths"]["state_dir"]`（默认 `manual_state`）
 - 预测/策略对齐：`DEFAULT_CONFIG["workflow_alignment"]`
 - 持仓约束（持有天数）：`DEFAULT_CONFIG["strategy"]["hold_thresh"]`
 - 并行加速：`DEFAULT_CONFIG["qlib_init"]["kernels"]` / `joblib_backend`
+- 下载超时：`DEFAULT_CONFIG["data_update"]["download_timeout"]`（默认 1800 秒）
 
 ## 4. 对比 workflow 的方式（简述）
 
@@ -72,11 +84,17 @@ python /qlib/examples/custom/compare_live_chain.py
 
 ## 5. 持仓历史文件说明
 
-- 文件：`examples/custom/holdings_history_manual.json`
+- 文件：`examples/custom/manual_state/holdings_history_manual.json`
 - 用途：用于计算持仓天数，配合 `hold_thresh` 限制卖出。
 - 日常无需手动修改，如需重置持仓天数，可删除该文件。
 
-## 6. 如何判断 workflow 回测结果好坏（简要标准）
+## 6. 数据更新下载说明（网络不稳定时）
+
+- 脚本默认先用 `curl` 断点续传下载数据包。
+- 如遇断点续传范围错误（常见 HTTP 416），会自动删除残留临时包并重试全量下载。
+- 若 `curl` 仍失败，脚本会自动回退到 `urllib` 下载。
+
+## 7. 如何判断 workflow 回测结果好坏（简要标准）
 
 以下指标是**实盘优先关注**的核心项（按重要性排序）：
 
