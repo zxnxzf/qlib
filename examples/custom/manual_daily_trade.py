@@ -442,6 +442,15 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
     urls = cfg.data_source_urls or [cfg.data_source_url]
     urls = [u for u in urls if u]
 
+    # New update cycle: clean stale package from previous runs first.
+    try:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        if download_path.exists():
+            download_path.unlink()
+            print(f"[DATA] cleanup stale package before new update cycle: {download_path}")
+    except Exception as cleanup_err:
+        print(f"[WARN] failed to cleanup stale package before update: {cleanup_err}")
+
     for url in urls:
         for attempt in range(1, retry_count + 1):
             try:
@@ -1428,12 +1437,39 @@ def _update_history_after_buy(history: Dict[str, dict], orders_df: pd.DataFrame,
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Manual daily trading for Qlib.")
+    examples = (
+        "Examples:\n"
+        "  python /qlib/examples/custom/manual_daily_trade.py --trade-date 2026-03-03\n"
+        "  python /qlib/examples/custom/manual_daily_trade.py --trade-date 2026-03-03 "
+        "--experiment-id 1 --recorder-id 80e45c37511c42ab8497514f05f1d633\n"
+        "  python /qlib/examples/custom/manual_daily_trade.py --trade-date 2026-03-03 "
+        "--mlruns-uri /qlib/examples/mlruns "
+        "--workflow-config-path /qlib/examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158_2020_2025.yaml"
+    )
+    parser = argparse.ArgumentParser(
+        description="Manual daily trading for Qlib.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=examples,
+    )
     parser.add_argument("--trade-date", default=None, help="Trade date, e.g. 2025-01-06; default is today.")
+    parser.add_argument("--experiment-id", default=None, help="Override prediction experiment_id for this run.")
+    parser.add_argument("--recorder-id", default=None, help="Override prediction recorder_id for this run.")
+    parser.add_argument("--mlruns-uri", default=None, help="Override paths.mlruns_uri for this run.")
+    parser.add_argument(
+        "--workflow-config-path",
+        default=None,
+        help="Override workflow_alignment.workflow_config_path for this run.",
+    )
     return parser.parse_args()
 
 
-def main(trade_date_override: Optional[str] = None) -> int:
+def main(
+    trade_date_override: Optional[str] = None,
+    experiment_id_override: Optional[str] = None,
+    recorder_id_override: Optional[str] = None,
+    mlruns_uri_override: Optional[str] = None,
+    workflow_config_path_override: Optional[str] = None,
+) -> int:
     cfg = DEFAULT_CONFIG
     # Allow external scripts to override DEFAULT_CONFIG in this module.
     try:
@@ -1442,6 +1478,9 @@ def main(trade_date_override: Optional[str] = None) -> int:
         cfg = DEFAULT_CONFIG
 
     paths_cfg = dict(cfg.get("paths", {}) or {})
+    if mlruns_uri_override:
+        paths_cfg["mlruns_uri"] = mlruns_uri_override
+        print(f"[INFO] cli override: mlruns_uri={mlruns_uri_override}")
     state_paths = _resolve_state_paths(paths_cfg)
     state_dir_value = str(paths_cfg.get("state_dir", "") or "").strip()
     if state_dir_value:
@@ -1466,7 +1505,18 @@ def main(trade_date_override: Optional[str] = None) -> int:
     required_pred_date = _previous_trade_date(trade_date, calendar_dates)
 
     pred_raw = dict(cfg.get("prediction", {}) or {})
+    if experiment_id_override:
+        pred_raw["experiment_id"] = str(experiment_id_override)
+        print(f"[INFO] cli override: experiment_id={experiment_id_override}")
+    if recorder_id_override:
+        pred_raw["recorder_id"] = str(recorder_id_override)
+        print(f"[INFO] cli override: recorder_id={recorder_id_override}")
+
     align_cfg = cfg.get("workflow_alignment", {}) or {}
+    if workflow_config_path_override:
+        align_cfg = dict(align_cfg)
+        align_cfg["workflow_config_path"] = workflow_config_path_override
+        print(f"[INFO] cli override: workflow_config_path={workflow_config_path_override}")
     handler_cfg = dict(align_cfg.get("handler", {}) or {})
     align_enabled = bool(align_cfg.get("enabled", False))
     mode = str(align_cfg.get("mode", "align")).lower()
@@ -1938,4 +1988,12 @@ def main(trade_date_override: Optional[str] = None) -> int:
 
 if __name__ == "__main__":
     args = _parse_args()
-    raise SystemExit(main(trade_date_override=args.trade_date))
+    raise SystemExit(
+        main(
+            trade_date_override=args.trade_date,
+            experiment_id_override=args.experiment_id,
+            recorder_id_override=args.recorder_id,
+            mlruns_uri_override=args.mlruns_uri,
+            workflow_config_path_override=args.workflow_config_path,
+        )
+    )
