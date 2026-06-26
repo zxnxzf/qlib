@@ -11,6 +11,9 @@ import importlib
 import os
 import yaml
 
+from qlib.config import C
+from qlib.log import set_log_with_config
+
 from .config import TunerConfigManager
 
 
@@ -29,9 +32,14 @@ TUNER_CONFIG_MANAGER = TunerConfigManager(args.config_path)
 
 
 def run():
+    set_log_with_config(C.logging_config)
     # 1. Get pipeline class.
     tuner_pipeline_class = getattr(importlib.import_module(".pipeline", package="qlib.contrib.tuner"), "Pipeline")
     # 2. Init tuner pipeline.
     tuner_pipeline = tuner_pipeline_class(TUNER_CONFIG_MANAGER)
     # 3. Begin to tune
     tuner_pipeline.run()
+
+
+if __name__ == "__main__":
+    run()

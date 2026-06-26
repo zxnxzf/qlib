@@ -83,7 +83,7 @@ def render_template(config_path: str) -> str:
 
 
 # workflow handler function
-def workflow(config_path, experiment_name="workflow", uri_folder="mlruns"):
+def workflow(config_path, experiment_name="workflow", uri_folder="mlruns", return_recorder=False):
     """
     This is a Qlib CLI entrance.
     User can run the whole Quant research workflow defined by a configure file
@@ -146,6 +146,8 @@ def workflow(config_path, experiment_name="workflow", uri_folder="mlruns"):
         experiment_name = config["experiment_name"]
     recorder = task_train(config.get("task"), experiment_name=experiment_name)
     recorder.save_objects(config=config)
+    if return_recorder:
+        return recorder
 
 
 # function to run workflow by config

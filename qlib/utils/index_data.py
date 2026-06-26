@@ -16,6 +16,7 @@ import bisect
 
 import numpy as np
 import pandas as pd
+import warnings
 
 
 def concat(data_list: Union[SingleData], axis=0) -> MultiData:
@@ -488,16 +489,18 @@ class IndexData(metaclass=index_data_ops_creator):
     def mean(self, axis=None, dtype=None, out=None):
         assert out is None and dtype is None, "`out` is just for compatible with numpy's aggregating function"
         # FIXME: weird logic and not general
-        if axis is None:
-            return np.nanmean(self.data)
-        elif axis == 0:
-            tmp_data = np.nanmean(self.data, axis=0)
-            return SingleData(tmp_data, self.columns)
-        elif axis == 1:
-            tmp_data = np.nanmean(self.data, axis=1)
-            return SingleData(tmp_data, self.index)
-        else:
-            raise ValueError(f"axis must be None, 0 or 1")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            if axis is None:
+                return np.nanmean(self.data)
+            elif axis == 0:
+                tmp_data = np.nanmean(self.data, axis=0)
+                return SingleData(tmp_data, self.columns)
+            elif axis == 1:
+                tmp_data = np.nanmean(self.data, axis=1)
+                return SingleData(tmp_data, self.index)
+            else:
+                raise ValueError(f"axis must be None, 0 or 1")
 
     def isna(self):
         return self.__class__(np.isnan(self.data), *self.indices)

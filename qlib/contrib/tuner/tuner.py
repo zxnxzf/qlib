@@ -5,6 +5,7 @@
 # flake8: noqa
 
 import os
+import sys
 import yaml
 import json
 import copy
@@ -24,7 +25,7 @@ from hyperopt import STATUS_OK, STATUS_FAIL
 
 class Tuner:
     def __init__(self, tuner_config, optim_config):
-        self.logger = get_module_logger("Tuner", sh_level=logging.INFO)
+        self.logger = get_module_logger("Tuner", level=logging.INFO)
 
         self.tuner_config = tuner_config
         self.optim_config = optim_config
@@ -37,6 +38,9 @@ class Tuner:
 
         self.best_params = None
         self.best_res = None
+        self.best_run_id = None
+        self.best_experiment_id = None
+        self.best_metric = None
 
         self.space = self.setup_space()
 
@@ -94,7 +98,8 @@ class QLibTuner(Tuner):
         self.logger.info("Searching params: {} ".format(params))
 
         # 2. Use subprocess to do the estimator program, this process will wait until subprocess finish
-        sub_fails = subprocess.call("estimator -c {}".format(estimator_path), shell=True)
+        cmd = [sys.executable, "-m", "qlib.contrib.model.launcher", "-c", estimator_path]
+        sub_fails = subprocess.call(cmd)
         if sub_fails:
             # If this subprocess failed, ignore this evaluation step
             self.logger.info("Estimator experiment failed when using this searching parameters")
@@ -108,9 +113,13 @@ class QLibTuner(Tuner):
             status = STATUS_OK
 
         # 4. Save the best score and params
-        if self.best_res is None or self.best_res > res:
-            self.best_res = res
-            self.best_params = params
+        if status == STATUS_OK:
+            if self.best_res is None or np.isnan(self.best_res) or self.best_res > res:
+                self.best_res = res
+                self.best_params = params
+                self.best_run_id = getattr(self, "_last_run_id", None)
+                self.best_experiment_id = getattr(self, "_last_experiment_id", None)
+                self.best_metric = getattr(self, "_last_metric_raw", None)
 
         # 5. Return the result as optim objective
         return {"loss": res, "status": status}
@@ -121,33 +130,36 @@ class QLibTuner(Tuner):
         with open(exp_info_path) as fp:
             exp_info = json.load(fp)
         estimator_ex_id = exp_info["id"]
+        self._last_run_id = estimator_ex_id
+        self._last_experiment_id = self._resolve_mlflow_experiment_id(estimator_ex_id)
 
-        # 2. Return model result if needed
+        # 2. Get raw metric value (the larger/smaller direction is handled by `optim_type` below)
         if self.optim_config.report_type == "model":
+            perf = exp_info.get("performance", {}) or {}
             if self.optim_config.report_factor == "model_score":
-                # if estimator experiment is multi-label training, user need to process the scores by himself
-                # Default method is return the average score
-                return np.mean(exp_info["performance"]["model_score"])
+                raw_val = perf.get("model_score", np.nan)
+                raw_val = np.mean(raw_val) if raw_val is not None else np.nan
             elif self.optim_config.report_factor == "model_pearsonr":
-                # pearsonr is a correlation coefficient, 1 is the best
-                return np.abs(exp_info["performance"]["model_pearsonr"] - 1)
-
-        # 3. Get backtest results
-        exp_result_dir = os.path.join(self.ex_dir, QLibTuner.EXP_RESULT_DIR.format(estimator_ex_id))
-        exp_result_path = os.path.join(exp_result_dir, QLibTuner.EXP_RESULT_NAME)
-        with open(exp_result_path, "rb") as fp:
-            analysis_df = pickle.load(fp)
-
-        # 4. Get the backtest factor which user want to optimize, if user want to maximize the factor, then reverse the result
-        res = analysis_df.loc[self.optim_config.report_type].loc[self.optim_config.report_factor]
-        # res = res.values[0] if self.optim_config.optim_type == 'min' else -res.values[0]
-        if self.optim_config == "min":
-            return res.values[0]
-        elif self.optim_config == "max":
-            return -res.values[0]
+                raw_val = perf.get("model_pearsonr", np.nan)
+            else:
+                raw_val = np.nan
         else:
-            # self.optim_config == 'correlation'
-            return np.abs(res.values[0] - 1)
+            exp_result_dir = os.path.join(self.ex_dir, QLibTuner.EXP_RESULT_DIR.format(estimator_ex_id))
+            exp_result_path = os.path.join(exp_result_dir, QLibTuner.EXP_RESULT_NAME)
+            with open(exp_result_path, "rb") as fp:
+                analysis_df = pickle.load(fp)
+            raw_val = analysis_df.loc[self.optim_config.report_type].loc[self.optim_config.report_factor].values[0]
+
+        self._last_metric_raw = raw_val
+
+        # 3. Convert raw metric to loss for Hyperopt (always minimize)
+        if self.optim_config.optim_type == "min":
+            return raw_val
+        elif self.optim_config.optim_type == "max":
+            return -raw_val
+        else:
+            # correlation: best value is 1 (e.g. Pearson correlation coefficient)
+            return np.abs(raw_val - 1)
 
     def setup_estimator_config(self, params):
         estimator_config = copy.deepcopy(self.tuner_config)
@@ -213,3 +225,39 @@ class QLibTuner(Tuner):
         TimeInspector.log_cost_time(
             "Finished saving local best tuner parameters to: {} .".format(local_best_params_path)
         )
+
+        if self.best_res is None:
+            self.logger.info("No valid trial results found.")
+            return
+
+        metric_name = f"{self.optim_config.report_type}.{self.optim_config.report_factor}"
+        best_metric = self.best_metric
+        is_nan = False
+        try:
+            is_nan = bool(np.isnan(best_metric))
+        except TypeError:
+            is_nan = False
+
+        if best_metric is None or is_nan:
+            self.logger.info(f"BEST RESULT: {metric_name} (loss)={self.best_res}, run_id={self.best_run_id}")
+        else:
+            self.logger.info(f"BEST RESULT: {metric_name}={best_metric}, run_id={self.best_run_id}")
+
+        if self.best_run_id and self.best_experiment_id is not None:
+            self.logger.info(
+                f"BEST RUN: experiment_id={self.best_experiment_id}, recorder_id={self.best_run_id}"
+            )
+
+    def _resolve_mlflow_experiment_id(self, run_id):
+        mlruns_dir = os.path.join(self.ex_dir, "mlruns")
+        if not os.path.isdir(mlruns_dir):
+            return None
+        for exp_id in os.listdir(mlruns_dir):
+            if exp_id.startswith("."):
+                continue
+            exp_dir = os.path.join(mlruns_dir, exp_id)
+            if not os.path.isdir(exp_dir):
+                continue
+            if os.path.isdir(os.path.join(exp_dir, run_id)):
+                return exp_id
+        return None

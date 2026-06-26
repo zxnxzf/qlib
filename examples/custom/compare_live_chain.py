@@ -11,6 +11,7 @@ Outputs under:
 
 from __future__ import annotations
 
+import argparse
 import copy
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -78,11 +79,33 @@ def _read_positions(path: Path) -> tuple[Dict[str, float], float]:
     return holdings, cash
 
 
+def _resolve_trade_dates(start: str | None, end: str | None) -> List[str]:
+    if start and end:
+        cal = D.calendar(start_time=start, end_time=end)
+        return [d.strftime("%Y-%m-%d") for d in cal]
+    if start or end:
+        raise ValueError("start/end must be provided together")
+    return list(TRADE_DATES)
+
+
 def main() -> None:
-    if not TRADE_DATES:
+    parser = argparse.ArgumentParser(description="Chain-compare live vs workflow over a date range.")
+    parser.add_argument("--start", type=str, default=None, help="Start trade date (YYYY-MM-DD)")
+    parser.add_argument("--end", type=str, default=None, help="End trade date (YYYY-MM-DD)")
+    args = parser.parse_args()
+
+    # Init qlib early so D.calendar works when using --start/--end.
+    base_cfg = mdt.DEFAULT_CONFIG.get("qlib_init", {})
+    qlib.init(
+        provider_uri=base_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data"),
+        region=base_cfg.get("region", "cn"),
+    )
+
+    trade_dates = _resolve_trade_dates(args.start, args.end)
+    if not trade_dates:
         raise ValueError("TRADE_DATES is empty")
     output_dir = Path(
-        f"/qlib/examples/custom/compare_live_chain_{TRADE_DATES[0]}_{TRADE_DATES[-1]}"
+        f"/qlib/examples/custom/compare_live_chain_{trade_dates[0]}_{trade_dates[-1]}"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "compare.log"
@@ -133,9 +156,9 @@ def main() -> None:
             log_print("run_id:", RUN_ID)
             log_print("artifacts:", artifacts)
             log_print("output_dir:", output_dir)
-            log_print("trade_dates:", TRADE_DATES)
+            log_print("trade_dates:", trade_dates)
 
-            for date_str in TRADE_DATES:
+            for date_str in trade_dates:
                 log_print("\n" + "=" * 60)
                 log_print("[DATE]", date_str)
 

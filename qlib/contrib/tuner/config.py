@@ -53,6 +53,8 @@ class PipelineExperimentConfig:
         # Save the tuner experiment for further view
         tuner_ex_config_path = os.path.join(self.tuner_ex_dir, "tuner_config.yaml")
         with open(tuner_ex_config_path, "w") as fp:
+            yaml = YAML()
+            yaml.default_flow_style = False
             yaml.dump(TUNER_CONFIG_MANAGER.config, fp)
 
 

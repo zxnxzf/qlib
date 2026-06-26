@@ -1,0 +1,12 @@
+workflow_config: benchmarks/LightGBM/workflow_config_lightgbm_Alpha158_2020_2025.yaml
+experiment:
+  dir: /qlib/.tuner_smoke
+  name: estimator_experiment_smoke
+model:
+  args:
+    num_boost_round: 50
+    early_stopping_rounds: 10
+strategy:
+  args:
+    topk: 50
+    n_drop: 2

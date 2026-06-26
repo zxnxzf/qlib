@@ -8,6 +8,12 @@
   - iQuant 实盘交易集成
   - 已修复的 Bug 和已实现的功能
   - 使用流程和技术架构说明
+- **[questions.md](./questions.md)**: 自用问答记录
+  - 使用 Qlib 过程中的常见疑问
+  - 对关键概念和指标的通俗解释
+- **[backtest_experiments.md](./backtest_experiments.md)**: 回测实验记录
+  - 记录尝试过的策略约束/开关
+  - 保留对照结果与是否采纳结论
 
 ## 文档更新原则
 

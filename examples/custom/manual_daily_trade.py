@@ -608,6 +608,32 @@ def _previous_trade_date(trade_date: str, calendar_dates: List[str]) -> str:
     return calendar_dates[idx - 1]
 
 
+def _previous_weekday(trade_date: str) -> str:
+    prev = pd.Timestamp(trade_date) - pd.Timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= pd.Timedelta(days=1)
+    return prev.strftime("%Y-%m-%d")
+
+
+def _resolve_calendar_trade_dates(
+    trade_date: str,
+    calendar_dates: List[str],
+    mode: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    calendar_dates = sorted(set(calendar_dates))
+    if trade_date in calendar_dates:
+        return trade_date, _previous_trade_date(trade_date, calendar_dates)
+    if not calendar_dates or str(mode).lower() != "live":
+        return None, None
+
+    trade_ts = pd.Timestamp(trade_date)
+    latest_calendar_ts = pd.Timestamp(calendar_dates[-1])
+    if trade_ts <= latest_calendar_ts or trade_ts.weekday() >= 5:
+        return None, None
+
+    return trade_date, _previous_weekday(trade_date)
+
+
 def _resolve_trade_date(value: str) -> str:
     if not value or str(value).lower() == "auto":
         return date.today().strftime("%Y-%m-%d")
@@ -1499,6 +1525,12 @@ def main(
         calendar_dates = _load_trade_calendar(calendar_path)
         calendar_source = "local"
     print(f"[INFO] calendar_source: {calendar_source}")
+    calendar_mode = str((cfg.get("workflow_alignment", {}) or {}).get("mode", "align")).lower()
+    if trade_date not in calendar_dates and calendar_mode == "live":
+        _resolved_trade_date, _required_pred_date = _resolve_calendar_trade_dates(trade_date, calendar_dates, calendar_mode)
+        if _resolved_trade_date is not None and _required_pred_date is not None:
+            print(f"[INFO] live trade_date beyond qlib calendar: trade_date={trade_date}, required_pred_date={_required_pred_date}")
+            calendar_dates = sorted(set(calendar_dates + [_required_pred_date, _resolved_trade_date]))
     if trade_date not in calendar_dates:
         print(f"[WARN] {trade_date} is not a trading day in calendar, exit.")
         return 0

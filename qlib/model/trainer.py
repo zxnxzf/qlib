@@ -32,9 +32,44 @@ from qlib.workflow import R
 from qlib.workflow.recorder import Recorder
 from qlib.workflow.task.manage import TaskManager, run_task
 
+try:
+    from mlflow.utils.validation import MAX_PARAM_VAL_LENGTH as _MLFLOW_MAX_PARAM_VAL_LENGTH
+except Exception:
+    _MLFLOW_MAX_PARAM_VAL_LENGTH = 1000
+
+_TRUNC_SUFFIX = "...<truncated>"
+_PARAM_VALUE_LIMIT = max(16, int(_MLFLOW_MAX_PARAM_VAL_LENGTH))
+
+
+def _sanitize_flattened_params(params: dict) -> tuple:
+    safe_params = {}
+    truncated = []
+    for key, value in params.items():
+        text = str(value)
+        if len(text) > _PARAM_VALUE_LIMIT:
+            keep_len = max(1, _PARAM_VALUE_LIMIT - len(_TRUNC_SUFFIX))
+            safe_params[key] = text[:keep_len] + _TRUNC_SUFFIX
+            truncated.append((key, len(text)))
+        else:
+            safe_params[key] = value
+    return safe_params, truncated
+
 
 def _log_task_info(task_config: dict):
-    R.log_params(**flatten_dict(task_config))
+    flat_task = flatten_dict(task_config)
+    safe_task, truncated = _sanitize_flattened_params(flat_task)
+    if truncated:
+        logger = get_module_logger("trainer")
+        preview = ", ".join(f"{k}({v})" for k, v in truncated[:5])
+        extra = "" if len(truncated) <= 5 else f", ... +{len(truncated) - 5}"
+        logger.warning(
+            "Truncated %d overly long mlflow params (limit=%d): %s%s",
+            len(truncated),
+            _PARAM_VALUE_LIMIT,
+            preview,
+            extra,
+        )
+    R.log_params(**safe_task)
     R.save_objects(**{"task": task_config})  # keep the original format and datatype
     R.set_tags(**{"hostname": socket.gethostname()})
 

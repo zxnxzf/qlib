@@ -2,11 +2,14 @@
 # Licensed under the MIT License.
 import os
 import copy
+import json
+import re
 import warnings
 import numpy as np
 import pandas as pd
 
-from typing import Dict, List, Text, Tuple, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Text, Tuple, Union
 from abc import ABC
 
 from qlib.data import D
@@ -72,6 +75,371 @@ class BaseSignalStrategy(BaseStrategy, ABC):
         return self.risk_degree
 
 
+class MonthlyPosRatioManager:
+    """
+    Minimal monthly position-ratio controller.
+    Rules:
+    - last two month excess both > 0 -> 1.0
+    - mixed signs -> 0.5
+    - last two month excess both <= 0 -> 0.1
+    """
+
+    ALLOWED_RATIO = {1.0, 0.5, 0.1}
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        benchmark: str = "SH000300",
+        state_path: Optional[str] = "monthly_pos_ratio_state.json",
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.benchmark = benchmark
+        self.state_path = Path(state_path).expanduser() if state_path else None
+
+        self.current_month: Optional[str] = None
+        self.current_ratio: float = 1.0
+        self.month_excess: Dict[str, float] = {}
+        self.month_order: List[str] = []
+        self.month_end_nav: Dict[str, float] = {}
+        self.month_end_bench_close: Dict[str, float] = {}
+        self.bench_close_cache: Dict[str, float] = {}
+
+        if self.enabled:
+            self._load_state()
+
+    @staticmethod
+    def _month_key(ts: pd.Timestamp) -> str:
+        return pd.Timestamp(ts).strftime("%Y-%m")
+
+    @staticmethod
+    def _month_gap(current_month: str, trade_month: str) -> int:
+        cur = pd.Period(current_month, freq="M")
+        tgt = pd.Period(trade_month, freq="M")
+        return int(tgt.ordinal - cur.ordinal)
+
+    @staticmethod
+    def _month_pair(ex_prev: float, ex_last: float) -> str:
+        return ("+" if ex_prev > 0 else "-") + ("+" if ex_last > 0 else "-")
+
+    def _load_state(self) -> None:
+        if self.state_path is None or not self.state_path.exists():
+            return
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        month = data.get("current_month")
+        ratio = float(data.get("pos_ratio", 1.0))
+        if month:
+            self.current_month = str(month)
+        self.current_ratio = ratio if ratio in self.ALLOWED_RATIO else 1.0
+
+        recent = data.get("recent_excess_months", []) or []
+        for item in recent:
+            try:
+                m = str(item["month"])
+                ex = float(item["excess_month"])
+            except Exception:
+                continue
+            self.month_excess[m] = ex
+            if m not in self.month_order:
+                self.month_order.append(m)
+
+        for m, v in (data.get("month_end_nav", {}) or {}).items():
+            try:
+                self.month_end_nav[str(m)] = float(v)
+            except Exception:
+                continue
+
+        for m, v in (data.get("month_end_bench_close", {}) or {}).items():
+            try:
+                self.month_end_bench_close[str(m)] = float(v)
+            except Exception:
+                continue
+
+    def _save_state(self) -> None:
+        if self.state_path is None:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        recent_months = self.month_order[-2:]
+        recent_excess = [{"month": m, "excess_month": self.month_excess[m]} for m in recent_months if m in self.month_excess]
+        dump = {
+            "current_month": self.current_month,
+            "pos_ratio": self.current_ratio,
+            "recent_excess_months": recent_excess,
+            "month_end_nav": {m: self.month_end_nav[m] for m in self.month_order[-3:] if m in self.month_end_nav},
+            "month_end_bench_close": {
+                m: self.month_end_bench_close[m] for m in self.month_order[-3:] if m in self.month_end_bench_close
+            },
+        }
+        self.state_path.write_text(json.dumps(dump, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _get_benchmark_close(self, date_value: pd.Timestamp) -> Optional[float]:
+        date_key = pd.Timestamp(date_value).strftime("%Y-%m-%d")
+        if date_key in self.bench_close_cache:
+            return self.bench_close_cache[date_key]
+        try:
+            df = D.features([self.benchmark], ["$close"], start_time=date_key, end_time=date_key)
+        except Exception:
+            return None
+        if df is None or df.empty:
+            return None
+        try:
+            close_val = float(df["$close"].iloc[0])
+        except Exception:
+            return None
+        self.bench_close_cache[date_key] = close_val
+        return close_val
+
+    def _append_month(self, month_key: str) -> None:
+        if month_key not in self.month_order:
+            self.month_order.append(month_key)
+
+    def _calc_completed_month_excess(self, month_key: str) -> Optional[float]:
+        if len(self.month_order) < 2:
+            return None
+        prev_month = self.month_order[-2]
+        if (
+            month_key not in self.month_end_nav
+            or prev_month not in self.month_end_nav
+            or month_key not in self.month_end_bench_close
+            or prev_month not in self.month_end_bench_close
+        ):
+            return None
+        nav_prev = self.month_end_nav[prev_month]
+        nav_cur = self.month_end_nav[month_key]
+        bench_prev = self.month_end_bench_close[prev_month]
+        bench_cur = self.month_end_bench_close[month_key]
+        if nav_prev <= 0 or bench_prev <= 0:
+            return None
+        strategy_month_return = nav_cur / nav_prev - 1.0
+        benchmark_month_return = bench_cur / bench_prev - 1.0
+        return strategy_month_return - benchmark_month_return
+
+    def _decide_ratio(self) -> Tuple[float, bool, Optional[float], Optional[float], str]:
+        valid_months = [m for m in self.month_order if m in self.month_excess]
+        if len(valid_months) < 2:
+            return 1.0, True, None, None, "cold"
+        prev_month = valid_months[-2]
+        last_month = valid_months[-1]
+        ex_prev = self.month_excess[prev_month]
+        ex_last = self.month_excess[last_month]
+        combo = self._month_pair(ex_prev, ex_last)
+        if ex_prev > 0 and ex_last > 0:
+            return 1.0, False, ex_prev, ex_last, combo
+        if ex_prev <= 0 and ex_last <= 0:
+            return 0.1, False, ex_prev, ex_last, combo
+        return 0.5, False, ex_prev, ex_last, combo
+
+    def on_trade_day(
+        self,
+        *,
+        trade_date: pd.Timestamp,
+        prev_trade_date: Optional[pd.Timestamp],
+        strategy_nav: float,
+    ) -> float:
+        if not self.enabled:
+            return 1.0
+
+        trade_month = self._month_key(trade_date)
+        if self.current_month is not None:
+            gap = self._month_gap(self.current_month, trade_month)
+            # Avoid cross-run state contamination: only allow same month or next month.
+            if gap < 0 or gap > 1:
+                self.current_month = trade_month
+                self.current_ratio = 1.0
+                self.month_excess = {}
+                self.month_order = []
+                self.month_end_nav = {}
+                self.month_end_bench_close = {}
+                self._save_state()
+                print(
+                    "[MonthlyPosRatio] "
+                    f"state reset due to month gap={gap}; "
+                    f"current_month={self.current_month}, pos_ratio=1.0, cold_start=True"
+                )
+                return self.current_ratio
+        if self.current_month is None:
+            self.current_month = trade_month
+            self.current_ratio = 1.0 if self.current_ratio not in self.ALLOWED_RATIO else self.current_ratio
+            self._save_state()
+            return self.current_ratio
+
+        if trade_month == self.current_month:
+            return self.current_ratio
+
+        completed_month = self.current_month
+        self._append_month(completed_month)
+        self.month_end_nav[completed_month] = float(strategy_nav)
+        if prev_trade_date is not None:
+            bench_close = self._get_benchmark_close(prev_trade_date)
+            if bench_close is not None:
+                self.month_end_bench_close[completed_month] = bench_close
+
+        excess = self._calc_completed_month_excess(completed_month)
+        if excess is not None:
+            self.month_excess[completed_month] = float(excess)
+
+        next_ratio, cold_start, ex_prev, ex_last, combo = self._decide_ratio()
+        self.current_month = trade_month
+        self.current_ratio = next_ratio
+        self._save_state()
+
+        print(
+            "[MonthlyPosRatio] "
+            f"prev_excess={ex_last if ex_last is not None else 'NA'} "
+            f"prev_prev_excess={ex_prev if ex_prev is not None else 'NA'} "
+            f"combo={combo} "
+            f"next_pos_ratio={next_ratio} "
+            f"cold_start={cold_start}"
+        )
+        return self.current_ratio
+
+
+class STStockFilterManager:
+    """Filter out ST/*ST stocks from buy candidates with a runtime switch."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        st_flag_field: str = "$is_st",
+        st_name_field: str = "$name",
+        st_name_pattern: str = r"^\*?ST",
+        strict: bool = False,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.st_flag_field = st_flag_field
+        self.st_name_field = st_name_field
+        self.strict = bool(strict)
+        self.st_name_re = re.compile(st_name_pattern, flags=re.IGNORECASE)
+
+        self.st_code_cache: Dict[str, Set[str]] = {}
+        self.source_cache: Dict[str, str] = {}
+        self._warned_unavailable = False
+        self._runtime_unavailable = False
+
+    @staticmethod
+    def _date_key(date_value: pd.Timestamp) -> str:
+        return pd.Timestamp(date_value).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _extract_codes(index: pd.Index, code_set: Set[str]) -> pd.Index:
+        if not isinstance(index, pd.MultiIndex):
+            return pd.Index(index).astype(str)
+
+        if "instrument" in index.names:
+            return pd.Index(index.get_level_values("instrument")).astype(str)
+
+        best_vals = None
+        best_hit = -1
+        for lvl in range(index.nlevels):
+            vals = pd.Index(index.get_level_values(lvl)).astype(str)
+            hit = len(set(vals.tolist()) & code_set)
+            if hit > best_hit:
+                best_hit = hit
+                best_vals = vals
+        return best_vals if best_vals is not None else pd.Index([])
+
+    @staticmethod
+    def _is_st_flag(v) -> bool:
+        if pd.isna(v):
+            return False
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        try:
+            return float(v) > 0
+        except Exception:
+            return str(v).strip().lower() in {"true", "t", "yes", "y", "1"}
+
+    @staticmethod
+    def _is_name_present(v) -> bool:
+        return isinstance(v, str) and bool(v.strip())
+
+    def _fetch_field_series(self, codes: List[str], field: str, date_key: str) -> Optional[pd.Series]:
+        try:
+            df = D.features(codes, [field], start_time=date_key, end_time=date_key)
+        except Exception:
+            return None
+        if df is None or df.empty or df.shape[1] == 0:
+            return None
+        return df.iloc[:, 0]
+
+    def _load_by_st_flag(self, codes: List[str], date_key: str, code_set: Set[str]) -> Tuple[Optional[Set[str]], int]:
+        series = self._fetch_field_series(codes, self.st_flag_field, date_key)
+        if series is None:
+            return None, 0
+        observed = int(series.notna().sum())
+        if observed <= 0:
+            return None, 0
+        code_idx = self._extract_codes(series.index, code_set)
+        st_codes = {c for c, v in zip(code_idx, series.values) if self._is_st_flag(v)}
+        return st_codes, observed
+
+    def _load_by_name(self, codes: List[str], date_key: str, code_set: Set[str]) -> Tuple[Optional[Set[str]], int]:
+        series = self._fetch_field_series(codes, self.st_name_field, date_key)
+        if series is None:
+            return None, 0
+        observed = int(series.map(self._is_name_present).sum())
+        if observed <= 0:
+            return None, 0
+        code_idx = self._extract_codes(series.index, code_set)
+        st_codes = {c for c, v in zip(code_idx, series.values) if self._is_name_present(v) and self.st_name_re.search(v)}
+        return st_codes, observed
+
+    def _get_st_codes(self, trade_date: pd.Timestamp, codes: List[str]) -> Set[str]:
+        if not self.enabled or not codes or self._runtime_unavailable:
+            return set()
+
+        date_key = self._date_key(trade_date)
+        if date_key in self.st_code_cache:
+            return self.st_code_cache[date_key]
+
+        code_set = set(codes)
+        st_codes, observed = self._load_by_st_flag(codes, date_key, code_set)
+        if st_codes is not None and observed > 0:
+            self.st_code_cache[date_key] = st_codes
+            self.source_cache[date_key] = self.st_flag_field
+            return st_codes
+
+        st_codes, observed = self._load_by_name(codes, date_key, code_set)
+        if st_codes is not None and observed > 0:
+            self.st_code_cache[date_key] = st_codes
+            self.source_cache[date_key] = self.st_name_field
+            return st_codes
+
+        msg = (
+            "[STFilter] enabled but no usable ST data source was found "
+            f"on {date_key} (fields: {self.st_flag_field}, {self.st_name_field})."
+        )
+        if self.strict:
+            raise ValueError(msg)
+        if not self._warned_unavailable:
+            print(msg + " fallback to no filtering.")
+            self._warned_unavailable = True
+        self._runtime_unavailable = True
+        self.st_code_cache[date_key] = set()
+        self.source_cache[date_key] = "none"
+        return set()
+
+    def filter_buy_score(self, score: pd.Series, trade_date: pd.Timestamp) -> pd.Series:
+        if not self.enabled or score is None or score.empty:
+            return score
+        codes = [str(c) for c in score.index.tolist()]
+        st_codes = self._get_st_codes(trade_date, codes)
+        if not st_codes:
+            return score
+        filtered_score = score[~score.index.isin(st_codes)]
+        removed = len(score) - len(filtered_score)
+        if removed > 0:
+            date_key = self._date_key(trade_date)
+            source = self.source_cache.get(date_key, "unknown")
+            print(f"[STFilter] trade_date={date_key} source={source} removed_st={removed}")
+        return filtered_score
+
+
 class TopkDropoutStrategy(BaseSignalStrategy):
     # TODO:
     # 1. Supporting leverage the get_range_limit result from the decision
@@ -88,6 +456,14 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         hold_thresh=1,
         only_tradable=False,
         forbid_all_trade_at_limit=True,
+        enable_monthly_pos_ratio=False,
+        monthly_pos_ratio_benchmark="SH000300",
+        monthly_pos_ratio_state_path="monthly_pos_ratio_state.json",
+        enable_st_stock_filter=False,
+        st_filter_field="$is_st",
+        st_name_field="$name",
+        st_name_pattern=r"^\*?ST",
+        st_filter_strict=False,
         **kwargs,
     ):
         """
@@ -134,6 +510,18 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         self.hold_thresh = hold_thresh
         self.only_tradable = only_tradable
         self.forbid_all_trade_at_limit = forbid_all_trade_at_limit
+        self.monthly_pos_ratio_manager = MonthlyPosRatioManager(
+            enabled=enable_monthly_pos_ratio,
+            benchmark=monthly_pos_ratio_benchmark,
+            state_path=monthly_pos_ratio_state_path,
+        )
+        self.st_stock_filter_manager = STStockFilterManager(
+            enabled=enable_st_stock_filter,
+            st_flag_field=st_filter_field,
+            st_name_field=st_name_field,
+            st_name_pattern=st_name_pattern,
+            strict=st_filter_strict,
+        )
 
     def generate_trade_decision(self, execute_result=None):
         # 当前交易步及对应的交易/预测窗口
@@ -149,6 +537,17 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                 f"pred_window=[{pred_start_time}, {pred_end_time}]"
             )
         pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)  # 前一天的分数
+        prev_trade_date = pd.Timestamp(pred_start_time) if trade_step > 0 else None
+        try:
+            strategy_nav = float(self.trade_position.calculate_value())
+        except Exception:
+            strategy_nav = float(self.trade_position.get_cash())
+        pos_ratio = self.monthly_pos_ratio_manager.on_trade_day(
+            trade_date=pd.Timestamp(trade_start_time),
+            prev_trade_date=prev_trade_date,
+            strategy_nav=strategy_nav,
+        )
+        effective_risk_degree = self.risk_degree * pos_ratio
 
         # NOTE: current version can't handle multi-signal DataFrame,仅取第一列
         if isinstance(pred_score, pd.DataFrame):
@@ -156,6 +555,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         # 无信号直接空决策返回
         if pred_score is None:
             return TradeDecisionWO([], self)
+        buy_score = self.st_stock_filter_manager.filter_buy_score(pred_score, pd.Timestamp(trade_start_time))
         if self.only_tradable:
             # 仅考虑可交易标的时，筛选助手函数基于交易所可交易状态过滤
             def get_first_n(li, n, reverse=False):
@@ -207,11 +607,11 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         # 生成今日最多想买的候选 today
         if self.method_buy == "top":
             today = get_first_n(
-                pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index, #剔除当前持仓的股票中选择
+                buy_score[~buy_score.index.isin(last)].sort_values(ascending=False).index, #剔除当前持仓的股票中选择
                 self.n_drop + self.topk - len(last),
             )
         elif self.method_buy == "random":
-            topk_candi = get_first_n(pred_score.sort_values(ascending=False).index, self.topk)
+            topk_candi = get_first_n(buy_score.sort_values(ascending=False).index, self.topk)
             candi = list(filter(lambda x: x not in last, topk_candi))
             n = self.n_drop + self.topk - len(last)
             try:
@@ -270,7 +670,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                     )
                     cash += trade_val - trade_cost
         # 重新分配买入金额（已含最新现金）
-        value = cash * self.risk_degree / len(buy) if len(buy) > 0 else 0
+        value = cash * effective_risk_degree / len(buy) if len(buy) > 0 else 0
 
         # open_cost should be considered in the real trading environment, while the backtest in evaluate.py does not
         # consider it as the aim of demo is to accomplish same strategy as evaluate.py, so comment out this line
@@ -527,4 +927,3 @@ class EnhancedIndexingStrategy(WeightStrategyBase):
             self.logger.info("total holding weight: {:.6f}".format(weight.sum()))
 
         return target_weight_position
-

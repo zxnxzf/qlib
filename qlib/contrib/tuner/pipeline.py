@@ -8,6 +8,7 @@ import os
 import json
 import logging
 import importlib
+import numpy as np
 from abc import abstractmethod
 
 from ...log import get_module_logger, TimeInspector
@@ -18,7 +19,7 @@ class Pipeline:
     GLOBAL_BEST_PARAMS_NAME = "global_best_params.json"
 
     def __init__(self, tuner_config_manager):
-        self.logger = get_module_logger("Pipeline", sh_level=logging.INFO)
+        self.logger = get_module_logger("Pipeline", level=logging.INFO)
 
         self.tuner_config_manager = tuner_config_manager
 
@@ -33,6 +34,9 @@ class Pipeline:
         self.global_best_res = None
         self.global_best_params = None
         self.best_tuner_index = None
+        self.global_best_run_id = None
+        self.global_best_experiment_id = None
+        self.global_best_metric = None
 
     def run(self):
         TimeInspector.set_time_mark()
@@ -43,6 +47,9 @@ class Pipeline:
                 self.global_best_res = tuner.best_res
                 self.global_best_params = tuner.best_params
                 self.best_tuner_index = tuner_index
+                self.global_best_run_id = getattr(tuner, "best_run_id", None)
+                self.global_best_experiment_id = getattr(tuner, "best_experiment_id", None)
+                self.global_best_metric = getattr(tuner, "best_metric", None)
         TimeInspector.log_cost_time("Finished tuner pipeline.")
 
         self.save_tuner_exp_info()
@@ -83,3 +90,25 @@ class Pipeline:
         self.logger.info("Best Tuner id: {}.".format(self.best_tuner_index))
         self.logger.info("Global best parameters: {}.".format(self.global_best_params))
         self.logger.info("You can check the best parameters at {}.".format(save_path))
+
+        if self.global_best_res is None:
+            return
+        metric_name = f"{self.optim_config.report_type}.{self.optim_config.report_factor}"
+        best_metric = self.global_best_metric
+        is_nan = False
+        try:
+            is_nan = bool(np.isnan(best_metric))
+        except TypeError:
+            is_nan = False
+
+        if best_metric is None or is_nan:
+            self.logger.info(
+                f"GLOBAL BEST RESULT: {metric_name} (loss)={self.global_best_res}, run_id={self.global_best_run_id}"
+            )
+        else:
+            self.logger.info(f"GLOBAL BEST RESULT: {metric_name}={best_metric}, run_id={self.global_best_run_id}")
+
+        if self.global_best_run_id and self.global_best_experiment_id is not None:
+            self.logger.info(
+                f"GLOBAL BEST RUN: experiment_id={self.global_best_experiment_id}, recorder_id={self.global_best_run_id}"
+            )
