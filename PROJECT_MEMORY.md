@@ -24,6 +24,7 @@
 - “我现在不是很想用iquant了想看看有没有什么其他的方式”（2026-07-27）
 - “我去问了下，国金的就没法开miniqmt，但是可以开通qmt和ptrade。我当前的qlib能和他们去配合吗？”（2026-07-28，国金实际询问结果：MiniQMT 不可开，标准 QMT 和 PTrade 可开）
 - “可以先收尾一下，那还是先优先这个qmt吧”（2026-07-28：确认先完成数据硬校验收尾；执行通道优先走国金标准 QMT，沿用现有文件握手方案迁移）
+- 代码来历（2026-07-28 用户确认）：iQuant 半自动线（live_daily_predict.py + iquant_qlib.py）和手动线（manual_daily_trade.py）都是用户本人早期开发。iQuant 线最先做，从未真正投入使用；隔了很久后另起手动线并实际使用至今。两线选股配置各自独立演化，迁移 QMT 前需核对一致性。
 
 ## 现在做到哪
 仓库位于 `/Users/bytedance/code/qlib/qlib`，当前 HEAD 为 `378d9ff1`。局部 Python 3.9.6 环境位于 `/Users/bytedance/code/qlib/.venv`。中国市场日频示例数据位于 `/Users/bytedance/code/qlib/.data/cn_data`，覆盖 1999-11-10 至 2020-09-25，共 3,875 个标的。已使用 `/Users/bytedance/code/qlib/run-configs/lightgbm_alpha158_local.yaml` 完整执行 Alpha158 + CSI300 + LightGBM `qrun`，并完成 2017-01-03 至 2020-08-01 的 871 个交易日回测。MLflow 实验 ID `583100969444960600`、Recorder ID `32fb882581004afa9ac2e9c5e95123db`，状态 FINISHED；IC 0.04680、Rank IC 0.04905、含成本超额年化收益 0.08065、信息比率 0.91449、最大回撤 -0.08608。手动交易脚本的 Qlib 初始化、预测配置、dataclass 默认值和运行兜底路径已统一改为项目局部数据目录。产物位于 `/Users/bytedance/code/qlib/runs/mlruns`。
@@ -68,11 +69,15 @@ Tushare 当前提供 A 股实时分钟接口 `rt_min`（1/5/15/30/60 分钟）�
 
 2026-07-27 用户明确表态不想继续用国信 iQuant 作为执行通道；2026-07-28 向国金实际确认 MiniQMT 不可开、标准 QMT 与 PTrade 可开，用户拍板执行通道优先走国金标准 QMT。关键认知：国信 iQuant 与国金 QMT 同为迅投系，内置 Python API 同族（handlebar/ContextInfo/passorder/get_trade_detail_data/is_last_bar），现有 `iquant_qlib.py` 文件握手方案可近乎直接迁移（改账号 ID/类型、路径、编码等适配项），历史踩坑（is_last_bar、历史回放静默吞单）经验直接沿用；但 QMT 仍是本地客户端模式，不解决无人值守。PTrade 留作终局无人值守路线，卡点是外部订单如何进入券商服务器（策略外网访问 or 研究环境自动上传，待向国金技术确认）。当前会话所在 ccs 路由无 WebSearch 服务端工具，通道对比基于 7-24/25 的调研结论。
 
+2026-07-28 链式对比实证（用户担心"manual 生成的单是否和 qrun 回测一致"）：用适配版对比脚本 `test_claude_code/compare_live_chain_local.py`（改自用户的 compare_live_chain.py，不入库）对本地 qrun LightGBM 实验（recorder 32fb88...，topk=50/n_drop=5/1亿资金）从回测首个建仓日 2017-01-04 起链跑三天，manual 以 live 模式逐日重预测+模拟成交。结果：**三天选股 100% 重合**（42/42、43/43、43/43）；份额差异为取整级——单股最大相对差 1.83%（约 1 手），现金差占总资产 0.066%→0.039%→0.026% 逐日收敛，无发散。差异根源：manual 在 _orders_to_frame 将策略内已按手取整的复权数量乘 factor 还原原始股数时出现浮点 ε（如 5399.9997），再向下整手取整导致系统性少一手（回测的原始股数本身非整手、实盘不可下单，manual 的整手化是实盘必需操作，只是浮点 ε 造成偏保守一手，可用 round 后再整手修复，影响极小）；对比脚本 int() 截断另贡献 ±1 股显示误差。结论：manual 是 qrun workflow 的忠实实盘孪生，更换模型/配置后应重跑该链式对比。
+
+2026-07-28 手动实盘时序核查结论（用户要求验证）：manual_daily_trade.py 的 T-1 时序与回测严格同构——回测 TopkDropoutStrategy 取信号 shift=1（signal_strategy.py:143，T 日决策用 T-1 分数、按 T 日价成交）；manual 侧 required_pred_date=T-1、handler end_time 截到 pred_date 无泄漏、_generate_orders_topk_dropout 为 generate_trade_decision 的忠实移植。四个实盘固有差异（人肉承担，QMT 自动化的目标）：①参考价为 T-1 收盘（trade_base_date 实盘必回落到 pred_date），执行越近收盘越贴近回测假设→QMT 版执行窗口应放尾盘；②买入股数按 T-1 收盘算，靠 risk_degree=0.95 缓冲高开；③涨跌停/停牌按 T-1 状态判定，T 日新涨停需执行时处理；④positions_next 假定全额按参考价成交，实际偏差靠人工改持仓文件。信号时序问题（原下一步第4项）就此解决：体系天然为"盘后信号、次日执行"，最优执行点是尾盘。QMT 对接方案已给用户：manual 线为信号源，QMT 端脚本（改自 iquant_qlib.py）三阶段握手（导出真实持仓→审批→尾盘执行+实时校验+回执对账），待确认 QMT 装机位置/文件同步方式与审批形态。
+
 ## 下一步
-1. 用户侧：办理国金开户及 QMT、PTrade 权限；顺带向国金技术确认两个问题——①PTrade 策略环境能否访问外部 HTTP/白名单；②研究环境文件上传有无自动化方式（决定终局无人值守形态）。
+1. 用户侧：办理国金开户及 QMT、PTrade 权限；顺带向国金技术确认两个问题——①PTrade 策略环境能否访问外部 HTTP/白名单；②研究环境文件上传有无自动化方式（决定终局无人值守形态）。另需确认：QMT 客户端装哪台机器、与 qlib(mac) 的文件共享方式、订单审批形态（文件/命令确认 vs 消息推送确认）。
 2. QMT 迁移：拿到国金 QMT 后，把 `examples/iquant_qlib.py` 适配为国金 QMT 版（账号 ID/类型、路径、编码、API 差异核对），先 DRY_RUN 验证三阶段握手，再小额实单。
 3. 迁移前可先做影子模式：每日跑全链路生成订单但不下单，记录"本该下的单"与实际行情对比，零风险验证时序与选股。
-4. 确认日频信号是在当日收盘后生成、次日执行，还是要求当日尾盘生成并执行。
+4. ~~确认日频信号时序~~（已解决：盘后 T-1 信号、次日执行，QMT 执行窗口放尾盘以贴近回测收盘价假设）。
 5. 补建独立订单管理层（订单状态机、幂等、成交回写、每日对账，券商数据为唯一事实），QMT 只做可替换执行适配器；随后人工审批模式跑 2-4 周攒滑点/成交率数据。
 6. 首次自动下单前完成程序化交易报备（2025-07 细则）；PTrade 模拟账号验证留作无人值守终局路线。
 
