@@ -37,8 +37,21 @@ except Exception:
 # Ensure local repo import precedence.
 _EXAMPLES_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _EXAMPLES_DIR.parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+LOCAL_PROVIDER_URI = str(_REPO_ROOT.parent / ".data" / "cn_data")
+for _extra_path in (str(_REPO_ROOT), str(_REPO_ROOT / "examples")):
+    if _extra_path not in sys.path:
+        sys.path.insert(0, _extra_path)
+
+from data_update_guard import (  # noqa: E402  # shared hard-validation helpers
+    ArchiveRejectedError,
+    best_manifest,
+    check_manifest_covers,
+    fetch_manifests,
+    load_calendar_dates,
+    manifest_for_url,
+    previous_trade_date_before,
+    verify_archive_against_manifest,
+)
 
 import qlib
 from qlib.constant import REG_CN
@@ -54,7 +67,7 @@ from qlib.backtest.position import Position
 
 DEFAULT_CONFIG = {
     "qlib_init": {
-        "provider_uri": "~/.qlib/qlib_data/cn_data",
+        "provider_uri": LOCAL_PROVIDER_URI,
         "region": "cn",
         "kernels": 64,
         "joblib_backend": "multiprocessing",
@@ -119,7 +132,7 @@ DEFAULT_CONFIG = {
         "weight_method": "equal",
         "pred_date_search_days": 10,
         "empty_pred_action": "exit",
-        "provider_uri": "~/.qlib/qlib_data/cn_data",
+        "provider_uri": LOCAL_PROVIDER_URI,
         "region": "cn",
         "instruments": "csi300",
         "dataset_class": "DatasetH",
@@ -177,7 +190,7 @@ class PredictionConfig:
     experiment_id: str
     recorder_id: str
     prediction_date: str
-    provider_uri: str = "~/.qlib/qlib_data/cn_data"
+    provider_uri: str = LOCAL_PROVIDER_URI
     region: str = REG_CN
     top_k: int = 20
     min_score_threshold: float = 0.0
@@ -249,6 +262,7 @@ class TradingConfig:
 @dataclass
 class DataUpdateConfig:
     enable_auto_update: bool = True
+    allow_stale_data: bool = False  # debug only: never enable for real trading
     data_source_url: str = ""
     data_source_urls: Optional[List[str]] = None
     download_timeout: int = 600
@@ -264,7 +278,7 @@ class DataUpdateConfig:
 
 def _provider_path_from_uri(uri: str) -> Path:
     if not uri:
-        uri = "~/.qlib/qlib_data/cn_data"
+        uri = LOCAL_PROVIDER_URI
     path = Path(uri)
     if uri.startswith("~"):
         path = path.expanduser()
@@ -433,7 +447,13 @@ def _is_data_outdated(data_path: Path, required_date: str, instruments) -> Tuple
     return False, latest_local
 
 
-def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
+def _download_and_update_data(
+    cfg: DataUpdateConfig,
+    target_path: Path,
+    manifests: Optional[Dict[str, dict]] = None,
+    required_date: Optional[str] = None,
+) -> bool:
+    manifests = manifests or {}
     temp_dir = cfg.get_temp_dir()
     download_path = temp_dir / "qlib_bin.tar.gz"
     extract_dir = temp_dir / "extracted"
@@ -476,6 +496,12 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
                     urlretrieve(url, download_path)
                 size_mb = download_path.stat().st_size / (1024 * 1024)
                 print(f"[OK] download completed: {size_mb:.1f} MB")
+                url_manifest = manifest_for_url(manifests, url)
+                if url_manifest is not None:
+                    ok, detail = verify_archive_against_manifest(download_path, url_manifest)
+                    if not ok:
+                        raise ArchiveRejectedError(f"archive integrity check failed: {detail}")
+                    print(f"[DATA] {detail}")
                 if extract_dir.exists():
                     shutil.rmtree(extract_dir)
                 extract_dir.mkdir(parents=True, exist_ok=True)
@@ -489,11 +515,26 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
                     if not (qlib_bin_dir / dirname).exists():
                         print(f"[ERROR] missing required dir: {dirname}")
                         return False
+                if required_date:
+                    extracted_latest = _latest_calendar_date(qlib_bin_dir)
+                    if not extracted_latest or extracted_latest < required_date:
+                        raise ArchiveRejectedError(
+                            f"package latest trade date {extracted_latest} does not cover required {required_date}"
+                        )
+                    print(f"[DATA] package calendar check passed (latest {extracted_latest})")
                 if target_path.exists():
                     shutil.rmtree(target_path)
                 shutil.copytree(qlib_bin_dir, target_path)
                 print("[OK] data update completed")
                 return True
+            except ArchiveRejectedError as err:
+                # Retrying the same URL would fetch the same rejected package; switch source.
+                print(f"[ERROR] {err}")
+                if download_path.exists():
+                    download_path.unlink()
+                if extract_dir.exists():
+                    shutil.rmtree(extract_dir)
+                break
             except Exception as err:
                 print(f"[ERROR] data update failed: {err}")
                 if download_path.exists():
@@ -550,24 +591,62 @@ def _download_with_curl(url: str, output_path: Path, timeout: int, resume: bool 
 def _ensure_data_ready(
     provider_uri: str,
     instruments,
+    trade_date: str,
     required_date: str,
     cfg: DataUpdateConfig,
-) -> None:
+) -> str:
+    """Ensure local data covers the trade date's previous trading day.
+
+    Returns the (possibly recomputed) required prediction date. Raises RuntimeError
+    when data cannot be brought up to date, so prediction/ordering never runs on
+    stale data.
+    """
     data_path = _provider_path_from_uri(provider_uri)
     missing = _missing_required_data(data_path, instruments)
     outdated, latest = _is_data_outdated(data_path, required_date, instruments)
-    if not cfg.enable_auto_update:
-        if missing:
-            print(f"[WARN] missing data: {missing}")
-        if outdated:
-            print(f"[WARN] local latest date {latest} is older than {required_date}")
-        return
     if not missing and not outdated:
-        print(f"[DATA] local data is up to date (latest {latest})")
-        return
-    print("[DATA] auto update triggered...")
-    if not _download_and_update_data(cfg, data_path):
-        raise RuntimeError("data update failed")
+        print(f"[DATA] local data is up to date (latest {latest}, required {required_date})")
+        return required_date
+
+    def _fail(message: str) -> None:
+        if cfg.allow_stale_data:
+            print(f"[WARN] {message}")
+            print("[WARN] allow_stale_data=True, proceeding with stale data -- DEBUG ONLY, never for real trading!")
+            return
+        raise RuntimeError(message + "; prediction/ordering blocked")
+
+    if not cfg.enable_auto_update:
+        _fail(f"local data missing or stale (latest {latest}, required {required_date}) and auto update disabled")
+        return required_date
+    print(f"[DATA] local data missing or stale (latest {latest}, required {required_date}), auto update triggered...")
+
+    urls = [u for u in (cfg.data_source_urls or [cfg.data_source_url]) if u]
+    manifests = fetch_manifests(urls)
+    top = best_manifest(manifests)
+    if top is None:
+        print("[WARN] no upstream manifest available, skip pre-download check (post-download calendar check still enforced)")
+    else:
+        ok, detail = check_manifest_covers(top, trade_date, required_date)
+        if not ok:
+            _fail(f"upstream data not ready, download skipped: {detail}")
+            return required_date
+        print(f"[DATA] manifest check passed: {detail}")
+
+    if not _download_and_update_data(cfg, data_path, manifests=manifests, required_date=required_date):
+        _fail("data update failed (download error or package does not cover required trade date)")
+        return required_date
+
+    # Re-derive the required date from the fresh calendar and re-check hard.
+    new_calendar = load_calendar_dates(data_path)
+    new_required = previous_trade_date_before(trade_date, new_calendar) if new_calendar else None
+    required_date = new_required or required_date
+    missing = _missing_required_data(data_path, instruments)
+    outdated, latest = _is_data_outdated(data_path, required_date, instruments)
+    if missing or outdated:
+        _fail(f"data still not ready after update (latest {latest}, required {required_date}, missing {missing})")
+        return required_date
+    print(f"[DATA] update completed and verified (latest {latest}, required {required_date})")
+    return required_date
 
 
 def _load_trade_calendar(path: Path) -> List[str]:
@@ -1488,7 +1567,7 @@ def main(
 
     trade_date_value = trade_date_override or cfg.get("runtime", {}).get("trade_date", "auto")
     trade_date = _resolve_trade_date(trade_date_value)
-    qlib_calendar_provider = cfg.get("qlib_init", {}).get("provider_uri", "~/.qlib/qlib_data/cn_data")
+    qlib_calendar_provider = cfg.get("qlib_init", {}).get("provider_uri", LOCAL_PROVIDER_URI)
     calendar_dates = _load_qlib_calendar_dates(qlib_calendar_provider, "day")
     calendar_source = "qlib"
     if not calendar_dates:
@@ -1582,7 +1661,7 @@ def main(
         if pred_raw.get("min_score_threshold") is not None:
             pred_raw["min_score_threshold"] = None
             print("[INFO] workflow_alignment: disable min_score_threshold to match workflow signal ranking")
-    provider_uri = pred_raw.get("provider_uri", "~/.qlib/qlib_data/cn_data")
+    provider_uri = pred_raw.get("provider_uri", LOCAL_PROVIDER_URI)
     instruments = pred_raw.get("instruments", "csi300")
 
     # Prebuild once to avoid "missing instruments file" on fresh environments.
@@ -1591,10 +1670,13 @@ def main(
 
     data_update_cfg = DataUpdateConfig(**cfg.get("data_update", {}))
     try:
-        _ensure_data_ready(provider_uri, instruments, required_pred_date, data_update_cfg)
+        new_required = _ensure_data_ready(provider_uri, instruments, trade_date, required_pred_date, data_update_cfg)
     except RuntimeError as err:
         print(f"[ERROR] {err}")
         return 1
+    if new_required and new_required != required_pred_date:
+        print(f"[INFO] required_pred_date recalculated after data update: {required_pred_date} -> {new_required}")
+        required_pred_date = new_required
 
     if isinstance(instruments, str):
         if instruments == "all_no_bj":
@@ -1618,7 +1700,7 @@ def main(
         f"local_cache_path={qlib_cfg.get('local_cache_path')}"
     )
     qlib.init(
-        provider_uri=qlib_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data"),
+        provider_uri=qlib_cfg.get("provider_uri", LOCAL_PROVIDER_URI),
         region=qlib_cfg.get("region", "cn"),
         kernels=qlib_cfg.get("kernels", 1),
         joblib_backend=qlib_cfg.get("joblib_backend", "threading"),

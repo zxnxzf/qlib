@@ -40,6 +40,16 @@ from daily_predict import (  # noqa: E402  # 延迟导入
     TradingConfig,
     OutputConfig,
 )
+from data_update_guard import (  # noqa: E402  # 数据包硬校验工具（与 manual_daily_trade 共用）
+    ArchiveRejectedError,
+    best_manifest,
+    check_manifest_covers,
+    fetch_manifests,
+    load_calendar_dates,
+    manifest_for_url,
+    previous_trade_date_before,
+    verify_archive_against_manifest,
+)
 
 
 # ================= 用户可直接在此处配置缺省参数 =================
@@ -258,6 +268,7 @@ class DataUpdateConfig:
     """描述数据自动更新所需的各项参数。"""
 
     enable_auto_update: bool = True  # 是否启用自动更新逻辑
+    allow_stale_data: bool = False  # 数据未覆盖所需前一交易日时是否放行（仅限调试，实盘必须 False）
     data_source_url: str = "https://ghfast.top/https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"  # 默认数据源
     data_source_urls: Optional[List[str]] = None  # 备用下载源（按顺序尝试）
     download_timeout: int = 600  # 下载超时时间
@@ -302,20 +313,34 @@ def _latest_calendar_date(data_path: Path) -> Optional[str]:
     return dates[-1] if dates else None
 
 
-def _is_data_outdated(data_path: Path, target_date: str, instruments) -> tuple:
+def _required_pred_date(data_path: Path, target_date: str) -> str:
+    """按交易日历（day.txt + day_future.txt）取 target 前一交易日；无日历时退回 BDay 近似。"""
+    calendar_dates = load_calendar_dates(data_path)
+    if calendar_dates:
+        required = previous_trade_date_before(target_date, calendar_dates)
+        if required:
+            return required
+    # 本地日历不可用时的近似兜底：更新完成后会用真实日历重新推算并复查
+    return (pd.Timestamp(target_date) - BDay(1)).normalize().strftime("%Y-%m-%d")
+
+
+def _is_data_outdated(data_path: Path, required_date: str, instruments) -> tuple:
     latest_local = _latest_calendar_date(data_path)
     if latest_local is None:
         return True, None
-    target_ts = pd.Timestamp(target_date)
-    required_ts = (target_ts - BDay(1)).normalize()
-    if latest_local < required_ts.strftime("%Y-%m-%d"):
+    if required_date and latest_local < required_date:
         return True, latest_local
     if _missing_required_data(data_path, instruments):
         return True, latest_local
     return False, latest_local
 
 
-def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
+def _download_and_update_data(
+    cfg: DataUpdateConfig,
+    target_path: Path,
+    manifests: Optional[Dict[str, dict]] = None,
+    required_date: Optional[str] = None,
+) -> bool:
     temp_dir = cfg.get_temp_dir()
     download_path = temp_dir / "qlib_bin.tar.gz"
     extract_dir = temp_dir / "extracted"
@@ -323,6 +348,7 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
     retry_interval = max(int(cfg.retry_interval), 0)
     urls = cfg.data_source_urls or [cfg.data_source_url]
     urls = [u for u in urls if u]
+    manifests = manifests or {}
 
     for url in urls:
         for attempt in range(1, retry_count + 1):
@@ -334,6 +360,12 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
                 print(f"   来源: {url}")
                 urlretrieve(url, download_path)
                 print(f"[成功] 下载完成，文件大小 {download_path.stat().st_size / (1024 * 1024):.1f} MB")
+                url_manifest = manifest_for_url(manifests, url)
+                if url_manifest is not None:
+                    ok, detail = verify_archive_against_manifest(download_path, url_manifest)
+                    if not ok:
+                        raise ArchiveRejectedError(f"数据包完整性校验失败: {detail}")
+                    print(f"[数据] {detail}")
                 if extract_dir.exists():
                     shutil.rmtree(extract_dir)
                 extract_dir.mkdir(parents=True, exist_ok=True)
@@ -347,11 +379,26 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
                     if not (qlib_bin_dir / dirname).exists():
                         print(f"[错误] 缺少必要目录: {dirname}")
                         return False
+                if required_date:
+                    extracted_latest = _latest_calendar_date(qlib_bin_dir)
+                    if not extracted_latest or extracted_latest < required_date:
+                        raise ArchiveRejectedError(
+                            f"数据包最新交易日 {extracted_latest} 未覆盖所需前一交易日 {required_date}"
+                        )
+                    print(f"[数据] 数据包日历校验通过（最新交易日 {extracted_latest}）")
                 if target_path.exists():
                     shutil.rmtree(target_path)
                 shutil.copytree(qlib_bin_dir, target_path)
                 print("[成功] 数据更新完成")
                 return True
+            except ArchiveRejectedError as err:
+                # 同一 URL 重试同样会拿到被拒绝的包，直接换下一个下载源
+                print(f"[错误] {err}")
+                if download_path.exists():
+                    download_path.unlink()
+                if extract_dir.exists():
+                    shutil.rmtree(extract_dir)
+                break
             except Exception as err:
                 print(f"[错误] 数据更新失败: {err}")
                 if download_path.exists():
@@ -368,21 +415,51 @@ def _download_and_update_data(cfg: DataUpdateConfig, target_path: Path) -> bool:
 
 
 def _ensure_data_ready(provider_uri: str, instruments, target_date: str, cfg: DataUpdateConfig):
+    """确保本地数据覆盖 target_date 的前一交易日；不满足且无法修复时抛错，禁止进入预测/下单。"""
     data_path = _provider_path_from_uri(provider_uri)
+    required_date = _required_pred_date(data_path, target_date)
     missing = _missing_required_data(data_path, instruments)
-    outdated, latest = _is_data_outdated(data_path, target_date, instruments)
-    if not cfg.enable_auto_update:
-        if missing:
-            print("[警告] 检测到数据缺失:", missing)
-        if outdated:
-            print(f"[警告] 本地数据最新日期 {latest} 早于 {target_date}")
-        return
+    outdated, latest = _is_data_outdated(data_path, required_date, instruments)
     if not missing and not outdated:
-        print(f"[数据] 本地数据已是最新（最新交易日 {latest}）")
+        print(f"[数据] 本地数据已是最新（最新交易日 {latest}，所需 {required_date}）")
         return
-    print("[数据] 触发自动更新...")
-    if not _download_and_update_data(cfg, data_path):
-        raise RuntimeError("自动更新数据失败，请检查网络或手动更新数据。")
+
+    def _fail(message: str):
+        if cfg.allow_stale_data:
+            print(f"[警告] {message}")
+            print("[警告] allow_stale_data=True，放行过期数据 —— 仅限调试，实盘严禁使用！")
+            return
+        raise RuntimeError(message + "；已停止预测/下单")
+
+    if not cfg.enable_auto_update:
+        _fail(f"本地数据缺失或过期（最新 {latest}，需要 {required_date}）且未启用自动更新")
+        return
+    print(f"[数据] 本地数据缺失或过期（最新 {latest}，需要 {required_date}），触发自动更新...")
+
+    urls = [u for u in (cfg.data_source_urls or [cfg.data_source_url]) if u]
+    manifests = fetch_manifests(urls)
+    top = best_manifest(manifests)
+    if top is None:
+        print("[警告] 未获取到上游 manifest，跳过下载前校验（下载后仍会硬校验日历）")
+    else:
+        ok, detail = check_manifest_covers(top, target_date, required_date)
+        if not ok:
+            _fail(f"上游数据未就绪，取消下载：{detail}")
+            return
+        print(f"[数据] manifest 校验通过: {detail}")
+
+    if not _download_and_update_data(cfg, data_path, manifests=manifests, required_date=required_date):
+        _fail("自动更新数据失败（下载异常或数据包未覆盖所需交易日）")
+        return
+
+    # 更新后用新日历重新推算并复查，仍不满足则硬失败
+    required_date = _required_pred_date(data_path, target_date)
+    missing = _missing_required_data(data_path, instruments)
+    outdated, latest = _is_data_outdated(data_path, required_date, instruments)
+    if missing or outdated:
+        _fail(f"数据更新后仍不满足要求（最新 {latest}，需要 {required_date}，缺失 {missing}）")
+        return
+    print(f"[数据] 更新完成并通过复查（最新交易日 {latest}，所需 {required_date}）")
 
 
 def _resolve_trading_date(target_ts: pd.Timestamp) -> str:
@@ -418,14 +495,12 @@ def _compute_target_pred_date(pred_cfg_raw: Dict[str, object]) -> str:
 
 def _is_trading_day(provider_uri: str, date_str: str) -> bool:
     data_path = _provider_path_from_uri(provider_uri)
-    cal_file = data_path / "calendars" / "day.txt"
-    if not cal_file.exists():
+    # 合并 day.txt 与 day_future.txt：本地数据只更新到 T-1 时，day.txt 不含今天，
+    # 必须靠 day_future.txt 判断今天是否交易日，否则循环模式会一直空转
+    calendar_dates = load_calendar_dates(data_path)
+    if not calendar_dates:
         return True
-    with cal_file.open("r") as f:
-        for line in f:
-            if line.strip() == date_str:
-                return True
-    return False
+    return date_str in calendar_dates
 
 
 def _read_positions(path: Optional[str]) -> Dict[str, float]:
@@ -1172,6 +1247,10 @@ def _run_once(cfg: Dict[str, object], target_pred_date: str, version: str) -> bo
         # 是否启用自动数据更新（下载最新数据）
         enable_auto_update=bool(
             data_update_raw.get("enable_auto_update", default_update_cfg.enable_auto_update)
+        ),
+        # 数据过期时是否放行（仅调试用；实盘必须 False，过期即停止预测/下单）
+        allow_stale_data=bool(
+            data_update_raw.get("allow_stale_data", default_update_cfg.allow_stale_data)
         ),
         # 数据源 URL（从哪里下载数据）
         data_source_url=data_update_raw.get("data_source_url", default_update_cfg.data_source_url),

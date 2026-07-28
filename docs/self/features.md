@@ -1317,5 +1317,37 @@ git commit: feat: 实盘交易系统优化 - Phase1/Phase2 分离与成本优化
 
 ---
 
-*最后更新: 2025-11-26*
+## 数据更新硬校验（manifest + 交易日历硬闸）
+
+**实现时间**: 2026-07-28
+**状态**: ✅ 已完成（28 项验证全部通过）
+
+### 功能概述
+
+此前 `live_daily_predict.py` / `manual_daily_trade.py` 的自动数据更新存在实盘不可接受的漏洞：上游 GitHub Release（`chenditc/investment_data` 及 fork）停更时，脚本会下载旧数据包、报"更新完成"并继续用过期数据预测下单。本功能加入多层硬校验，保证**"数据未覆盖交易日的前一交易日 → 禁止预测/下单"**。
+
+### 校验层次
+
+1. **下载前（manifest 前置校验）**: 拉取 release 附带的 `qlib_bin.manifest.json`（约 500 字节），用 `future_start_date`（上游按真实交易所日历算出的下一交易日）判断覆盖范围——`target_date <= future_start_date` 即覆盖，对节假日免疫。上游未就绪则硬失败且**不下载** 558MB 数据包。
+2. **下载后（完整性校验）**: 按 manifest 校验压缩包字节数与 sha256。不符则拒绝并**换下一个下载源**（不重试同源）。
+3. **安装前（日历硬闸）**: 校验解压包内 `calendars/day.txt` 末日期覆盖所需前一交易日。这是最终闸门，**上游无 manifest 时（如 jzhongsun fork，实测 404）依然生效**，且被拒绝的包不会覆盖本地数据。
+4. **更新后复查**: 用新日历重新推算所需日期并复查，仍不满足则 raise，绝不进入预测/下单。
+
+### 其他修复
+
+- 日期推算统一改用交易日历（`day.txt` + `day_future.txt`），`live_daily_predict.py` 原 `BDay(1)` 近似仅保留为无日历时的兜底（原实现长假后会误判过期、触发无谓的 558MB 重下）。
+- `enable_auto_update=False` 且数据过期时由"警告放行"改为**硬失败**。
+- 新增 `data_update.allow_stale_data` 配置（默认 `False`）：仅调试用的放行开关，实盘严禁开启。
+- `_is_trading_day` 并入 `day_future.txt`：修复本地数据只到 T-1 时循环模式把"今天"误判为非交易日而空转的问题。
+
+### 核心文件
+
+- `examples/data_update_guard.py` — 新增共享校验模块（manifest 抓取/覆盖判断/sha256/日历工具），两脚本共用
+- `examples/live_daily_predict.py` — `_ensure_data_ready`/`_download_and_update_data` 重写，`_required_pred_date` 新增
+- `examples/custom/manual_daily_trade.py` — 同上；`_ensure_data_ready` 改为返回按新日历复核的 `required_pred_date`
+- `test_claude_code/test_data_update_guard.py` — 验证脚本：纯函数 + 两脚本端到端（本地迷你数据包 + `file://` 源模拟 8 类场景）+ 真实网络端点，28 项全通过
+
+---
+
+*最后更新: 2026-07-28*
 **文档维护**: 每次实现新功能并验证通过后，及时更新本文档。
