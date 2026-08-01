@@ -1,11 +1,19 @@
+# 现役实盘策略（examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha158_2020_2025.yaml）
+# 在本机的复刻版。与原版的差异仅两处：
+#   1. 数据路径改为项目局部 .data/cn_data（2026-07-28 版数据包）
+#   2. test/回测段从 2025 全年延长到 2026-07-28 —— 2025-08 之后对该模型是纯样本外，
+#      相当于现役策略近一年的"天然影子模式"成绩单
+# 模型参数、票池、策略参数与现役完全一致，不做任何"改进"。
 qlib_init:
-    provider_uri: "~/.qlib/qlib_data/cn_data"
+    provider_uri: "/Users/bytedance/code/qlib/my/data/cn_data"
     region: cn
+    kernels: 4
+    joblib_backend: threading
 market: &market all_no_bj
 benchmark: &benchmark SH000300
 data_handler_config: &data_handler_config
     start_time: 2020-01-01
-    end_time: 2025-12-29
+    end_time: 2026-07-28
     fit_start_time: 2020-01-01
     fit_end_time: 2022-12-31
     instruments: *market
@@ -20,7 +28,7 @@ port_analysis_config: &port_analysis_config
             hold_thresh: 2
     backtest:
         start_time: 2025-01-01
-        end_time: 2025-12-29
+        end_time: 2026-07-28
         account: 50000
         benchmark: *benchmark
         exchange_kwargs:
@@ -49,7 +57,7 @@ task:
             lambda_l2: 580.9768
             max_depth: 8
             num_leaves: 210
-            num_threads: 20
+            num_threads: 8
             num_boost_round: 2000
             early_stopping_rounds: 100
             verbose_eval: 50
@@ -64,7 +72,7 @@ task:
             segments:
                 train: [2020-01-01, 2022-12-31]
                 valid: [2023-01-01, 2024-12-31]
-                test: [2025-01-01, 2025-12-29]
+                test: [2025-01-01, 2026-07-28]
     record:
         - class: SignalRecord
           module_path: qlib.workflow.record_temp

@@ -81,7 +81,7 @@ class PredictionConfig:
     experiment_id: str
     recorder_id: str
     prediction_date: str
-    provider_uri: str = "~/.qlib/qlib_data/cn_data"
+    provider_uri: str = "/Users/bytedance/code/qlib/my/data/cn_data"
     region: str = REG_CN
     top_k: int = 50  # 最多推荐的股票数量（最终会结合约束筛选）
     min_score_threshold: float = 0.0  # 分数低于该阈值的股票会被剔除

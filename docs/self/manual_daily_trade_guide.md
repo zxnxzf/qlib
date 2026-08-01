@@ -1,6 +1,6 @@
 # 手动实盘（manual_daily_trade）使用说明
 
-本文说明如何用 `examples/custom/manual_daily_trade.py` 进行日频手动实盘，并保证与
+本文说明如何用 `my/trading/manual_daily_trade.py` 进行日频手动实盘，并保证与
 `benchmarks/LightGBM/workflow_config_lightgbm_Alpha158_2020_2025.yaml` 的回测配置一致。
 
 ## 1. 用途与一致性说明
@@ -16,7 +16,7 @@
 ## 2. 日常实盘步骤
 
 1. **确认状态目录**
-   - 默认统一目录：`examples/custom/manual_state/`
+   - 默认统一目录：`my/trading/manual_state/`
    - 交易状态文件（5个）：
      - `positions_manual.csv`
      - `orders_manual.csv`
@@ -25,7 +25,7 @@
      - `holdings_history_manual.json`
 
 2. **更新持仓与现金**
-   - 文件：`examples/custom/manual_state/positions_manual.csv`
+   - 文件：`my/trading/manual_state/positions_manual.csv`
    - 格式示例：
      ```csv
      code,position
@@ -36,22 +36,22 @@
 
 3. **运行脚本生成订单**
    ```bash
-   python /qlib/examples/custom/manual_daily_trade.py
+   python /qlib/my/trading/manual_daily_trade.py
    ```
 
 4. **查看输出**
-   - 订单：`examples/custom/manual_state/orders_manual.csv`
-   - 净值历史：`examples/custom/manual_state/pnl_history.csv`
+   - 订单：`my/trading/manual_state/orders_manual.csv`
+   - 净值历史：`my/trading/manual_state/pnl_history.csv`
    - 控制台也会打印买卖列表
 
 5. **手动下单**
    - 价格为未复权价格，直接用于真实下单参考。
 
 6. **更新下一日持仓**
-   - 自动生成：`examples/custom/manual_state/positions_manual_next.csv`
+   - 自动生成：`my/trading/manual_state/positions_manual_next.csv`
    - 确认成交后：
      ```bash
-     mv /qlib/examples/custom/manual_state/positions_manual_next.csv /qlib/examples/custom/manual_state/positions_manual.csv
+     mv /qlib/my/trading/manual_state/positions_manual_next.csv /qlib/my/trading/manual_state/positions_manual.csv
      ```
 
 7. **次日重复**
@@ -61,7 +61,7 @@
 脚本配置集中在 `manual_daily_trade.py` 的 `DEFAULT_CONFIG`：
 
 - 交易日历：`DEFAULT_CONFIG["calendar"]`
-- Qlib 数据：默认使用项目局部目录 `/Users/bytedance/code/qlib/.data/cn_data`
+- Qlib 数据：默认使用项目局部目录 `/Users/bytedance/code/qlib/my/data/cn_data`
 - 数据更新硬校验：`DEFAULT_CONFIG["data_update"]`，上游数据包未覆盖前一交易日时禁止预测/下单（manifest 前置校验 + sha256 + 解压包日历硬闸 + 更新后复查；`allow_stale_data` 仅调试用，详见 `docs/self/features.md`）
 - 实盘路径：`DEFAULT_CONFIG["paths"]`
 - 状态目录：`DEFAULT_CONFIG["paths"]["state_dir"]`（默认 `manual_state`）
@@ -75,7 +75,7 @@
 我们使用链式对比脚本验证一致性：
 
 ```bash
-python /qlib/examples/custom/compare_live_chain.py
+python /Users/bytedance/code/qlib/my/trading/compare_live_chain.py
 ```
 
 输出目录：
@@ -86,7 +86,7 @@ python /qlib/examples/custom/compare_live_chain.py
 
 ## 5. 持仓历史文件说明
 
-- 文件：`examples/custom/manual_state/holdings_history_manual.json`
+- 文件：`my/trading/manual_state/holdings_history_manual.json`
 - 用途：用于计算持仓天数，配合 `hold_thresh` 限制卖出。
 - 日常无需手动修改，如需重置持仓天数，可删除该文件。
 

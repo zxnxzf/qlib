@@ -52,9 +52,18 @@ tags
 .aider*
 
 # diagnostic and log files
-test_claude_code/
+
 pigure_log/
 
 .serena/
 predictions/
 
+
+# --- my/ workspace ---
+.venv/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.DS_Store
+my/data/
+my/artifacts/
+my/mlruns/

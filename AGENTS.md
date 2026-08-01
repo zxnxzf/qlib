@@ -264,8 +264,8 @@ task:
 - 贡献模型时，将其放在 `examples/benchmarks/[MODEL_NAME]/` 目录
 - 修改 `.pyx` 文件后必须重新编译 Cython 模块：`make prerequisite`
 - 项目使用 pandas 2.x+，`group_keys` 默认值已更改，部分旧脚本可能存在问题
-- 就是claude code你自己新建的测试脚本，放在test_claude_code的文件夹下吧，便于管理
-- 我这个项目用了anaconda的虚拟环境，虚拟环境的名字是qlib，注意执行的时候使用这个
+- claude code 新建的实验/测试脚本放在 my/scripts/ 下，实验产物放 my/artifacts/（gitignore），便于管理
+- 本项目虚拟环境是仓库根目录的 .venv（/Users/bytedance/code/qlib/.venv），执行一律用它的 python/qrun，不要用系统或 conda 环境
 
 ## 文档更新规范（重要）
 
@@ -761,3 +761,16 @@ def main():
 - iQuant API: `get_trade_detail_data(accountID, ACCOUNT_TYPE, "account")` - 获取账户信息
 - 返回对象字段: `m_dAvailable` - 可用资金（浮点数）
 - 详细文档: `D:/国信iQuant策略交易平台/HTML/guosenPythonApiHelp/iQuant_Python_API_Doc.html`
+
+## my/ 工作区（2026-08-01 目录重构后）
+
+个人量化工作统一放在仓库内 `my/`：
+- `my/configs/` 实验 yaml（qrun 配置）
+- `my/scripts/` 实验/诊断/基建脚本（含 recorder_visualizer_from_path.py）
+- `my/trading/` 实盘线脚本（manual_daily_trade.py、live_daily_predict.py、iquant 系列、data_update_guard.py）
+- `my/artifacts/` 实验产物（gitignore）
+- `my/mlruns/` 训练实验记录（gitignore）
+- `my/data/` qlib 数据（gitignore；cn_data 为最新数据包）
+
+跑实验的标准姿势：`cd /Users/bytedance/code/qlib/my && ../.venv/bin/qrun configs/xxx.yaml`
+（cwd 在 my/ 下，mlruns 自动落在 my/mlruns，且避开仓库根的 qlib 包名遮蔽）

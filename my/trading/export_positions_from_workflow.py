@@ -84,7 +84,7 @@ def main() -> int:
     parser.add_argument("--artifacts", required=True, help="Path to mlruns run artifacts directory.")
     parser.add_argument("--dates", required=True, help="Comma-separated dates, e.g. 2025-01-06,2025-03-03")
     parser.add_argument("--output", required=True, help="Output CSV path (will be overwritten per date).")
-    parser.add_argument("--provider-uri", default="~/.qlib/qlib_data/cn_data")
+    parser.add_argument("--provider-uri", default="/Users/bytedance/code/qlib/my/data/cn_data")
     parser.add_argument("--region", default="cn")
     args = parser.parse_args()
 

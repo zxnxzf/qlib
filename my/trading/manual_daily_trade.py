@@ -37,8 +37,8 @@ except Exception:
 # Ensure local repo import precedence.
 _EXAMPLES_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _EXAMPLES_DIR.parents[1]
-LOCAL_PROVIDER_URI = str(_REPO_ROOT.parent / ".data" / "cn_data")
-for _extra_path in (str(_REPO_ROOT), str(_REPO_ROOT / "examples")):
+LOCAL_PROVIDER_URI = str(_REPO_ROOT / "my" / "data" / "cn_data")
+for _extra_path in (str(_REPO_ROOT), str(_REPO_ROOT / "my" / "trading")):
     if _extra_path not in sys.path:
         sys.path.insert(0, _extra_path)
 
@@ -87,14 +87,14 @@ DEFAULT_CONFIG = {
         "positions": "positions_manual.csv",
         "orders_out": "orders_manual.csv",
         "holdings_history": "holdings_history_manual.json",
-        "mlruns_uri": "../benchmarks/LightGBM/mlruns",
+        "mlruns_uri": "../mlruns",
         "positions_next": "positions_manual_next.csv",
         "pnl_history": "pnl_history.csv",
     },
     "workflow_alignment": {
         "enabled": True,
         "mode": "live",
-        "workflow_config_path": "../benchmarks/LightGBM/workflow_config_lightgbm_Alpha158_2020_2025.yaml",
+        "workflow_config_path": "../configs/workflow_config_lightgbm_Alpha158_2020_2025.yaml",
         "handler_end_time_policy": "pred_date",
         "market": "all",
         "handler": {

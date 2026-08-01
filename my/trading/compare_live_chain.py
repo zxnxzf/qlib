@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 注意：本脚本为 Docker 时代遗留（/qlib/ 硬路径），在本机不可直接运行；可用版本见 my/scripts/compare_live_chain_local.py
 """
 Chain-compare manual live (re-predict) vs workflow positions across multiple dates.
 

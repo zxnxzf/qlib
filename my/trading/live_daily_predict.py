@@ -23,7 +23,7 @@ from pandas.tseries.offsets import BDay
 
 # 确保优先使用项目根目录下的 qlib 包，避免被 examples/qlib 命名空间遮蔽
 _EXAMPLES_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _EXAMPLES_DIR.parent
+_REPO_ROOT = _EXAMPLES_DIR.parents[1]
 for _path in (str(_REPO_ROOT), str(_EXAMPLES_DIR)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
@@ -55,7 +55,7 @@ from data_update_guard import (  # noqa: E402  # 数据包硬校验工具（与 
 # ================= 用户可直接在此处配置缺省参数 =================
 DEFAULT_CONFIG = {
     "qlib_init": {
-        "provider_uri": "~/.qlib/qlib_data/cn_data",  # 数据路径
+        "provider_uri": "/Users/bytedance/code/qlib/my/data/cn_data",  # 数据路径
         "region": "cn",  # 市场区域
         "kernels": 1,  # 进程池个数
         "joblib_backend": "threading",  # joblib 后端类型
@@ -81,7 +81,7 @@ DEFAULT_CONFIG = {
         "top_k": 20,  # 选股数量
         "min_score_threshold": 0.0,  # 评分阈值
         "weight_method": "equal",  # 权重计算方式
-        "provider_uri": "~/.qlib/qlib_data/cn_data",  # 数据源
+        "provider_uri": "/Users/bytedance/code/qlib/my/data/cn_data",  # 数据源
         "region": "cn",  # 区域
         "instruments": "csi300",  # 证券池
         "dataset_class": "DatasetH",  # 数据集类型
@@ -285,7 +285,7 @@ class DataUpdateConfig:
 
 def _provider_path_from_uri(uri: str) -> Path:
     if not uri:
-        uri = "~/.qlib/qlib_data/cn_data"
+        uri = "/Users/bytedance/code/qlib/my/data/cn_data"
     path = Path(uri)
     if uri.startswith("~"):
         path = path.expanduser()
@@ -1270,7 +1270,7 @@ def _run_once(cfg: Dict[str, object], target_pred_date: str, version: str) -> bo
 
     # 数据存储路径（本地 qlib 数据目录）
     # 优先使用 prediction 配置，其次使用 qlib_init 配置
-    provider_uri = pred_cfg_raw.get("provider_uri") or qlib_init_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data")
+    provider_uri = pred_cfg_raw.get("provider_uri") or qlib_init_cfg.get("provider_uri", "/Users/bytedance/code/qlib/my/data/cn_data")
     # 市场区域（cn=中国，us=美国等）
     region = pred_cfg_raw.get("region") or qlib_init_cfg.get("region", "cn")
     # 股票池（csi300=沪深300，csi500=中证500等）
@@ -1619,7 +1619,7 @@ def main(argv=None) -> bool:
             continue
 
         qlib_init_cfg = cfg.get("qlib_init", {})
-        provider_uri = pred_cfg_raw.get("provider_uri") or qlib_init_cfg.get("provider_uri", "~/.qlib/qlib_data/cn_data")
+        provider_uri = pred_cfg_raw.get("provider_uri") or qlib_init_cfg.get("provider_uri", "/Users/bytedance/code/qlib/my/data/cn_data")
         if loop_enabled and not _is_trading_day(provider_uri, target_pred_date):
             print(f"[live] {target_pred_date} 非交易日，等待 {loop_interval} 秒...")
             time.sleep(loop_interval)

@@ -1,10 +1,13 @@
 # 项目记忆
 <!--
-更新: 2026-07-28
+更新: 2026-08-01
 核对基线:
-- qlib | HEAD 0731f0d1 | 工作区干净（test_claude_code/ 按 .gitignore 不入库）
+- qlib | 待本次重构提交后更新 HEAD | 仓库已上移至 /Users/bytedance/code/qlib（原外层壳路径）
 代码与 Git 用于判断实现现状；用户最后确认的需求用于判断目标。
 -->
+
+## 目录结构（2026-08-01 重构，用户拍板）
+外层壳已消灭：git 仓库本体现在就是 /Users/bytedance/code/qlib（路径名义未变，.venv/.claude 绝对路径全部保持有效，editable 安装已用 pip install -e 刷新）。个人量化工作统一在仓库内 my/：configs（实验yaml，含原 run-configs 与两个用户 benchmark yaml）、scripts（原 test_claude_code 脚本+visualizer，首次入 git）、trading（原 examples/custom 与 examples 下的实盘线脚本）、artifacts（实验产物，gitignore）、mlruns（原 runs/mlruns，meta.yaml 的 artifact 路径已 sed 修正）、data（原 .data，cn_data 最新包）。旧路径→新路径：runs/mlruns→my/mlruns、.data→my/data、test_claude_code→my/scripts+my/artifacts、examples/custom→my/trading、run-configs→my/configs。跑实验标准姿势：cd my && ../.venv/bin/qrun configs/xxx.yaml。验证已过：import qlib 指向新位置、guard 套件 28/28、日历 2026-07-28、visualizer 重生成正常、mlruns mlflow 可读。
 
 ## 项目目标
 以 Qlib 为基础走向 A 股日频实盘：执行通道优先国金标准 QMT（迁移现有文件握手方案），终局目标正常日完全无人操作（PTrade 托管为候选终局路线）。
@@ -24,7 +27,10 @@
 - “我现在不是很想用iquant了想看看有没有什么其他的方式”（2026-07-27）
 - “我去问了下，国金的就没法开miniqmt，但是可以开通qmt和ptrade。我当前的qlib能和他们去配合吗？”（2026-07-28，国金实际询问结果：MiniQMT 不可开，标准 QMT 和 PTrade 可开）
 - “可以先收尾一下，那还是先优先这个qmt吧”（2026-07-28：确认先完成数据硬校验收尾；执行通道优先走国金标准 QMT，沿用现有文件握手方案迁移）
-- 代码来历（2026-07-28 用户确认）：iQuant 半自动线（live_daily_predict.py + iquant_qlib.py）和手动线（manual_daily_trade.py）都是用户本人早期开发。iQuant 线最先做，从未真正投入使用；隔了很久后另起手动线并实际使用至今。两线选股配置各自独立演化，迁移 QMT 前需核对一致性。
+- “可以 后续可以接回来 然后可以先按手动脚本去做吧 后续在去接对吧？其实除了这个下单的问题，还有就是策略的问题，怎么弄一个好的策略，怎么回测，对吧，这个才是重点我觉得”（2026-07-28：近期先用 manual 手动脚本实盘，QMT 接入及实时重算股数后续再做；工作重心转向策略研究与回测方法）
+- “应该没法自动增量，我的来源应该是别人这个github拉取的。但是数据确实可以先拉一下。其他的先别弄吧，先讨论一下…一个就是策略的调整，在就是回测标准，怎么样认为是一个好的策略，下单其实后面只要通了就行。前面两个才是最重要的”（2026-07-29：同意先把本机研究数据更新到最新；baseline 重跑和实验模板暂缓，先讨论策略调整与回测标准两个主题）
+- 2026-07-29 策略研究讨论定案：①验收及格线用户认可（含成本超额年化>10%、IR>1.5、超额回撤<15%、逐年≥4/5为正、成本翻倍剩60%、test只看一次、参数敏感性检查）；②all_no_bj 的动机=用户开不了北交所权限、票池与现实对齐，基准用户拍板：统一用沪深300（SH000300），理由是票池反正不含北交所、图简单直接。已向用户说明中证全指其实也不含北交所、且全市场策略赢300可能只是小盘beta——约定在实验分析时附带 vs 中证全指（SH000985）的诊断曲线，但验收门槛只认 vs 沪深300（新数据包已确认含 sh000300/905/852/985 指数数据）；③实验清单已拟五项（新baseline/csi500/all_no_bj/DoubleEnsemble/滚动重训）但用户明确"先不动手"，等其确认后再跑。
+- 代码来历（2026-07-28 用户确认，2026-07-29 修正）：iQuant 半自动线（live_daily_predict.py + iquant_qlib.py）和手动线（manual_daily_trade.py）都是用户本人早期开发。iQuant 线最先做，从未真正投入使用；隔了很久后另起手动线。**2026-07-29 用户确认手动实盘其实也从未真正跑起来**——没有 pnl_history 真实记录，无真金白银在场。因此现役策略失效的发现没有造成实际亏损，也无"降仓/暂停"的紧迫决策；一切以"先做出通过验收的策略，再走影子模式→QMT"推进。
 
 ## 现在做到哪
 仓库位于 `/Users/bytedance/code/qlib/qlib`，当前 HEAD 为 `378d9ff1`。局部 Python 3.9.6 环境位于 `/Users/bytedance/code/qlib/.venv`。中国市场日频示例数据位于 `/Users/bytedance/code/qlib/.data/cn_data`，覆盖 1999-11-10 至 2020-09-25，共 3,875 个标的。已使用 `/Users/bytedance/code/qlib/run-configs/lightgbm_alpha158_local.yaml` 完整执行 Alpha158 + CSI300 + LightGBM `qrun`，并完成 2017-01-03 至 2020-08-01 的 871 个交易日回测。MLflow 实验 ID `583100969444960600`、Recorder ID `32fb882581004afa9ac2e9c5e95123db`，状态 FINISHED；IC 0.04680、Rank IC 0.04905、含成本超额年化收益 0.08065、信息比率 0.91449、最大回撤 -0.08608。手动交易脚本的 Qlib 初始化、预测配置、dataclass 默认值和运行兜底路径已统一改为项目局部数据目录。产物位于 `/Users/bytedance/code/qlib/runs/mlruns`。
@@ -72,6 +78,20 @@ Tushare 当前提供 A 股实时分钟接口 `rt_min`（1/5/15/30/60 分钟）�
 2026-07-28 链式对比实证（用户担心"manual 生成的单是否和 qrun 回测一致"）：用适配版对比脚本 `test_claude_code/compare_live_chain_local.py`（改自用户的 compare_live_chain.py，不入库）对本地 qrun LightGBM 实验（recorder 32fb88...，topk=50/n_drop=5/1亿资金）从回测首个建仓日 2017-01-04 起链跑三天，manual 以 live 模式逐日重预测+模拟成交。结果：**三天选股 100% 重合**（42/42、43/43、43/43）；份额差异为取整级——单股最大相对差 1.83%（约 1 手），现金差占总资产 0.066%→0.039%→0.026% 逐日收敛，无发散。差异根源：manual 在 _orders_to_frame 将策略内已按手取整的复权数量乘 factor 还原原始股数时出现浮点 ε（如 5399.9997），再向下整手取整导致系统性少一手（回测的原始股数本身非整手、实盘不可下单，manual 的整手化是实盘必需操作，只是浮点 ε 造成偏保守一手，可用 round 后再整手修复，影响极小）；对比脚本 int() 截断另贡献 ±1 股显示误差。结论：manual 是 qrun workflow 的忠实实盘孪生，更换模型/配置后应重跑该链式对比。
 
 2026-07-28 手动实盘时序核查结论（用户要求验证）：manual_daily_trade.py 的 T-1 时序与回测严格同构——回测 TopkDropoutStrategy 取信号 shift=1（signal_strategy.py:143，T 日决策用 T-1 分数、按 T 日价成交）；manual 侧 required_pred_date=T-1、handler end_time 截到 pred_date 无泄漏、_generate_orders_topk_dropout 为 generate_trade_decision 的忠实移植。四个实盘固有差异（人肉承担，QMT 自动化的目标）：①参考价为 T-1 收盘（trade_base_date 实盘必回落到 pred_date），执行越近收盘越贴近回测假设→QMT 版执行窗口应放尾盘；②买入股数按 T-1 收盘算，靠 risk_degree=0.95 缓冲高开；③涨跌停/停牌按 T-1 状态判定，T 日新涨停需执行时处理；④positions_next 假定全额按参考价成交，实际偏差靠人工改持仓文件。信号时序问题（原下一步第4项）就此解决：体系天然为"盘后信号、次日执行"，最优执行点是尾盘。QMT 对接方案已给用户：manual 线为信号源，QMT 端脚本（改自 iquant_qlib.py）三阶段握手（导出真实持仓→审批→尾盘执行+实时校验+回执对账），待确认 QMT 装机位置/文件同步方式与审批形态。
+
+2026-07-29：本机研究数据已更新至最新——`.data/cn_data` 换为 chenditc 官方包（日历末日期 2026-07-28，含 day_future.txt，816MB），旧 2020 样例备份在 `.data/cn_data_sample2020.bak`。更新走 `test_claude_code/update_research_data.py`（复用 manual 的 _ensure_data_ready 全链路），过程实测了新校验链：镜像 manifest 超时→回退 GitHub 直连→sha256 通过→日历硬闸通过→复查通过。注意：旧 mlruns 里的 LightGBM 实验是在旧样例数据上训练的，与新数据不再匹配，baseline 需在新数据上重训。
+
+2026-07-29 重大发现——现役策略复刻实验（run-configs/lightgbm_alpha158_all_no_bj_2020_2026.yaml，实验 659009532578438967 / recorder 408b68e7，qrun 由用户本人在终端执行）：现役实盘配置（LGB 精调参数、all_no_bj、topk50/n_drop2/hold_thresh2、train 2020-2022）在延长回测（2025-01~2026-07-28）中呈现典型的"看过区间好、纯样本外崩"模式：2025-01~07（用户当年构建策略时看过的段）含成本超额年化 +44.1%、IR 2.40；2025-08~2026-07（纯样本外）**超额年化 -21.7%、IR -1.08、超额回撤 -34.9%**；vs 中证全指更差（样本外 -30.9%），说明不是大小盘风格问题而是选股能力失效。全区间 IC 0.0551 但 2026 年超额 -41.3%。绝对收益全靠 2025 上半年。主要嫌疑：模型 2022-12 停训已 3 年半未滚动重训 + 当年在 2025 上半年区间上反复迭代定型。已提醒用户核对实盘 pnl_history 印证并考虑降仓，等待用户决策；最有信息量的下一个实验是滚动重训版对照。runs/ 目录已 git init（消除 qrun 的 git diff 噪音）。quantstats 体检报告在 test_claude_code/quantstats_report_all_no_bj_2025_2026.html。
+
+2026-07-30 死因排查进展：①IC 分层验证（test_claude_code/decile_analysis.py）推翻"头部失效"——样本外分层完美单调，TOP50 次日纸面超额年化仍 +81.5%，问题在信号→组合的转化层；两大嫌疑：涨停板逆向选择（纸面 alpha 集中在买不进的涨停票）、1日信号 vs ~25日持有期错配。②资金规模对照（backtest_account_sweep.py，同 pred 换账户 5万→100万）：样本外 -21.7% vs -22.5%，基本无差——资金约束（5万×topk50 每只仅~950元预算、只买得起 <9.5元低价股）虽真实存在并扭曲持仓风格，但**不是**样本外亏损主因，已排除。裁决实验 a 已完成（top50_tradability_analysis.py）——**涨停逆向选择实锤**：TOP50 纸面超额的大头集中在执行日涨停买不进的票（日均 6.9~7.8/50 只被拦，被拦票年化 +677%~+761%）；剔除后"可成交 TOP50"的头部超额两个时期都为负（25-08 前 -30.2%、后 -14.5%）。结论：模型本质学成了"涨停/强动量预测器"，纸面 alpha 不可收割；25-08 前组合仍赚 +44% 是因为小盘牛市中买入后续日还有涨停可吃，行情一平该模式即失效。这是策略设计层缺陷（1日label+全市场微小盘+动量特征），不是调参问题。修复方向：可成交性感知的 label/剔除涨停样本、拉长 label 期限匹配持有期、或收缩票池到涨停稀少的流动性池。实验 b 已完成（backtest_ndrop_sweep.py，账户100万）：样本外超额 n_drop=2→-22.5%，5→-15.2%，10(hold=1)→+1.4%，25(hold=1)→-22.8%（日换手50.6%被成本吃死）。持有期错配得证：适度提速可挽回约24个百分点，但最优也只到持平——该策略族样本外无可收割alpha。⚠️纪律警示：n_drop=10 是在样本外段上诊断出来的，不得直接当"修复方案"采用（那等于在test上调参），只能作为新设计的先验。死因终版：主犯=涨停逆向选择（结构性），从犯=持有期错配，背景=RankIC衰减；已排除=资金量、头部排序失效。策略重构方向：①票池收缩到涨停稀少的流动性池（csi300/500或全市场+市值流动性过滤）②label与持有期对齐（如5日）并在训练中处理不可成交样本③滚动重训入流程标配④新设计一律走base模板+验收单。另修复 recorder_visualizer_from_path.py 直线图 bug：HTML 模板 CDN plotly-latest(1.x) 与 plotly.py 6.9 序列化格式不兼容致数值被当类别渲染成直线，已改为 plotly-3.7.0.min.js；数据与 qlib 计算本身无误。plotly 已经用户同意装入 .venv。
+
+2026-07-31 实验：5日label 对照（run-configs/lightgbm_alpha158_all_no_bj_5dlabel.yaml，recorder 51caff16，仅改 handler label 为 Ref($close,-6)/Ref($close,-1)-1，其余与现役复刻一致）。结果：信号层主犯被打中——样本外可成交TOP50超额从 -14.5% 翻正至 +12.5%，日均被涨停拦截 6.9→2.8/50；但组合层样本外仍 -17.7%，因为分数变稳后 n_drop=2 换手掉到 1.1%/日（持有~90天），5日信号×90天持有错配更重。5dlabel pred + 换手对照结果（backtest_5dlabel_ndrop.py，账户100万）：n_drop=5→样本外-6.9%；**n_drop=10→+5.0%（IR+0.32，全期+20.9%）**；n_drop=15→+0.5%（成本拖累上升）。修复弧线：现役-21.7%→5dlabel-17.7%→5dlabel+n_drop10 **+5.0%**，两个修复方向（label对齐+换手对齐）均被验证有效。但+5.0%/IR0.32 远低于验收线（>10%/IR>1.5），且该组合是在烧掉的窗口上迭代出来的，只能作为下一代设计先验。注意：至此所有实验仍用 fit_end=2022-12-31 的旧模型，滚动重训杠杆完全未动，是候选一号最大的待验证提升项。候选一号设计=5日label+快换手(n_drop~10)+滚动重训(+可选票池流动性过滤)，验收必须走干净流程（重新划分或影子模式，烧掉的25-08~26-07段不得作为最终test）。⚠️重要纪律记录：2025-08~2026-07 这段"样本外"经过多轮诊断迭代已被烧掉（burned），现在事实上是验证集；最终策略验收必须靠全新数据（影子模式/2026-08后）或重新划分，不得再把该段当 test 报最终成绩。
+
+2026-07-31 候选一号（5日label+季度滚动重训+n_drop10，test_claude_code/candidate1_rolling.py，15个季度模型，回测2023-01~2026-07）：首跑全期-3.24%**无效**——组合2023-07-14后完全冻结三年零换手。冻结机制已诊断实锤（candidate1_freeze_diag.py）：持仓膨胀到60只（卖出失败但买入按候选数计算导致超配），其中恰好10只停牌/退市死票（pred无分数、排名垫底）；n_drop=10时每日卖出候选=垫底10只死票全不可交易→卖出0成交→buy=today[:10+50-60]=0→永久锁死。这是TopkDropoutStrategy在全市场票池的真实缺陷，实盘会同样发生（现役1日配置未触发属侥幸）。only_tradable=True 重测完成（candidate1_only_tradable.py）：锁死解除（逐年换手37-46%恢复正常），候选一号真实成绩=全期-3.95%/IR-0.21，逐年+1.2%/-12.7%/+13.3%/-28.2%——剧烈摆动无稳定alpha，且~40%日换手下成本拖累约19%/年。**候选一号正式不及格，Alpha158+LGB+all_no_bj 这个策略族在现有修补空间内宣告枯竭**。下一轮设计核心变化=票池（三个独立证据均指向：涨停逆向选择、低价股集中、死票锁死）：csi300/csi500 或全市场+ST/流动性/市值过滤，配 5日label+滚动重训 重新训练评估，走干净验收流程。另一结论：同窗口对照（2025-01起跑）滚动版25-08后=-17.0%（换手30%正常） vs 静态版+5.0%——滚动重训在烧掉窗口上非但没加分反而更差，进一步说明静态版+5.0%是窗口迭代水分，候选一号目前不及格。结构性启示：票池过滤（剔ST/退市风险/低流动性）的优先级进一步上升。
+
+2026-07-31 票池对比轮完成（pool_rolling.py csi300/csi500 + pool_filtered_backtest.py 全市场过滤复用candidate1_pred；均为5日label+季度滚动+n_drop10+only_tradable，2023-01~2026-07，账户100万）：净超额 all_no_bj=-3.9%、csi300=-3.1%、csi500=-11.2%、全市场+过滤=-2.9%，全部不及格。关键分解：**毛超额（不含成本）all/csi300/过滤 均为 +5.8~6.5%，csi500=-2.0%；成本在39-41%日换手下高达9-10%/年，把毛alpha全部吃光**（only_tradable=True 使实际换手远超 n_drop=10 名义值）。结论：①该策略族毛alpha天花板≈6%/年，即便零成本执行也够不到净超额>10%的验收线；②下一轮两个正交方向：换手/成本效率（降频调仓，能把净值拉回0~+3%但不足以及格）+ 更强信号（换模型/特征，观察指标应为毛超额）；③csi500 在该配方下连毛alpha都没有，优先级降低。全部实验工具与report pkl在 test_claude_code/。
+
+2026-08-01 工作流约定：用户习惯用自己的 examples/custom/recorder_visualizer_from_path.py 看实验结果（不要用 quantstats/matplotlib 代替）。为此新增 test_claude_code/build_faux_recorders.py：把 backtest_daily 直跑的实验（pred+report pkl）打包成标准 recorder artifacts 结构（pred/report/port_analysis/ic/ric/metrics），visualizer 即可直接用。四个票池实验的仪表板已生成在 test_claude_code/faux_recorders/<name>/recorder_dashboard.html。**今后所有实验产物一律打包成 recorder 结构出仓**。附带发现：各池 vs 5日label 的 IC——all_no_bj=0.0715、csi300=0.0082、csi500=-0.0063，小票池训练样本少信号质量急剧下降，进一步支持"全市场训练+入组过滤"而非"小票池训练"的路线。
 
 ## 下一步
 1. 用户侧：办理国金开户及 QMT、PTrade 权限；顺带向国金技术确认两个问题——①PTrade 策略环境能否访问外部 HTTP/白名单；②研究环境文件上传有无自动化方式（决定终局无人值守形态）。另需确认：QMT 客户端装哪台机器、与 qlib(mac) 的文件共享方式、订单审批形态（文件/命令确认 vs 消息推送确认）。
