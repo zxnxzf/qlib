@@ -93,6 +93,8 @@ Tushare 当前提供 A 股实时分钟接口 `rt_min`（1/5/15/30/60 分钟）�
 
 2026-08-01 工作流约定：用户习惯用自己的 examples/custom/recorder_visualizer_from_path.py 看实验结果（不要用 quantstats/matplotlib 代替）。为此新增 test_claude_code/build_faux_recorders.py：把 backtest_daily 直跑的实验（pred+report pkl）打包成标准 recorder artifacts 结构（pred/report/port_analysis/ic/ric/metrics），visualizer 即可直接用。四个票池实验的仪表板已生成在 test_claude_code/faux_recorders/<name>/recorder_dashboard.html。**今后所有实验产物一律打包成 recorder 结构出仓**。附带发现：各池 vs 5日label 的 IC——all_no_bj=0.0715、csi300=0.0082、csi500=-0.0063，小票池训练样本少信号质量急剧下降，进一步支持"全市场训练+入组过滤"而非"小票池训练"的路线。
 
+2026-08-01 strategy-research 项目级 skill 建成（commit 3e74ce14，设计经四层逐层讨论定稿，spec 在 my/docs/specs/2026-08-01-strategy-research-skill-design.md）。定位：自动连跑的策略研究员——Claude 自主出想法（线索→qlib榜单→经典改进，自定义因子无权限）、合理性审查入队（机制/证据/预期三问）、滚动回测（锁死口径）、三关淘汰（海选 IC≥0.03且RankIC≥0.03/分层/可成交；复赛毛>12%；决赛净>10%/IR>1.5/至多1负年/成本翻倍/敏感性/5万复测；影子模式=验流程需拍板）、双落档（exp_mlflow_log.py→my/mlruns + faux recorder仪表板）、台账 my/docs/research_log.md（顶部排行榜，用户随时问"最好的是啥"）。机器分时段：工作日白天轻实验≤4核、重训23:00后。拍板事项五种，其余全自动。改动边界：冻结区（qlib//my/trading//已有scripts）只准调用；施工区每实验≤1yaml+1脚本；git 不搞一实验一提交、按阶段汇总。用户触发词："继续研究"/"研究一下XX"//strategy-research。台账已回填本周 8 个实验与 4 条队列想法（队首：T+1开盘价执行）。
+
 ## 下一步
 1. 用户侧：办理国金开户及 QMT、PTrade 权限；顺带向国金技术确认两个问题——①PTrade 策略环境能否访问外部 HTTP/白名单；②研究环境文件上传有无自动化方式（决定终局无人值守形态）。另需确认：QMT 客户端装哪台机器、与 qlib(mac) 的文件共享方式、订单审批形态（文件/命令确认 vs 消息推送确认）。
 2. QMT 迁移：拿到国金 QMT 后，把 `examples/iquant_qlib.py` 适配为国金 QMT 版（账号 ID/类型、路径、编码、API 差异核对），先 DRY_RUN 验证三阶段握手，再小额实单。
