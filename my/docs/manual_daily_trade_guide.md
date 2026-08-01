@@ -62,7 +62,7 @@
 
 - 交易日历：`DEFAULT_CONFIG["calendar"]`
 - Qlib 数据：默认使用项目局部目录 `/Users/bytedance/code/qlib/my/data/cn_data`
-- 数据更新硬校验：`DEFAULT_CONFIG["data_update"]`，上游数据包未覆盖前一交易日时禁止预测/下单（manifest 前置校验 + sha256 + 解压包日历硬闸 + 更新后复查；`allow_stale_data` 仅调试用，详见 `docs/self/features.md`）
+- 数据更新硬校验：`DEFAULT_CONFIG["data_update"]`，上游数据包未覆盖前一交易日时禁止预测/下单（manifest 前置校验 + sha256 + 解压包日历硬闸 + 更新后复查；`allow_stale_data` 仅调试用，详见 `my/docs/features.md`）
 - 实盘路径：`DEFAULT_CONFIG["paths"]`
 - 状态目录：`DEFAULT_CONFIG["paths"]["state_dir"]`（默认 `manual_state`）
 - 预测/策略对齐：`DEFAULT_CONFIG["workflow_alignment"]`

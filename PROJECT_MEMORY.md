@@ -7,7 +7,7 @@
 -->
 
 ## 目录结构（2026-08-01 重构，用户拍板）
-外层壳已消灭：git 仓库本体现在就是 /Users/bytedance/code/qlib（路径名义未变，.venv/.claude 绝对路径全部保持有效，editable 安装已用 pip install -e 刷新）。个人量化工作统一在仓库内 my/：configs（实验yaml，含原 run-configs 与两个用户 benchmark yaml）、scripts（原 test_claude_code 脚本+visualizer，首次入 git）、trading（原 examples/custom 与 examples 下的实盘线脚本）、artifacts（实验产物，gitignore）、mlruns（原 runs/mlruns，meta.yaml 的 artifact 路径已 sed 修正）、data（原 .data，cn_data 最新包）。旧路径→新路径：runs/mlruns→my/mlruns、.data→my/data、test_claude_code→my/scripts+my/artifacts、examples/custom→my/trading、run-configs→my/configs。跑实验标准姿势：cd my && ../.venv/bin/qrun configs/xxx.yaml。验证已过：import qlib 指向新位置、guard 套件 28/28、日历 2026-07-28、visualizer 重生成正常、mlruns mlflow 可读。
+外层壳已消灭：git 仓库本体现在就是 /Users/bytedance/code/qlib（路径名义未变，.venv/.claude 绝对路径全部保持有效，editable 安装已用 pip install -e 刷新）。个人量化工作统一在仓库内 my/：configs（实验yaml，含原 run-configs 与两个用户 benchmark yaml）、scripts（原 test_claude_code 脚本+visualizer，首次入 git）、trading（原 examples/custom 与 examples 下的实盘线脚本）、artifacts（实验产物，gitignore）、mlruns（原 runs/mlruns，meta.yaml 的 artifact 路径已 sed 修正）、data（原 .data，cn_data 最新包）。旧路径→新路径：runs/mlruns→my/mlruns、.data→my/data、test_claude_code→my/scripts+my/artifacts、examples/custom→my/trading、run-configs→my/configs、docs/self→my/docs。跑实验标准姿势：cd my && ../.venv/bin/qrun configs/xxx.yaml。验证已过：import qlib 指向新位置、guard 套件 28/28、日历 2026-07-28、visualizer 重生成正常、mlruns mlflow 可读。
 
 ## 项目目标
 以 Qlib 为基础走向 A 股日频实盘：执行通道优先国金标准 QMT（迁移现有文件握手方案），终局目标正常日完全无人操作（PTrade 托管为候选终局路线）。

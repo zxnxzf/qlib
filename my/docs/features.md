@@ -1013,7 +1013,7 @@ git commit: feat: 实现 LiveTopkStrategy 小资金优化策略
 - 更新 `qlib/contrib/strategy/__init__.py` 导出
 - 修改 `examples/daily_predict.py` TradingConfig 添加字段
 - 修改 `examples/live_daily_predict.py` 配置和策略实例化
-- 更新文档 `docs/self/features.md`
+- 更新文档 `my/docs/features.md`
 
 ---
 
