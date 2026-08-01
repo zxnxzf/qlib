@@ -45,7 +45,7 @@ def main():
         pred.to_pickle(art / "pred.pkl")
         report.to_pickle(art / "portfolio_analysis" / "report_normal_1day.pkl")
         # label.pkl：visualizer 的 IC 图用 pred+label 现场算（与 SignalRecord 同构）
-        label_out = label.rename(columns={"label": "LABEL0"}).reindex(pred.index).dropna()
+        label_out = pred.join(label.rename(columns={"label": "LABEL0"}), how="inner")[["LABEL0"]].dropna()
         label_out.to_pickle(art / "label.pkl")
 
         # port_analysis（与 PortAnaRecord 同构）

@@ -63,7 +63,7 @@ description: 本项目的自动连跑策略研究员。当用户说"继续研究
 ## 第 4 层：产出（每实验固定四件+榜单）
 
 1. **mlflow 落档**：用 `my/scripts/exp_mlflow_log.py` 把实验（名=想法名）参数与各关指标写入 `my/mlruns/`
-2. **仪表板**：`my/scripts/build_faux_recorders.py` 风格打包 → `my/scripts/recorder_visualizer_from_path.py` 生成 `my/artifacts/faux_recorders/<实验名>/recorder_dashboard.html`
+2. **仪表板**：统一调用 `my/scripts/package_dashboard.py <实验名> <pred.pkl> <report.pkl>`（内部会调用用户的 recorder_visualizer_from_path.py 渲染），禁止在实验脚本里内联打包代码（曾因内联复制引入 label 索引 bug）
 3. **三行战报**（发给用户，不停机）：
    - 试了什么：假设一句话
    - 结果：各关得分 + 榜单变动（新榜首/第N名/未上榜）+ 仪表板路径
