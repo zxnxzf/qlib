@@ -2,7 +2,7 @@
 <!--
 更新: 2026-08-01
 核对基线:
-- qlib | 待本次重构提交后更新 HEAD | 仓库已上移至 /Users/bytedance/code/qlib（原外层壳路径）
+- qlib | HEAD 5f6ed372 | 工作区干净；仓库根=/Users/bytedance/code/qlib（历史段落中的旧路径 runs/.data/test_claude_code/examples/custom 均已迁入 my/，按"目录结构"节对照）
 代码与 Git 用于判断实现现状；用户最后确认的需求用于判断目标。
 -->
 
