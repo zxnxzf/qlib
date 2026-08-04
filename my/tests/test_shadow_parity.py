@@ -6,8 +6,12 @@ from my.quant.parity import (
     MarketCache,
     OrderSnapshot,
     compare_snapshots,
+    normalize_qlib_order,
+    position_to_holdings,
+    qlib_outputs_to_snapshots,
     run_shadow_replay,
     validate_snapshot_dates,
+    write_parity_artifacts,
 )
 
 
@@ -28,6 +32,10 @@ def test_equal_snapshots_have_full_parity():
     assert result.summary["cash_match_rate"] == 1.0
     assert result.summary["holding_match_rate"] == 1.0
     assert result.summary["order_match_rate"] == 1.0
+    assert result.summary["holding_exact_day_match_rate"] == 1.0
+    assert result.summary["order_exact_day_match_rate"] == 1.0
+    assert result.summary["qlib_total_return"] == 0.0
+    assert result.summary["shadow_total_return"] == 0.0
     assert result.daily_compare.loc[0, "nav_delta"] == 0.0
 
 
@@ -60,6 +68,23 @@ def test_snapshot_difference_is_located_by_date_and_stock():
     assert holding["shares_delta"] == -100
     assert order["shares_delta"] == -100
     assert result.daily_compare.loc[0, "nav_delta"] == -10.0
+
+
+def test_summary_counts_shadow_receipt_statuses():
+    qlib = DailySnapshot("2025-01-02", 100_000.0, 100_000.0, True, {}, [], {})
+    shadow = DailySnapshot(
+        "2025-01-02",
+        100_000.0,
+        100_000.0,
+        True,
+        {},
+        [],
+        {("SH600000", "buy"): "blocked_limit"},
+    )
+
+    result = compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
+
+    assert result.summary["shadow_receipt_status_counts"] == {"blocked_limit": 1}
 
 
 def test_missing_comparison_date_is_rejected():
@@ -97,6 +122,30 @@ def test_market_cache_returns_requested_fields():
 
     assert bars.columns.tolist() == ["close", "factor", "prev_close"]
     assert bars.loc["SH600000", "close"] == 10.2
+
+
+def test_market_cache_carries_last_factor_after_instrument_disappears():
+    index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2025-01-02"), "SZ300379"),
+            (pd.Timestamp("2025-01-03"), "SH600000"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    cache = MarketCache(
+        pd.DataFrame(
+            {
+                "open": [10.0, 8.0],
+                "close": [10.2, 8.1],
+                "volume": [1_000.0, 2_000.0],
+                "factor": [0.2, 0.5],
+                "prev_close": [9.8, 7.9],
+            },
+            index=index,
+        )
+    )
+
+    assert cache.factors_on("2025-01-03").loc["SZ300379"] == pytest.approx(0.2)
 
 
 def test_shadow_replay_uses_warmup_only_to_create_first_order(tmp_path):
@@ -146,3 +195,100 @@ def test_shadow_replay_uses_warmup_only_to_create_first_order(tmp_path):
     assert snapshots["2025-01-02"].receipts == {
         ("SH600000", "buy"): "filled"
     }
+
+
+def test_position_to_holdings_excludes_cash_fields():
+    class FakePosition:
+        def get_stock_list(self):
+            return ["SH600000"]
+
+        def get_stock_amount(self, code):
+            assert code == "SH600000"
+            return 1_000
+
+    assert position_to_holdings(FakePosition()) == {"SH600000": 1_000}
+
+
+def test_position_and_order_amounts_are_converted_to_raw_shares():
+    from qlib.backtest.decision import OrderDir
+
+    class FakePosition:
+        def get_stock_list(self):
+            return ["SH600000"]
+
+        def get_stock_amount(self, _code):
+            return 2_000
+
+    class FakeOrder:
+        stock_id = "SH600000"
+        direction = OrderDir.BUY
+        amount = 2_000
+        factor = None
+
+    factors = pd.Series({"SH600000": 0.5})
+
+    assert position_to_holdings(FakePosition(), factors) == {"SH600000": 1_000}
+    assert normalize_qlib_order(FakeOrder(), factor=0.5) == OrderSnapshot(
+        "SH600000", "buy", 1_000
+    )
+
+
+def test_qlib_buy_order_is_normalized():
+    from qlib.backtest.decision import OrderDir
+
+    class FakeOrder:
+        stock_id = "SH600000"
+        direction = OrderDir.BUY
+        amount = 1_000
+
+    assert normalize_qlib_order(FakeOrder()) == OrderSnapshot(
+        "SH600000", "buy", 1_000
+    )
+
+
+def test_artifact_writer_creates_all_required_files(tmp_path):
+    snap = DailySnapshot("2025-01-02", 100_000.0, 100_000.0, True, {}, [], {})
+    result = compare_snapshots({snap.date: snap}, {snap.date: snap})
+
+    write_parity_artifacts(
+        result,
+        tmp_path,
+        {"start": "2025-01-02", "end": "2026-07-28"},
+    )
+
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "daily_compare.csv",
+        "holdings_compare.csv",
+        "orders_compare.csv",
+        "summary.json",
+        "report.md",
+    }
+
+
+def test_qlib_outputs_are_converted_to_daily_snapshots():
+    date = pd.Timestamp("2025-01-02")
+
+    class FakePosition:
+        def get_stock_list(self):
+            return ["SH600000"]
+
+        def get_stock_amount(self, code):
+            assert code == "SH600000"
+            return 1_000
+
+    report = pd.DataFrame({"account": [100_100.0], "cash": [90_000.0]}, index=[date])
+    positions = {date: FakePosition()}
+    orders = {date: [OrderSnapshot("SH600000", "buy", 1_000)]}
+    gates = pd.Series([True], index=[date])
+
+    snapshots = qlib_outputs_to_snapshots(report, positions, orders, gates)
+
+    assert snapshots["2025-01-02"] == DailySnapshot(
+        "2025-01-02",
+        100_100.0,
+        90_000.0,
+        True,
+        {"SH600000": 1_000},
+        [OrderSnapshot("SH600000", "buy", 1_000)],
+        {},
+    )
