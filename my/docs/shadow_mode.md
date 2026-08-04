@@ -28,6 +28,9 @@ cd /Users/bytedance/code/qlib
 
 # 用归档预测对比影子回放与 Qlib 普通回测（默认1.5年）
 .venv/bin/python my/scripts/compare_shadow_backtest.py
+
+# 额外生成双方价格冲击都为0的严格成本控制报告
+.venv/bin/python my/scripts/compare_shadow_backtest.py --strict-cost-control
 ```
 
 工作日重训只在 23:00 后启动。回填账本写入 `my/quant_state/backfills/`，正式账本写入 `my/quant_state/`；两者不得混用，整个目录不会提交 Git。
@@ -62,7 +65,10 @@ cd /Users/bytedance/code/qlib
 - 首次分叉为2025-01-15：影子有6笔涨停禁买，Qlib `only_tradable=True` 会过滤并补选
 - 影子全期回执：filled=1449、blocked_limit=97、suspended=229、no_data=230、insufficient_cash=6
 
-结果说明当前影子路径更接近“前夜锁单、次日不补选”的真实执行，不等价于Qlib回测。最终版对Qlib复权股数按100股整手归一，订单差异分类为rounding_or_cost=487、execution_tradability=1941、initialization=0、unexplained=0；完整报告见 `my/artifacts/shadow_backtest_parity/full-20250102-20260728-v3/report.md`。
+- v5 生产语义报告：`rounding_or_cost=505`、`execution_tradability=556`、`selection_or_path_dependency=1382`；其中明确成交性回执为556条，涉及79只股票、217个交易日，不能把其余单边差异直接称为涨跌停/停牌
+- v5 严格成本控制（Qlib/影子价格冲击均为0）：Qlib期末144,630.01，影子126,959.83；用于隔离成本语义，不能当作生产绩效
+- 复权股数只在距离整手不超过2股时吸附，353、426等合法零股保持原值；运行前硬校验完整交易日、warmup为start前一交易日、每个执行日的T-1预测、门控和行情缓存
+- 完整生产报告见 `my/artifacts/shadow_backtest_parity/full-20250102-20260728-v5/report.md`，严格成本子报告见其 `strict_cost_control/report.md`
 
 ## 正式启用前检查
 

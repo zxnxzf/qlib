@@ -28,6 +28,7 @@ class DailySnapshot:
     holdings: Dict[str, int]
     orders: List[OrderSnapshot]
     receipts: Dict[Tuple[str, str], str]
+    signal_date: str = ""
 
 
 @dataclass
@@ -39,9 +40,12 @@ class ParityResult:
 
 
 def _raw_lot_shares(amount: float, factor: float) -> int:
-    """将复权股数还原并吸收日间 factor 微漂移，回到 A 股整手。"""
+    """还原原始股数，只吸收极小的 factor 浮点漂移。"""
     raw_shares = float(amount) * float(factor)
-    return int(round(raw_shares / C.LOT) * C.LOT)
+    nearest_lot = round(raw_shares / C.LOT) * C.LOT
+    if abs(raw_shares - nearest_lot) <= 2:
+        return int(nearest_lot)
+    return int(round(raw_shares))
 
 
 def position_to_holdings(position, factors: pd.Series = None) -> Dict[str, int]:
@@ -75,12 +79,17 @@ def qlib_outputs_to_snapshots(
     orders: dict,
     gate_by_exec_date: pd.Series,
     factor_cache=None,
+    signal_dates=None,
 ) -> Dict[str, DailySnapshot]:
     """将 Qlib 回测原始输出归一为逐日快照。"""
     normalized_positions = {pd.Timestamp(key).normalize(): value for key, value in positions.items()}
     normalized_orders = {pd.Timestamp(key).normalize(): value for key, value in orders.items()}
     normalized_gate = gate_by_exec_date.copy()
     normalized_gate.index = pd.to_datetime(normalized_gate.index).normalize()
+    normalized_signal_dates = {
+        pd.Timestamp(key).normalize(): pd.Timestamp(value).strftime("%Y-%m-%d")
+        for key, value in (signal_dates or {}).items()
+    }
 
     snapshots = {}
     for raw_date, row in report.iterrows():
@@ -103,6 +112,7 @@ def qlib_outputs_to_snapshots(
             ),
             orders=list(normalized_orders.get(timestamp, [])),
             receipts={},
+            signal_date=normalized_signal_dates.get(timestamp, ""),
         )
     return snapshots
 
@@ -113,6 +123,8 @@ def run_qlib_backtest(
     start: str,
     end: str,
     factor_cache=None,
+    signal_dates=None,
+    impact_cost=None,
 ) -> Dict[str, DailySnapshot]:
     """按锁定的 10 万门控参数运行 Qlib 引擎回测并录制订单。"""
     from qlib.contrib.evaluate import backtest_daily
@@ -123,11 +135,16 @@ def run_qlib_backtest(
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.recorded_orders = {}
+            self.recorded_signal_dates = {}
 
         def generate_trade_decision(self, execute_result=None):
             trade_step = self.trade_calendar.get_trade_step()
             trade_start, _ = self.trade_calendar.get_step_time(trade_step)
+            pred_start, _ = self.trade_calendar.get_step_time(trade_step, shift=1)
             decision = super().generate_trade_decision(execute_result)
+            self.recorded_signal_dates[pd.Timestamp(trade_start).normalize()] = pd.Timestamp(
+                pred_start
+            ).strftime("%Y-%m-%d")
             self.recorded_orders[pd.Timestamp(trade_start).normalize()] = []
             for order in decision.get_decision():
                 factor = self.trade_exchange.get_factor(
@@ -161,7 +178,7 @@ def run_qlib_backtest(
             "open_cost": C.OPEN_COST,
             "close_cost": C.CLOSE_COST,
             "min_cost": C.MIN_COST,
-            "impact_cost": C.IMPACT_COST,
+            "impact_cost": C.IMPACT_COST if impact_cost is None else impact_cost,
         },
     )
     return qlib_outputs_to_snapshots(
@@ -170,6 +187,7 @@ def run_qlib_backtest(
         strategy.recorded_orders,
         gate_by_exec_date,
         factor_cache=factor_cache,
+        signal_dates=signal_dates or strategy.recorded_signal_dates,
     )
 
 
@@ -228,11 +246,13 @@ def write_parity_artifacts(result: ParityResult, output_dir: Path, metadata: dic
 
 ## 订单差异分类
 
-{class_text}。每类最多列出5个样例：
+{class_text}。其中直接有成交性回执证据的事件为 {result.summary['direct_tradability_events']} 条，涉及 {result.summary['direct_tradability_unique_stocks']} 只股票、{result.summary['direct_tradability_dates']} 个交易日；其余单边差异保守归为选股/路径依赖，不等同于已证明的涨跌停或停牌原因。每类最多列出5个样例：
 
 {examples_text}
 
-Qlib 在执行日可见当日可交易状态并可替补候选；影子模式在前一晚按当日收盘价锁定订单与股数，次日开盘不替补。Qlib 的 `impact_cost` 是按成交额占市场成交量的平方缩放后计入费用，影子路径则把0.1%固定加减在成交价上，所以净值差不能只归因于 `only_tradable`。
+成本模式：{metadata.get('cost_mode', 'production_semantics')}。Qlib 在执行日可见当日可交易状态并可替补候选；影子模式在前一晚按当日收盘价锁定订单与股数，次日开盘不替补。
+
+在生产语义模式下，Qlib 的 `impact_cost` 是按成交额占市场成交量的平方缩放后计入费用，影子路径则把固定滑点加减在成交价上，所以净值差不能只归因于 `only_tradable`。严格成本控制子报告将双方价格冲击都置零，仅用于隔离选股/执行路径差异，不能当作生产绩效。
 
 本报告是这两条真实路径的黑盒对比，不使用兼容模式强行抹平差异。
 
@@ -370,12 +390,12 @@ def _classify_order_row(row: pd.Series, first_date: str) -> str:
         return ""
     if row["shadow_status"] in {"blocked_limit", "suspended", "no_data"}:
         return "execution_tradability"
+    if row["shadow_status"] == "insufficient_cash":
+        return "rounding_or_cost"
     if int(row["qlib_shares"]) > 0 and int(row["shadow_shares"]) > 0:
         return "rounding_or_cost"
-    if row["date"] == first_date:
-        return "initialization"
     if int(row["qlib_shares"]) == 0 or int(row["shadow_shares"]) == 0:
-        return "execution_tradability"
+        return "selection_or_path_dependency"
     return "unexplained"
 
 
@@ -440,6 +460,11 @@ def compare_snapshots(
             raise ValueError(
                 f"{date} 门控不一致: qlib={qlib_snap.gate_on}, shadow={shadow_snap.gate_on}"
             )
+        if qlib_snap.signal_date != shadow_snap.signal_date:
+            raise ValueError(
+                f"{date} 信号日期不一致: qlib={qlib_snap.signal_date}, "
+                f"shadow={shadow_snap.signal_date}"
+            )
         nav_delta = float(shadow_snap.nav) - float(qlib_snap.nav)
         cash_delta = float(shadow_snap.cash) - float(qlib_snap.cash)
         daily_rows.append(
@@ -485,9 +510,9 @@ def compare_snapshots(
         ],
     )
     categories = [
-        "initialization",
         "rounding_or_cost",
         "execution_tradability",
+        "selection_or_path_dependency",
         "unexplained",
     ]
     first_date = min(qlib_dates) if qlib_dates else ""
@@ -537,6 +562,15 @@ def compare_snapshots(
             for category in categories
         },
         "mismatch_examples": _mismatch_examples(orders, categories),
+        "direct_tradability_events": int(
+            (orders["classification"] == "execution_tradability").sum()
+        ),
+        "direct_tradability_unique_stocks": int(
+            orders.loc[orders["classification"] == "execution_tradability", "code"].nunique()
+        ),
+        "direct_tradability_dates": int(
+            orders.loc[orders["classification"] == "execution_tradability", "date"].nunique()
+        ),
         "qlib_total_return": qlib_nav_metrics["total_return"],
         "qlib_annualized_return": qlib_nav_metrics["annualized_return"],
         "qlib_max_drawdown": qlib_nav_metrics["max_drawdown"],
@@ -557,6 +591,56 @@ def _scores_on(pred: pd.Series, date: str) -> pd.Series:
     scores = scores.copy()
     scores.name = "score"
     return scores
+
+
+def validate_replay_inputs(
+    pred: pd.Series,
+    gate_by_exec_date: pd.Series,
+    cache: MarketCache,
+    calendar_days: List[str],
+    warmup: str,
+    start: str,
+    end: str,
+) -> Dict[str, str]:
+    """在运行前锁定交易日、门控、行情和执行日对应的 T-1 预测。"""
+    calendar = [pd.Timestamp(day).strftime("%Y-%m-%d") for day in calendar_days]
+    if start not in calendar or end not in calendar or start > end:
+        raise ValueError(f"对比区间不是完整交易日区间: {start}~{end}")
+    start_index = calendar.index(start)
+    end_index = calendar.index(end)
+    if start_index == 0 or calendar[start_index - 1] != warmup:
+        raise ValueError("预热日必须是 start 的前一交易日")
+    expected_dates = calendar[start_index : end_index + 1]
+
+    gate = gate_by_exec_date.copy()
+    gate.index = pd.to_datetime(gate.index).normalize()
+    for date in expected_dates:
+        timestamp = pd.Timestamp(date)
+        if timestamp not in gate.index or pd.isna(gate.loc[timestamp]):
+            raise ValueError(f"门控缺少或为空: {date}")
+
+    pred_dates = set(
+        pd.to_datetime(pred.index.get_level_values("datetime"))
+        .normalize()
+        .strftime("%Y-%m-%d")
+    )
+    cache_dates = set(
+        pd.to_datetime(cache.frame.index.get_level_values("datetime"))
+        .normalize()
+        .strftime("%Y-%m-%d")
+    )
+    signal_dates = {}
+    for index, exec_date in enumerate(expected_dates, start=start_index):
+        signal_date = calendar[index - 1]
+        signal_dates[exec_date] = signal_date
+        if signal_date not in pred_dates:
+            raise ValueError(f"预测缺少信号日: {signal_date}")
+        if signal_date not in cache_dates or exec_date not in cache_dates:
+            missing = signal_date if signal_date not in cache_dates else exec_date
+            raise ValueError(f"行情缓存缺少日期: {missing}")
+    if warmup not in cache_dates:
+        raise ValueError(f"行情缓存缺少日期: {warmup}")
+    return signal_dates
 
 
 def _receipt_statuses(state_dir: Path, exec_date: str) -> Dict[Tuple[str, str], str]:
@@ -580,6 +664,7 @@ def run_shadow_replay(
     start: str,
     end: str,
     state_dir: Path,
+    impact_cost=None,
     log=print,
 ) -> Dict[str, DailySnapshot]:
     """用归档预测和缓存行情驱动现有 nightly，返回正式比较区间快照。"""
@@ -593,12 +678,18 @@ def run_shadow_replay(
     calendar_days = [day for day in data.calendar() if warmup <= day <= end]
     if not calendar_days or calendar_days[0] != warmup:
         raise ValueError(f"预热日期不是有效交易日: {warmup}")
+    if start not in calendar_days:
+        raise ValueError(f"开始日期不是有效交易日: {start}")
+    start_index = calendar_days.index(start)
+    if start_index == 0 or calendar_days[start_index - 1] != warmup:
+        raise ValueError("预热日必须是 start 的前一交易日")
 
     original_state_dir = C.STATE_DIR
     original_day_bars = data.day_bars
     original_latest_data_date = data.latest_data_date
     original_scores_for = signal_.scores_for
     original_gate_for_next_day = gate.gate_for_next_day
+    original_impact_cost = C.IMPACT_COST
 
     def cached_scores(date: str, log=print) -> pd.Series:
         scores = _scores_on(pred, date)
@@ -615,6 +706,8 @@ def run_shadow_replay(
     snapshots: Dict[str, DailySnapshot] = {}
     try:
         C.STATE_DIR = state_dir
+        if impact_cost is not None:
+            C.IMPACT_COST = float(impact_cost)
         data.day_bars = cache.day_bars
         data.latest_data_date = lambda: cache.latest_date
         signal_.scores_for = cached_scores
@@ -634,6 +727,7 @@ def run_shadow_replay(
                 holdings={code: int(shares) for code, shares in state["holdings"].items()},
                 orders=[OrderSnapshot(order.code, order.side, int(order.shares)) for order in orders],
                 receipts=_receipt_statuses(state_dir, date),
+                signal_date=calendar_days[calendar_days.index(date) - 1],
             )
     finally:
         C.STATE_DIR = original_state_dir
@@ -641,4 +735,5 @@ def run_shadow_replay(
         data.latest_data_date = original_latest_data_date
         signal_.scores_for = original_scores_for
         gate.gate_for_next_day = original_gate_for_next_day
+        C.IMPACT_COST = original_impact_cost
     return snapshots

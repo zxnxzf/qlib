@@ -229,11 +229,12 @@ cd /Users/bytedance/code/qlib && .venv/bin/python my/scripts/shadow_run.py night
   - SH000985 中证全指断更问题定位（7-06 起）
   - update_data 整目录替换抹掉 all_no_bj.txt → 加 `_rebuild_pool_file()` 自动重建
 - ✅ 影子核心补齐旧数据停摆、同日/倒序幂等、资金不足、超卖、卖单重试去重、停牌最近价持久化和回填账本隔离
-- ✅ `my/tests/test_shadow_core.py` + `my/tests/test_shadow_parity.py` 共31 项通过（含合成两日闭环、factor 微漂移整手归一和差异分类）
+- ✅ `my/tests/test_shadow_core.py` + `my/tests/test_shadow_parity.py` 共45 项通过（含合成两日闭环、factor 微漂移保护、差异分类、T-1 输入硬校验和 Qlib 适配器注入测试）
 - ✅ 用归档同口径预测 + 真实行情完成 2026-07-20~07-28 隔离回填烟测：7个交易日、一次16只建仓和次日清仓、32笔回执全部 filled、无负现金/残仓/重复净值，终值 100,110.27 元
 - ✅ 新增 `parity.py` 和 `compare_shadow_backtest.py`，完成影子回放、Qlib引擎录制和五份对账产物
-- ✅ 2025-01-02~2026-07-28 共379个交易日完整对账：Qlib期末144,631.46（+44.63%，MDD -16.29%），影子121,248.55（+21.25%，MDD -24.22%）；差异分类为rounding_or_cost=487、execution_tradability=1941，报告 `my/artifacts/shadow_backtest_parity/full-20250102-20260728-v3/report.md`
-- ✅ 首次分叉定位到2025-01-15：影子有6笔涨停禁买，Qlib `only_tradable=True` 可过滤并补选；全区间另有229笔suspended、230笔no_data
+- ✅ 2025-01-02~2026-07-28 共379个交易日完整对账：生产语义 Qlib期末144,631.46（+44.63%，MDD -16.29%），影子121,248.55（+21.25%，MDD -24.22%）；v5 分类为 rounding_or_cost=505、execution_tradability=556、selection_or_path_dependency=1382，报告 `my/artifacts/shadow_backtest_parity/full-20250102-20260728-v5/report.md`
+- ✅ 同一输入的严格成本控制（双方价格冲击=0）期末 Qlib 144,630.01、影子126,959.83；成本语义只解释约5,711元差异，其余主要是执行/路径差异
+- ✅ 首次分叉定位到2025-01-15：影子有6笔涨停禁买，Qlib `only_tradable=True` 可过滤并补选；明确成交性回执事件共556条（79只股票、217个交易日），其余单边差异保守标成路径依赖
 
 ### 还没做（Codex 接手的第一优先级）
 1. **先拍板执行语义**：建议影子/QMT前夜输出排名候选，执行日用实时行情过滤、按当日价重算股数并补选；否则不得以Qlib回测绩效作为实盘预期

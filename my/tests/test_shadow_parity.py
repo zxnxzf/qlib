@@ -1,6 +1,7 @@
 import pandas as pd
 import pytest
 
+import my.quant.parity as parity
 from my.quant.parity import (
     DailySnapshot,
     MarketCache,
@@ -115,6 +116,50 @@ def test_blocked_shadow_order_is_classified_with_stock_example():
     ]
 
 
+def test_insufficient_cash_is_classified_as_sizing_or_cost():
+    qlib = DailySnapshot("2025-01-02", 100_000.0, 100_000.0, True, {}, [], {})
+    shadow = DailySnapshot(
+        "2025-01-02",
+        100_000.0,
+        100_000.0,
+        True,
+        {},
+        [OrderSnapshot("SH600000", "buy", 1_000)],
+        {("SH600000", "buy"): "insufficient_cash"},
+    )
+
+    result = compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
+
+    assert result.orders_compare.loc[0, "classification"] == "rounding_or_cost"
+
+
+@pytest.mark.parametrize("shadow_status", ["", "filled"])
+def test_one_sided_order_without_direct_block_evidence_is_path_dependency(shadow_status):
+    qlib = DailySnapshot(
+        "2025-01-03",
+        100_000.0,
+        90_000.0,
+        True,
+        {"SH600000": 1_000},
+        [],
+        {},
+    )
+    receipts = {("SZ000001", "buy"): shadow_status} if shadow_status else {}
+    shadow = DailySnapshot(
+        "2025-01-03",
+        100_000.0,
+        90_000.0,
+        True,
+        {"SZ000001": 1_000},
+        [OrderSnapshot("SZ000001", "buy", 1_000)],
+        receipts,
+    )
+
+    result = compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
+
+    assert result.orders_compare.loc[0, "classification"] == "selection_or_path_dependency"
+
+
 def test_missing_comparison_date_is_rejected():
     with pytest.raises(ValueError, match="缺少日期"):
         validate_snapshot_dates({}, ["2025-01-02", "2025-01-03"])
@@ -225,6 +270,42 @@ def test_shadow_replay_uses_warmup_only_to_create_first_order(tmp_path):
     }
 
 
+def test_shadow_replay_can_disable_price_impact_for_cost_control(tmp_path):
+    dates = [pd.Timestamp("2024-12-31"), pd.Timestamp("2025-01-02")]
+    index = pd.MultiIndex.from_product(
+        [dates, ["SH600000"]], names=["datetime", "instrument"]
+    )
+    cache = MarketCache(
+        pd.DataFrame(
+            {
+                "open": [10.0, 10.0],
+                "close": [10.0, 10.0],
+                "volume": [1_000.0, 1_000.0],
+                "factor": [1.0, 1.0],
+                "prev_close": [9.9, 10.0],
+            },
+            index=index,
+        )
+    )
+    pred = pd.Series(1.0, index=index, name="score")
+    gates = pd.Series([True, True], index=pd.to_datetime(["2025-01-02", "2025-01-03"]))
+
+    run_shadow_replay(
+        pred=pred,
+        gate_by_exec_date=gates,
+        cache=cache,
+        warmup="2024-12-31",
+        start="2025-01-02",
+        end="2025-01-02",
+        state_dir=tmp_path,
+        impact_cost=0.0,
+        log=lambda _msg: None,
+    )
+
+    receipt = pd.read_csv(tmp_path / "receipts" / "2025-01-02.csv")
+    assert receipt.loc[0, "price"] == pytest.approx(10.0)
+
+
 def test_position_to_holdings_excludes_cash_fields():
     class FakePosition:
         def get_stock_list(self):
@@ -273,6 +354,23 @@ def test_factor_drift_is_rounded_back_to_a_share_lot():
     assert position_to_holdings(
         FakePosition(), pd.Series({"SH600000": 0.4995})
     ) == {"SH600000": 1_000}
+
+
+@pytest.mark.parametrize(
+    ("amount", "expected"),
+    [(999, 1_000), (1_101, 1_100), (353, 353), (426, 426)],
+)
+def test_only_tiny_factor_drift_is_absorbed_into_a_share_lot(amount, expected):
+    class FakePosition:
+        def get_stock_list(self):
+            return ["SH600000"]
+
+        def get_stock_amount(self, _code):
+            return amount
+
+    assert position_to_holdings(
+        FakePosition(), pd.Series({"SH600000": 1.0})
+    ) == {"SH600000": expected}
 
 
 def test_qlib_buy_order_is_normalized():
@@ -324,7 +422,13 @@ def test_qlib_outputs_are_converted_to_daily_snapshots():
     orders = {date: [OrderSnapshot("SH600000", "buy", 1_000)]}
     gates = pd.Series([True], index=[date])
 
-    snapshots = qlib_outputs_to_snapshots(report, positions, orders, gates)
+    snapshots = qlib_outputs_to_snapshots(
+        report,
+        positions,
+        orders,
+        gates,
+        signal_dates={date: "2024-12-31"},
+    )
 
     assert snapshots["2025-01-02"] == DailySnapshot(
         "2025-01-02",
@@ -334,4 +438,169 @@ def test_qlib_outputs_are_converted_to_daily_snapshots():
         {"SH600000": 1_000},
         [OrderSnapshot("SH600000", "buy", 1_000)],
         {},
+        "2024-12-31",
     )
+
+
+def test_signal_date_mismatch_is_a_hard_error():
+    qlib = DailySnapshot(
+        "2025-01-02", 100_000.0, 100_000.0, True, {}, [], {}, "2024-12-31"
+    )
+    shadow = DailySnapshot(
+        "2025-01-02", 100_000.0, 100_000.0, True, {}, [], {}, "2024-12-30"
+    )
+
+    with pytest.raises(ValueError, match="信号日期不一致"):
+        compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
+
+
+def _validation_cache(dates):
+    index = pd.MultiIndex.from_product(
+        [pd.to_datetime(dates), ["SH600000"]],
+        names=["datetime", "instrument"],
+    )
+    return MarketCache(
+        pd.DataFrame(
+            {
+                "open": 10.0,
+                "close": 10.0,
+                "volume": 1_000.0,
+                "factor": 1.0,
+                "prev_close": 9.9,
+            },
+            index=index,
+        )
+    )
+
+
+def test_replay_inputs_require_prediction_for_every_previous_trade_day():
+    calendar = ["2024-12-31", "2025-01-02", "2025-01-03"]
+    pred_index = pd.MultiIndex.from_product(
+        [[pd.Timestamp("2024-12-31")], ["SH600000"]],
+        names=["datetime", "instrument"],
+    )
+    pred = pd.Series([1.0], index=pred_index)
+    gates = pd.Series(
+        [True, False],
+        index=pd.to_datetime(["2025-01-02", "2025-01-03"]),
+    )
+
+    with pytest.raises(ValueError, match="预测缺少信号日: 2025-01-02"):
+        parity.validate_replay_inputs(
+            pred,
+            gates,
+            _validation_cache(calendar),
+            calendar,
+            warmup="2024-12-31",
+            start="2025-01-02",
+            end="2025-01-03",
+        )
+
+
+def test_replay_inputs_require_warmup_to_be_previous_trade_day():
+    calendar = ["2024-12-30", "2024-12-31", "2025-01-02"]
+    pred_index = pd.MultiIndex.from_product(
+        [pd.to_datetime(calendar), ["SH600000"]],
+        names=["datetime", "instrument"],
+    )
+    pred = pd.Series(1.0, index=pred_index)
+    gates = pd.Series([True], index=[pd.Timestamp("2025-01-02")])
+
+    with pytest.raises(ValueError, match="预热日必须是 start 的前一交易日"):
+        parity.validate_replay_inputs(
+            pred,
+            gates,
+            _validation_cache(calendar),
+            calendar,
+            warmup="2024-12-30",
+            start="2025-01-02",
+            end="2025-01-02",
+        )
+
+
+def test_replay_inputs_reject_missing_or_empty_gate_values():
+    calendar = ["2024-12-31", "2025-01-02"]
+    pred_index = pd.MultiIndex.from_product(
+        [[pd.Timestamp("2024-12-31")], ["SH600000"]],
+        names=["datetime", "instrument"],
+    )
+    pred = pd.Series([1.0], index=pred_index)
+    gates = pd.Series([float("nan")], index=[pd.Timestamp("2025-01-02")])
+
+    with pytest.raises(ValueError, match="门控缺少或为空: 2025-01-02"):
+        parity.validate_replay_inputs(
+            pred,
+            gates,
+            _validation_cache(calendar),
+            calendar,
+            warmup="2024-12-31",
+            start="2025-01-02",
+            end="2025-01-02",
+        )
+
+
+def test_qlib_adapter_passes_locked_execution_semantics(monkeypatch):
+    import qlib.contrib.evaluate
+
+    date = pd.Timestamp("2025-01-02")
+    captured = {}
+
+    class FakePosition:
+        def get_stock_list(self):
+            return []
+
+    def fake_backtest_daily(**kwargs):
+        captured.update(kwargs)
+        strategy = kwargs["strategy"]
+        strategy.recorded_signal_dates[date] = "2024-12-31"
+        return (
+            pd.DataFrame({"account": [100_000.0], "cash": [100_000.0]}, index=[date]),
+            {date: FakePosition()},
+        )
+
+    monkeypatch.setattr(qlib.contrib.evaluate, "backtest_daily", fake_backtest_daily)
+    pred_index = pd.MultiIndex.from_product(
+        [[pd.Timestamp("2024-12-31")], ["SH600000"]],
+        names=["datetime", "instrument"],
+    )
+    pred = pd.Series([1.0], index=pred_index)
+    gates = pd.Series([True], index=[date])
+
+    snapshots = parity.run_qlib_backtest(
+        pred,
+        gates,
+        "2025-01-02",
+        "2025-01-02",
+        impact_cost=0.0,
+    )
+
+    assert captured["start_time"] == "2025-01-02"
+    assert captured["end_time"] == "2025-01-02"
+    assert captured["exchange_kwargs"]["deal_price"] == "open"
+    assert captured["exchange_kwargs"]["impact_cost"] == 0.0
+    assert captured["strategy"].only_tradable is True
+    assert snapshots["2025-01-02"].signal_date == "2024-12-31"
+
+
+def test_reproducibility_metadata_contains_input_hash_and_cost_semantics(tmp_path):
+    from my.scripts.compare_shadow_backtest import build_repro_metadata
+
+    prediction = tmp_path / "pred.pkl"
+    prediction.write_bytes(b"prediction-input")
+    cache = _validation_cache(["2024-12-31", "2025-01-02"])
+
+    metadata = build_repro_metadata(
+        start="2025-01-02",
+        end="2025-01-02",
+        warmup="2024-12-31",
+        prediction_path=prediction,
+        state_dir=tmp_path / "state",
+        cache=cache,
+        cost_mode="strict_zero_impact_control",
+    )
+
+    assert metadata["prediction_sha256"]
+    assert metadata["market_latest_date"] == "2025-01-02"
+    assert metadata["cost_mode"] == "strict_zero_impact_control"
+    assert metadata["qlib_impact_cost"] == 0.0
+    assert metadata["shadow_price_impact"] == 0.0

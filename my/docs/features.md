@@ -1381,7 +1381,7 @@ git commit: feat: 实盘交易系统优化 - Phase1/Phase2 分离与成本优化
 - `summary.json`
 - `report.md`
 
-完整结果位于 `my/artifacts/shadow_backtest_parity/full-20250102-20260728-v3/`：
+完整生产语义结果位于 `my/artifacts/shadow_backtest_parity/full-20250102-20260728-v5/`，严格成本控制结果位于其 `strict_cost_control/`：
 
 | 指标 | Qlib | 影子回放 |
 |---|---:|---:|
@@ -1390,13 +1390,13 @@ git commit: feat: 实盘交易系统优化 - Phase1/Phase2 分离与成本优化
 | 年化收益 | +26.08% | +12.86% |
 | 最大回撤 | -16.29% | -24.22% |
 
-两边门控的282个在场日/97个离场日完全一致，首次订单和持仓分叉均为 2025-01-15。当日影子路径有6笔涨停禁买；Qlib 会在执行日过滤不可交易候选并补选，影子路径不补选，之后持仓和收益因路径依赖继续分化。全区间影子回执为 filled=1449、blocked_limit=97、suspended=229、no_data=230、insufficient_cash=6。
+两边门控的282个在场日/97个离场日完全一致，首次订单和持仓分叉均为 2025-01-15。当日影子路径有6笔涨停禁买；Qlib 会在执行日过滤不可交易候选并补选，影子路径不补选，之后持仓和收益因路径依赖继续分化。生产语义全区间影子回执为 filled=1449、blocked_limit=97、suspended=229、no_data=230、insufficient_cash=6；订单分类为 rounding_or_cost=505、execution_tradability=556、selection_or_path_dependency=1382。严格成本控制（双方价格冲击均为0）影子期末为126,959.83，生产语义影子期末为121,248.55，说明固定滑点/impact语义约造成5,711元差异，但不是全部差异来源。
 
 这证明影子模式的计算与普通回测并不等价：前者更接近“盘后产生订单、次日执行”的现实链路，后者使用执行日已知可交易性并按执行价计算数量。两边还有成本语义差异：Qlib `impact_cost` 按成交额/市场成交量平方缩放成费用，影子固定按成交价±0.1%。在接 QMT 前，需要拍板是否输出备选候选并在开盘按实时行情重算数量，而不应把 Qlib 回测数字直接当成可实现实盘绩效。
 
-**验证**: `my/tests/test_shadow_core.py` + `my/tests/test_shadow_parity.py` 共31项通过；三次完整执行的两边期末净值一致，最终版额外消除了复权因子微漂移导致的非整手假差异。
+**验证**: `my/tests/test_shadow_core.py` + `my/tests/test_shadow_parity.py` 共45项通过；完整生产语义和严格成本控制两次执行均可重复，最终版额外增加了 T-1 信号日期/输入硬校验、Qlib 适配器注入测试和合法零股保护。
 
-**Git 提交**: `a5a99963 feat: compare shadow replay with qlib backtest`
+**Git 提交**: `d3c9f5f0 feat: add shadow trading core` 及后续 parity 修复提交
 
 ---
 
