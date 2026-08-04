@@ -1,9 +1,12 @@
+import pandas as pd
 import pytest
 
 from my.quant.parity import (
     DailySnapshot,
+    MarketCache,
     OrderSnapshot,
     compare_snapshots,
+    run_shadow_replay,
     validate_snapshot_dates,
 )
 
@@ -70,3 +73,76 @@ def test_gate_mismatch_is_reported_as_hard_error():
 
     with pytest.raises(ValueError, match="门控不一致"):
         compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
+
+
+def test_market_cache_returns_requested_fields():
+    index = pd.MultiIndex.from_tuples(
+        [(pd.Timestamp("2025-01-02"), "SH600000")],
+        names=["datetime", "instrument"],
+    )
+    cache = MarketCache(
+        pd.DataFrame(
+            {
+                "open": [10.0],
+                "close": [10.2],
+                "volume": [1_000.0],
+                "factor": [1.0],
+                "prev_close": [9.8],
+            },
+            index=index,
+        )
+    )
+
+    bars = cache.day_bars("2025-01-02", fields=("$close", "$factor"))
+
+    assert bars.columns.tolist() == ["close", "factor", "prev_close"]
+    assert bars.loc["SH600000", "close"] == 10.2
+
+
+def test_shadow_replay_uses_warmup_only_to_create_first_order(tmp_path):
+    dates = [pd.Timestamp("2024-12-31"), pd.Timestamp("2025-01-02")]
+    instruments = ["SH600000"]
+    index = pd.MultiIndex.from_product(
+        [dates, instruments], names=["datetime", "instrument"]
+    )
+    cache = MarketCache(
+        pd.DataFrame(
+            {
+                "open": [10.0, 10.0],
+                "close": [10.0, 10.2],
+                "volume": [1_000.0, 1_000.0],
+                "factor": [1.0, 1.0],
+                "prev_close": [9.9, 10.0],
+            },
+            index=index,
+        )
+    )
+    pred = pd.Series(
+        [1.0, 1.0],
+        index=index,
+        name="score",
+    )
+    gates = pd.Series(
+        [True, True],
+        index=[pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03")],
+    )
+
+    snapshots = run_shadow_replay(
+        pred=pred,
+        gate_by_exec_date=gates,
+        cache=cache,
+        warmup="2024-12-31",
+        start="2025-01-02",
+        end="2025-01-02",
+        state_dir=tmp_path,
+        log=lambda _msg: None,
+    )
+
+    assert list(snapshots) == ["2025-01-02"]
+    assert snapshots["2025-01-02"].holdings == {"SH600000": 9_500}
+    assert snapshots["2025-01-02"].orders == [
+        OrderSnapshot("SH600000", "buy", 9_500)
+    ]
+    assert snapshots["2025-01-02"].receipts == {
+        ("SH600000", "buy"): "filled"
+    }
