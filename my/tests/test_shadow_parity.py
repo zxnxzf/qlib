@@ -67,6 +67,7 @@ def test_snapshot_difference_is_located_by_date_and_stock():
     assert holding["code"] == "SH600000"
     assert holding["shares_delta"] == -100
     assert order["shares_delta"] == -100
+    assert order["classification"] == "rounding_or_cost"
     assert result.daily_compare.loc[0, "nav_delta"] == -10.0
 
 
@@ -85,6 +86,33 @@ def test_summary_counts_shadow_receipt_statuses():
     result = compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
 
     assert result.summary["shadow_receipt_status_counts"] == {"blocked_limit": 1}
+
+
+def test_blocked_shadow_order_is_classified_with_stock_example():
+    qlib = DailySnapshot("2025-01-02", 100_000.0, 100_000.0, True, {}, [], {})
+    shadow = DailySnapshot(
+        "2025-01-02",
+        100_000.0,
+        100_000.0,
+        True,
+        {},
+        [OrderSnapshot("SH600000", "buy", 1_000)],
+        {("SH600000", "buy"): "blocked_limit"},
+    )
+
+    result = compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
+
+    assert result.orders_compare.loc[0, "classification"] == "execution_tradability"
+    assert result.summary["order_mismatch_class_counts"]["execution_tradability"] == 1
+    assert result.summary["mismatch_examples"]["execution_tradability"] == [
+        {
+            "date": "2025-01-02",
+            "code": "SH600000",
+            "side": "buy",
+            "shares_delta": 1_000,
+            "shadow_status": "blocked_limit",
+        }
+    ]
 
 
 def test_missing_comparison_date_is_rejected():
@@ -233,6 +261,20 @@ def test_position_and_order_amounts_are_converted_to_raw_shares():
     )
 
 
+def test_factor_drift_is_rounded_back_to_a_share_lot():
+    class FakePosition:
+        def get_stock_list(self):
+            return ["SH600000"]
+
+        def get_stock_amount(self, _code):
+            return 2_000
+
+    # 2000 * 0.4995 = 999; Qlib's trade unit is still one 100-share lot.
+    assert position_to_holdings(
+        FakePosition(), pd.Series({"SH600000": 0.4995})
+    ) == {"SH600000": 1_000}
+
+
 def test_qlib_buy_order_is_normalized():
     from qlib.backtest.decision import OrderDir
 
@@ -263,6 +305,7 @@ def test_artifact_writer_creates_all_required_files(tmp_path):
         "summary.json",
         "report.md",
     }
+    assert "Qlib 的 `impact_cost`" in (tmp_path / "report.md").read_text()
 
 
 def test_qlib_outputs_are_converted_to_daily_snapshots():

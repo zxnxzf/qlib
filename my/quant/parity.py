@@ -38,6 +38,12 @@ class ParityResult:
     summary: dict
 
 
+def _raw_lot_shares(amount: float, factor: float) -> int:
+    """将复权股数还原并吸收日间 factor 微漂移，回到 A 股整手。"""
+    raw_shares = float(amount) * float(factor)
+    return int(round(raw_shares / C.LOT) * C.LOT)
+
+
 def position_to_holdings(position, factors: pd.Series = None) -> Dict[str, int]:
     """将 Qlib Position 转为仅含股票的持仓快照。"""
     holdings = {}
@@ -47,7 +53,7 @@ def position_to_holdings(position, factors: pd.Series = None) -> Dict[str, int]:
             if code not in factors.index or pd.isna(factors.loc[code]):
                 raise ValueError(f"Qlib 持仓缺少复权因子: {code}")
             factor = float(factors.loc[code])
-        shares = int(round(float(position.get_stock_amount(code)) * factor))
+        shares = _raw_lot_shares(position.get_stock_amount(code), factor)
         if shares:
             holdings[str(code)] = shares
     return holdings
@@ -60,9 +66,7 @@ def normalize_qlib_order(order, factor: float = None) -> OrderSnapshot:
     side = "buy" if order.direction == OrderDir.BUY else "sell"
     factor = factor if factor is not None else getattr(order, "factor", None)
     factor = 1.0 if factor is None else float(factor)
-    return OrderSnapshot(
-        str(order.stock_id), side, int(round(float(order.amount) * factor))
-    )
+    return OrderSnapshot(str(order.stock_id), side, _raw_lot_shares(order.amount, factor))
 
 
 def qlib_outputs_to_snapshots(
@@ -183,6 +187,18 @@ def write_parity_artifacts(result: ParityResult, output_dir: Path, metadata: dic
     )
     statuses = result.summary["shadow_receipt_status_counts"]
     status_text = "、".join(f"{key}={value}" for key, value in statuses.items()) or "无回执"
+    class_counts = result.summary["order_mismatch_class_counts"]
+    class_text = "、".join(f"{key}={value}" for key, value in class_counts.items())
+    example_lines = []
+    for category, examples in result.summary["mismatch_examples"].items():
+        if not examples:
+            continue
+        formatted = "；".join(
+            f"{item['date']} {item['code']} {item['side']} Δ{item['shares_delta']} ({item['shadow_status'] or '-'})"
+            for item in examples
+        )
+        example_lines.append(f"- {category}：{formatted}")
+    examples_text = "\n".join(example_lines) or "- 无订单差异"
     report = f"""# 影子回放 vs Qlib 普通回测
 
 区间：{metadata.get('start', '')} 至 {metadata.get('end', '')}，共 {result.summary['daily_rows']} 个交易日。
@@ -210,7 +226,15 @@ def write_parity_artifacts(result: ParityResult, output_dir: Path, metadata: dic
 
 {status_text}。
 
-Qlib 在执行日可见当日可交易状态并可替补候选；影子模式在前一晚按当日收盘价锁定订单与股数，次日开盘不替补。本报告是这两条真实路径的黑盒对比，不使用兼容模式强行抹平差异。
+## 订单差异分类
+
+{class_text}。每类最多列出5个样例：
+
+{examples_text}
+
+Qlib 在执行日可见当日可交易状态并可替补候选；影子模式在前一晚按当日收盘价锁定订单与股数，次日开盘不替补。Qlib 的 `impact_cost` 是按成交额占市场成交量的平方缩放后计入费用，影子路径则把0.1%固定加减在成交价上，所以净值差不能只归因于 `only_tradable`。
+
+本报告是这两条真实路径的黑盒对比，不使用兼容模式强行抹平差异。
 
 明细见 `daily_compare.csv`、`holdings_compare.csv` 和 `orders_compare.csv`。
 """
@@ -341,6 +365,37 @@ def _match_rate(frame: pd.DataFrame) -> float:
     return float(frame["match"].mean())
 
 
+def _classify_order_row(row: pd.Series, first_date: str) -> str:
+    if bool(row["match"]):
+        return ""
+    if row["shadow_status"] in {"blocked_limit", "suspended", "no_data"}:
+        return "execution_tradability"
+    if int(row["qlib_shares"]) > 0 and int(row["shadow_shares"]) > 0:
+        return "rounding_or_cost"
+    if row["date"] == first_date:
+        return "initialization"
+    if int(row["qlib_shares"]) == 0 or int(row["shadow_shares"]) == 0:
+        return "execution_tradability"
+    return "unexplained"
+
+
+def _mismatch_examples(orders: pd.DataFrame, categories: List[str]) -> dict:
+    examples = {}
+    for category in categories:
+        rows = orders[orders["classification"] == category].head(5)
+        examples[category] = [
+            {
+                "date": str(row.date),
+                "code": str(row.code),
+                "side": str(row.side),
+                "shares_delta": int(row.shares_delta),
+                "shadow_status": str(row.shadow_status),
+            }
+            for row in rows.itertuples(index=False)
+        ]
+    return examples
+
+
 def _nav_metrics(values: pd.Series, initial_nav: float) -> dict:
     if values.empty:
         return {"total_return": None, "annualized_return": None, "max_drawdown": None}
@@ -429,6 +484,18 @@ def compare_snapshots(
             "shadow_status",
         ],
     )
+    categories = [
+        "initialization",
+        "rounding_or_cost",
+        "execution_tradability",
+        "unexplained",
+    ]
+    first_date = min(qlib_dates) if qlib_dates else ""
+    orders["classification"] = (
+        orders.apply(_classify_order_row, axis=1, first_date=first_date)
+        if not orders.empty
+        else pd.Series(dtype=str)
+    )
     qlib_nav_metrics = _nav_metrics(daily["qlib_nav"], C.SHADOW_INIT_CASH)
     shadow_nav_metrics = _nav_metrics(daily["shadow_nav"], C.SHADOW_INIT_CASH)
     holding_mismatch_dates = [
@@ -465,6 +532,11 @@ def compare_snapshots(
         "gate_on_days": int(daily["gate_on"].sum()) if not daily.empty else 0,
         "gate_off_days": int((~daily["gate_on"]).sum()) if not daily.empty else 0,
         "shadow_receipt_status_counts": dict(sorted(receipt_status_counts.items())),
+        "order_mismatch_class_counts": {
+            category: int((orders["classification"] == category).sum())
+            for category in categories
+        },
+        "mismatch_examples": _mismatch_examples(orders, categories),
         "qlib_total_return": qlib_nav_metrics["total_return"],
         "qlib_annualized_return": qlib_nav_metrics["annualized_return"],
         "qlib_max_drawdown": qlib_nav_metrics["max_drawdown"],
