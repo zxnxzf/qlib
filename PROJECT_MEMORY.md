@@ -1,8 +1,8 @@
 # 项目记忆
 <!--
-更新: 2026-08-04 17:47
+更新: 2026-08-04 20:00
 核对基线:
-- qlib | branch codex/shadow-backtest-parity | HEAD a5a99963 | 工作区仍有影子核心、交接/功能文档与既有研究台账修改；当前分支比 origin/main ahead 21
+- qlib | branch codex/shadow-backtest-parity | HEAD 4002a001 | 工作区仅有既有研究台账修改和两个未跟踪实验脚本；当前分支比 main ahead 6
 代码与 Git 用于判断实现现状；用户最后确认的需求用于判断目标。
 -->
 
