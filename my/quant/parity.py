@@ -126,68 +126,17 @@ def run_qlib_backtest(
     signal_dates=None,
     impact_cost=None,
 ) -> Dict[str, DailySnapshot]:
-    """按锁定的 10 万门控参数运行 Qlib 引擎回测并录制订单。"""
-    from qlib.contrib.evaluate import backtest_daily
+    """按锁定的 10 万参数，通过共享规划器运行 Qlib 历史回测。"""
+    from .qlib_adapter import run_qlib_shared_planner_backtest
 
-    from my.scripts.exp_gated_100k import GatedTopkDropout
-
-    class RecordingGatedTopkDropout(GatedTopkDropout):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self.recorded_orders = {}
-            self.recorded_signal_dates = {}
-
-        def generate_trade_decision(self, execute_result=None):
-            trade_step = self.trade_calendar.get_trade_step()
-            trade_start, _ = self.trade_calendar.get_step_time(trade_step)
-            pred_start, _ = self.trade_calendar.get_step_time(trade_step, shift=1)
-            decision = super().generate_trade_decision(execute_result)
-            self.recorded_signal_dates[pd.Timestamp(trade_start).normalize()] = pd.Timestamp(
-                pred_start
-            ).strftime("%Y-%m-%d")
-            self.recorded_orders[pd.Timestamp(trade_start).normalize()] = []
-            for order in decision.get_decision():
-                factor = self.trade_exchange.get_factor(
-                    order.stock_id, order.start_time, order.end_time
-                )
-                self.recorded_orders[pd.Timestamp(trade_start).normalize()].append(
-                    normalize_qlib_order(order, factor=factor)
-                )
-            return decision
-
-    strategy = RecordingGatedTopkDropout(
-        gate=gate_by_exec_date,
-        signal=pred,
-        topk=C.TOPK,
-        n_drop=C.N_DROP,
-        hold_thresh=1,
-        only_tradable=True,
-    )
-    report, positions = backtest_daily(
-        start_time=start,
-        end_time=end,
-        strategy=strategy,
-        account=C.SHADOW_INIT_CASH,
-        benchmark=C.BENCH,
-        exchange_kwargs={
-            "deal_price": "open",
-            "limit_threshold": (
-                f"$open/Ref($close,1)-1 > {C.LIMIT_TH}",
-                f"$open/Ref($close,1)-1 < {-C.LIMIT_TH}",
-            ),
-            "open_cost": C.OPEN_COST,
-            "close_cost": C.CLOSE_COST,
-            "min_cost": C.MIN_COST,
-            "impact_cost": C.IMPACT_COST if impact_cost is None else impact_cost,
-        },
-    )
-    return qlib_outputs_to_snapshots(
-        report,
-        positions,
-        strategy.recorded_orders,
-        gate_by_exec_date,
+    return run_qlib_shared_planner_backtest(
+        pred=pred,
+        gate_by_exec_date=gate_by_exec_date,
+        start=start,
+        end=end,
         factor_cache=factor_cache,
-        signal_dates=signal_dates or strategy.recorded_signal_dates,
+        signal_dates=signal_dates,
+        impact_cost=impact_cost,
     )
 
 

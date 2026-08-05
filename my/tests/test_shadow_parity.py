@@ -542,6 +542,8 @@ def test_replay_inputs_reject_missing_or_empty_gate_values():
 def test_qlib_adapter_passes_locked_execution_semantics(monkeypatch):
     import qlib.contrib.evaluate
 
+    from my.quant.qlib_adapter import SharedPlannerStrategy
+
     date = pd.Timestamp("2025-01-02")
     captured = {}
 
@@ -578,6 +580,7 @@ def test_qlib_adapter_passes_locked_execution_semantics(monkeypatch):
     assert captured["end_time"] == "2025-01-02"
     assert captured["exchange_kwargs"]["deal_price"] == "open"
     assert captured["exchange_kwargs"]["impact_cost"] == 0.0
+    assert isinstance(captured["strategy"], SharedPlannerStrategy)
     assert captured["strategy"].only_tradable is True
     assert snapshots["2025-01-02"].signal_date == "2024-12-31"
 
