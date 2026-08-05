@@ -14,6 +14,7 @@ from my.quant.parity import (
     validate_snapshot_dates,
     write_parity_artifacts,
 )
+from my.quant.trade_planner import AccountSnapshot, HoldingSnapshot
 
 
 def test_equal_snapshots_have_full_parity():
@@ -38,6 +39,7 @@ def test_equal_snapshots_have_full_parity():
     assert result.summary["qlib_total_return"] == 0.0
     assert result.summary["shadow_total_return"] == 0.0
     assert result.daily_compare.loc[0, "nav_delta"] == 0.0
+    assert result.summary["planner_mismatch_count"] == 0
 
 
 def test_snapshot_difference_is_located_by_date_and_stock():
@@ -87,6 +89,35 @@ def test_summary_counts_shadow_receipt_statuses():
     result = compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
 
     assert result.summary["shadow_receipt_status_counts"] == {"blocked_limit": 1}
+    assert result.summary["direct_rejection_count"] == 1
+
+
+def test_order_rows_name_the_sell_or_buy_stage():
+    qlib = DailySnapshot(
+        "2025-01-02", 100_000.0, 99_000.0, True, {}, [OrderSnapshot("SH600000", "buy", 100)], {}
+    )
+    shadow = DailySnapshot(
+        "2025-01-02", 100_000.0, 99_000.0, True, {}, [OrderSnapshot("SH600000", "buy", 100)], {}
+    )
+
+    result = compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
+
+    assert result.orders_compare.loc[0, "stage"] == "buy"
+
+
+def test_candidate_skip_reasons_are_compared_between_adapters():
+    skips = {("buy", "SH600001"): "blocked_limit", ("buy", "SZ000001"): "already_held"}
+    qlib = DailySnapshot("2025-01-02", 100_000.0, 100_000.0, True, {}, [], {}, skips=skips)
+    shadow = DailySnapshot("2025-01-02", 100_000.0, 100_000.0, True, {}, [], {}, skips=skips)
+
+    result = compare_snapshots({qlib.date: qlib}, {shadow.date: shadow})
+
+    assert result.summary["candidate_skip_reason_counts"] == {
+        "already_held": 1,
+        "blocked_limit": 1,
+    }
+    assert result.summary["skip_mismatch_count"] == 0
+    assert result.skips_compare["match"].all()
 
 
 def test_blocked_shadow_order_is_classified_with_stock_example():
@@ -424,10 +455,30 @@ def test_artifact_writer_creates_all_required_files(tmp_path):
         "daily_compare.csv",
         "holdings_compare.csv",
         "orders_compare.csv",
+        "skips_compare.csv",
         "summary.json",
         "report.md",
     }
-    assert "Qlib 的 `impact_cost`" in (tmp_path / "report.md").read_text()
+    report = (tmp_path / "report.md").read_text()
+    assert "共享规划器订单差异" in report
+    assert "Qlib 的 `impact_cost`" in report
+
+
+def test_strict_cost_report_names_zero_impact_control(tmp_path):
+    snap = DailySnapshot("2025-01-02", 100_000.0, 100_000.0, True, {}, [], {})
+    result = compare_snapshots({snap.date: snap}, {snap.date: snap})
+
+    write_parity_artifacts(
+        result,
+        tmp_path,
+        {
+            "start": "2025-01-02",
+            "end": "2025-01-02",
+            "cost_mode": "strict_zero_impact_control",
+        },
+    )
+
+    assert "strict_zero_impact_control" in (tmp_path / "report.md").read_text()
 
 
 def test_qlib_outputs_are_converted_to_daily_snapshots():
@@ -464,6 +515,39 @@ def test_qlib_outputs_are_converted_to_daily_snapshots():
         {},
         "2024-12-31",
     )
+
+
+def test_qlib_snapshot_prefers_recorded_planner_account_over_factor_reinterpretation():
+    date = pd.Timestamp("2025-01-02")
+
+    class DriftedPosition:
+        def get_stock_list(self):
+            return ["SZ300117"]
+
+        def get_stock_amount(self, _code):
+            return 200.0
+
+    report = pd.DataFrame({"account": [2_010.0], "cash": [995.0]}, index=[date])
+    planner_account = AccountSnapshot(
+        cash=995.0,
+        holdings={"SZ300117": HoldingSnapshot(100, 100, 1)},
+    )
+
+    snapshots = qlib_outputs_to_snapshots(
+        report,
+        {date: DriftedPosition()},
+        {date: []},
+        pd.Series([True], index=[date]),
+        factor_cache=type(
+            "FactorCache",
+            (),
+            {"factors_on": lambda _self, _date: pd.Series({"SZ300117": 0.489})},
+        )(),
+        planner_accounts={date: planner_account},
+    )
+
+    assert snapshots["2025-01-02"].cash == 995.0
+    assert snapshots["2025-01-02"].holdings == {"SZ300117": 100}
 
 
 def test_signal_date_mismatch_is_a_hard_error():

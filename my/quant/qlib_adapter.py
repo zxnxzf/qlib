@@ -60,14 +60,37 @@ class SharedPlannerStrategy(BaseSignalStrategy):
         self.recorded_orders: Dict[pd.Timestamp, list] = {}
         self.recorded_signal_dates: Dict[pd.Timestamp, str] = {}
         self.recorded_packages: Dict[pd.Timestamp, object] = {}
+        self.recorded_skips: Dict[pd.Timestamp, dict] = {}
+        self.recorded_accounts: Dict[pd.Timestamp, AccountSnapshot] = {}
+        self._planner_account: Optional[AccountSnapshot] = None
+        self._pending_exec_timestamp: Optional[pd.Timestamp] = None
 
     def _factor(self, code: str, start, end) -> float:
         factor = self.trade_exchange.get_factor(code, start, end)
+        if (factor is None or pd.isna(factor) or float(factor) <= 0) and self.factor_cache is not None:
+            factors = self.factor_cache.factors_on(pd.Timestamp(start).strftime("%Y-%m-%d"))
+            if code in factors.index and pd.notna(factors.loc[code]):
+                factor = factors.loc[code]
         if factor is None or pd.isna(factor) or float(factor) <= 0:
             raise ValueError(f"Qlib 缺少执行日复权因子: {code}")
         return float(factor)
 
     def _account(self, trade_start, trade_end) -> AccountSnapshot:
+        if self._planner_account is not None:
+            freq = self.trade_calendar.get_freq()
+            holdings = {}
+            for code, holding in self._planner_account.holdings.items():
+                holdings[code] = HoldingSnapshot(
+                    shares=holding.shares,
+                    available_shares=holding.shares,
+                    held_days=int(self.trade_position.get_stock_count(code, bar=freq)),
+                )
+            self._planner_account = AccountSnapshot(
+                cash=self._planner_account.cash,
+                holdings=holdings,
+            )
+            return self._planner_account
+
         holdings = {}
         freq = self.trade_calendar.get_freq()
         for code in self.trade_position.get_stock_list():
@@ -80,7 +103,11 @@ class SharedPlannerStrategy(BaseSignalStrategy):
                 available_shares=shares,
                 held_days=int(self.trade_position.get_stock_count(code, bar=freq)),
             )
-        return AccountSnapshot(cash=float(self.trade_position.get_cash()), holdings=holdings)
+        self._planner_account = AccountSnapshot(
+            cash=float(self.trade_position.get_cash()),
+            holdings=holdings,
+        )
+        return self._planner_account
 
     def _reference_closes(self, scores: pd.Series, signal_start, signal_end) -> Dict[str, float]:
         signal_date = pd.Timestamp(signal_start).strftime("%Y-%m-%d")
@@ -150,7 +177,11 @@ class SharedPlannerStrategy(BaseSignalStrategy):
         factor = self._factor(planned.code, trade_start, trade_end)
         amount = qlib_amount_from_raw(planned.shares, factor)
         if planned.side == "sell":
-            amount = min(amount, float(self.trade_position.get_stock_amount(planned.code)))
+            current_amount = float(self.trade_position.get_stock_amount(planned.code))
+            if raw_shares_from_qlib(current_amount, factor) == planned.shares:
+                amount = current_amount
+            else:
+                amount = min(amount, current_amount)
         return Order(
             stock_id=planned.code,
             amount=amount,
@@ -168,7 +199,10 @@ class SharedPlannerStrategy(BaseSignalStrategy):
             trade_value, trade_cost, trade_price = self.trade_exchange.deal_order(
                 simulated, position=temporary_position
             )
-            filled = raw_shares_from_qlib(simulated.deal_amount, factor) if simulated.deal_amount else 0
+            if simulated.deal_amount and abs(simulated.deal_amount - simulated.amount) <= 1e-8:
+                filled = planned.shares
+            else:
+                filled = raw_shares_from_qlib(simulated.deal_amount, factor) if simulated.deal_amount else 0
             status = "filled" if filled >= planned.shares else "partial" if filled else "blocked"
             raw_price = float(trade_price) / factor if filled and not pd.isna(trade_price) else 0.0
             receipts.append(
@@ -183,12 +217,45 @@ class SharedPlannerStrategy(BaseSignalStrategy):
             )
         return apply_receipts(account, receipts)
 
+    def post_exe_step(self, execute_result=None) -> None:
+        if self._planner_account is None or self._pending_exec_timestamp is None:
+            return
+
+        planned = {
+            (order.code, order.side): order
+            for order in self.recorded_orders.get(self._pending_exec_timestamp, [])
+        }
+        receipts = []
+        for order, _trade_value, trade_cost, trade_price in execute_result or []:
+            if not order.deal_amount:
+                continue
+            side = "buy" if order.direction == OrderDir.BUY else "sell"
+            planned_order = planned.get((str(order.stock_id), side))
+            factor = float(order.factor)
+            if planned_order is not None and abs(order.deal_amount - order.amount) <= 1e-8:
+                shares = planned_order.shares
+            else:
+                shares = raw_shares_from_qlib(order.deal_amount, factor)
+            receipts.append(
+                Receipt(
+                    code=str(order.stock_id),
+                    side=side,
+                    shares=shares,
+                    price=float(trade_price) / factor,
+                    cost=float(trade_cost),
+                    status="filled" if planned_order is None or shares >= planned_order.shares else "partial",
+                )
+            )
+        self._planner_account = apply_receipts(self._planner_account, receipts)
+        self.recorded_accounts[self._pending_exec_timestamp] = self._planner_account
+
     def generate_trade_decision(self, execute_result=None):
         del execute_result
         trade_step = self.trade_calendar.get_trade_step()
         trade_start, trade_end = self.trade_calendar.get_step_time(trade_step)
         signal_start, signal_end = self.trade_calendar.get_step_time(trade_step, shift=1)
         exec_timestamp = pd.Timestamp(trade_start).normalize()
+        self._pending_exec_timestamp = exec_timestamp
         exec_date = exec_timestamp.strftime("%Y-%m-%d")
         signal_date = pd.Timestamp(signal_start).strftime("%Y-%m-%d")
         gate_on = bool(self._gate.get(exec_timestamp, True))
@@ -225,6 +292,10 @@ class SharedPlannerStrategy(BaseSignalStrategy):
         self.recorded_signal_dates[exec_timestamp] = signal_date
         self.recorded_orders[exec_timestamp] = planned_orders
         self.recorded_packages[exec_timestamp] = package
+        self.recorded_skips[exec_timestamp] = {
+            (skip.side, skip.code): skip.reason
+            for skip in list(sell_plan.skips) + list(buy_plan.skips)
+        }
         return TradeDecisionWO(qlib_orders, self)
 
 
@@ -275,4 +346,6 @@ def run_qlib_shared_planner_backtest(
         gate_by_exec_date,
         factor_cache=factor_cache,
         signal_dates=signal_dates or strategy.recorded_signal_dates,
+        skips=strategy.recorded_skips,
+        planner_accounts=strategy.recorded_accounts,
     )

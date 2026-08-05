@@ -94,6 +94,26 @@ def test_shadow_executor_rejects_sell_larger_than_position(monkeypatch):
     assert receipts[0].status == "insufficient_position"
 
 
+def test_market_snapshot_keeps_stock_tradable_when_previous_close_is_missing(monkeypatch):
+    bars = pd.DataFrame(
+        {
+            "open": [10.0],
+            "close": [10.0],
+            "volume": [1_000.0],
+            "factor": [1.0],
+            "prev_close": [float("nan")],
+        },
+        index=["SH600811"],
+    )
+    monkeypatch.setattr(data, "day_bars", lambda *_args, **_kwargs: bars)
+
+    quote = nightly._market_snapshot("2025-03-18").quotes["SH600811"]
+
+    assert quote.status == "normal"
+    assert quote.buyable is True
+    assert quote.sellable is True
+
+
 def test_mark_to_market_persists_last_price_across_processes(monkeypatch):
     priced = pd.DataFrame(
         {"close": [10.0], "factor": [1.0], "prev_close": [9.9]},

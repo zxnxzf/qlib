@@ -2,7 +2,7 @@
 
 import json
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -29,6 +29,7 @@ class DailySnapshot:
     orders: List[OrderSnapshot]
     receipts: Dict[Tuple[str, str], str]
     signal_date: str = ""
+    skips: Dict[Tuple[str, str], str] = field(default_factory=dict)
 
 
 @dataclass
@@ -36,6 +37,7 @@ class ParityResult:
     daily_compare: pd.DataFrame
     holdings_compare: pd.DataFrame
     orders_compare: pd.DataFrame
+    skips_compare: pd.DataFrame
     summary: dict
 
 
@@ -80,6 +82,8 @@ def qlib_outputs_to_snapshots(
     gate_by_exec_date: pd.Series,
     factor_cache=None,
     signal_dates=None,
+    skips=None,
+    planner_accounts=None,
 ) -> Dict[str, DailySnapshot]:
     """将 Qlib 回测原始输出归一为逐日快照。"""
     normalized_positions = {pd.Timestamp(key).normalize(): value for key, value in positions.items()}
@@ -90,6 +94,10 @@ def qlib_outputs_to_snapshots(
         pd.Timestamp(key).normalize(): pd.Timestamp(value).strftime("%Y-%m-%d")
         for key, value in (signal_dates or {}).items()
     }
+    normalized_skips = {pd.Timestamp(key).normalize(): value for key, value in (skips or {}).items()}
+    normalized_planner_accounts = {
+        pd.Timestamp(key).normalize(): value for key, value in (planner_accounts or {}).items()
+    }
 
     snapshots = {}
     for raw_date, row in report.iterrows():
@@ -99,20 +107,28 @@ def qlib_outputs_to_snapshots(
             raise ValueError(f"Qlib 持仓缺少日期: {date}")
         if timestamp not in normalized_gate.index:
             raise ValueError(f"Qlib 门控缺少执行日: {date}")
+        planner_account = normalized_planner_accounts.get(timestamp)
         snapshots[date] = DailySnapshot(
             date=date,
             nav=float(row["account"]),
-            cash=float(row["cash"]),
+            cash=float(row["cash"] if planner_account is None else planner_account.cash),
             gate_on=bool(normalized_gate.loc[timestamp]),
-            holdings=position_to_holdings(
-                normalized_positions[timestamp],
-                None
-                if factor_cache is None
-                else factor_cache.factors_on(date),
+            holdings=(
+                position_to_holdings(
+                    normalized_positions[timestamp],
+                    None if factor_cache is None else factor_cache.factors_on(date),
+                )
+                if planner_account is None
+                else {
+                    str(code): int(holding.shares)
+                    for code, holding in planner_account.holdings.items()
+                    if int(holding.shares) > 0
+                }
             ),
             orders=list(normalized_orders.get(timestamp, [])),
             receipts={},
             signal_date=normalized_signal_dates.get(timestamp, ""),
+            skips=dict(normalized_skips.get(timestamp, {})),
         )
     return snapshots
 
@@ -147,6 +163,7 @@ def write_parity_artifacts(result: ParityResult, output_dir: Path, metadata: dic
     result.daily_compare.to_csv(output_dir / "daily_compare.csv", index=False)
     result.holdings_compare.to_csv(output_dir / "holdings_compare.csv", index=False)
     result.orders_compare.to_csv(output_dir / "orders_compare.csv", index=False)
+    result.skips_compare.to_csv(output_dir / "skips_compare.csv", index=False)
 
     payload = {**metadata, **result.summary}
     (output_dir / "summary.json").write_text(
@@ -156,6 +173,8 @@ def write_parity_artifacts(result: ParityResult, output_dir: Path, metadata: dic
     status_text = "、".join(f"{key}={value}" for key, value in statuses.items()) or "无回执"
     class_counts = result.summary["order_mismatch_class_counts"]
     class_text = "、".join(f"{key}={value}" for key, value in class_counts.items())
+    skip_counts = result.summary["candidate_skip_reason_counts"]
+    skip_text = "、".join(f"{key}={value}" for key, value in skip_counts.items()) or "无候选跳过"
     example_lines = []
     for category, examples in result.summary["mismatch_examples"].items():
         if not examples:
@@ -188,10 +207,14 @@ def write_parity_artifacts(result: ParityResult, output_dir: Path, metadata: dic
 - 持仓明细行匹配率：{result.summary['holding_match_rate']:.2%}；整日持仓完全一致率：{result.summary['holding_exact_day_match_rate']:.2%}。
 - 订单明细行匹配率：{result.summary['order_match_rate']:.2%}；整日订单完全一致率：{result.summary['order_exact_day_match_rate']:.2%}。
 - 首次持仓分叉：{result.summary['first_holding_mismatch_date'] or '无'}；首次订单分叉：{result.summary['first_order_mismatch_date'] or '无'}。
+- 共享规划器订单差异：{result.summary['planner_mismatch_count']} 行；候选跳过原因差异：{result.summary['skip_mismatch_count']} 行。
+- 候选跳过原因：{skip_text}。
 
 ## 影子成交回执
 
 {status_text}。
+
+适配器直接拒单或未成交 {result.summary['direct_rejection_count']} 条。
 
 ## 订单差异分类
 
@@ -199,13 +222,13 @@ def write_parity_artifacts(result: ParityResult, output_dir: Path, metadata: dic
 
 {examples_text}
 
-成本模式：{metadata.get('cost_mode', 'production_semantics')}。Qlib 在执行日可见当日可交易状态并可替补候选；影子模式在前一晚按当日收盘价锁定订单与股数，次日开盘不替补。
+成本模式：{metadata.get('cost_mode', 'production_semantics')}。Qlib 与影子模式均由 T-1 信号包和同一个共享规划器决定卖出、Top100 补选与股数；只有行情快照、成交价、费用和回执约束允许产生差异。
 
 在生产语义模式下，Qlib 的 `impact_cost` 是按成交额占市场成交量的平方缩放后计入费用，影子路径则把固定滑点加减在成交价上，所以净值差不能只归因于 `only_tradable`。严格成本控制子报告将双方价格冲击都置零，仅用于隔离选股/执行路径差异，不能当作生产绩效。
 
-本报告是这两条真实路径的黑盒对比，不使用兼容模式强行抹平差异。
+本报告按 `sell` / `buy` 阶段记录规划订单与回执，不使用未来信息强行抹平成交差异。
 
-明细见 `daily_compare.csv`、`holdings_compare.csv` 和 `orders_compare.csv`。
+明细见 `daily_compare.csv`、`holdings_compare.csv`、`orders_compare.csv` 和 `skips_compare.csv`。
 """
     (output_dir / "report.md").write_text(report, encoding="utf-8")
 
@@ -329,11 +352,30 @@ def _order_rows(qlib: DailySnapshot, shadow: DailySnapshot) -> List[dict]:
                 "date": qlib.date,
                 "code": code,
                 "side": side,
+                "stage": side,
                 "qlib_shares": qlib_shares,
                 "shadow_shares": shadow_shares,
                 "shares_delta": shadow_shares - qlib_shares,
                 "match": qlib_shares == shadow_shares,
                 "shadow_status": shadow.receipts.get((code, side), ""),
+            }
+        )
+    return rows
+
+
+def _skip_rows(qlib: DailySnapshot, shadow: DailySnapshot) -> List[dict]:
+    rows = []
+    for stage, code in sorted(set(qlib.skips) | set(shadow.skips)):
+        qlib_reason = qlib.skips.get((stage, code), "")
+        shadow_reason = shadow.skips.get((stage, code), "")
+        rows.append(
+            {
+                "date": qlib.date,
+                "stage": stage,
+                "code": code,
+                "qlib_reason": qlib_reason,
+                "shadow_reason": shadow_reason,
+                "match": qlib_reason == shadow_reason,
             }
         )
     return rows
@@ -410,6 +452,7 @@ def compare_snapshots(
     daily_rows = []
     holding_rows = []
     order_rows = []
+    skip_rows = []
     holding_day_matches = []
     order_day_matches = []
     receipt_status_counts = Counter()
@@ -445,6 +488,7 @@ def compare_snapshots(
         )
         holding_rows.extend(_holding_rows(qlib_snap, shadow_snap))
         order_rows.extend(_order_rows(qlib_snap, shadow_snap))
+        skip_rows.extend(_skip_rows(qlib_snap, shadow_snap))
         holding_day_matches.append(qlib_snap.holdings == shadow_snap.holdings)
         order_day_matches.append(
             _aggregate_orders(qlib_snap.orders) == _aggregate_orders(shadow_snap.orders)
@@ -462,12 +506,17 @@ def compare_snapshots(
             "date",
             "code",
             "side",
+            "stage",
             "qlib_shares",
             "shadow_shares",
             "shares_delta",
             "match",
             "shadow_status",
         ],
+    )
+    skips = pd.DataFrame(
+        skip_rows,
+        columns=["date", "stage", "code", "qlib_reason", "shadow_reason", "match"],
     )
     categories = [
         "rounding_or_cost",
@@ -517,6 +566,14 @@ def compare_snapshots(
         "gate_on_days": int(daily["gate_on"].sum()) if not daily.empty else 0,
         "gate_off_days": int((~daily["gate_on"]).sum()) if not daily.empty else 0,
         "shadow_receipt_status_counts": dict(sorted(receipt_status_counts.items())),
+        "direct_rejection_count": int(
+            sum(count for status, count in receipt_status_counts.items() if status != "filled")
+        ),
+        "planner_mismatch_count": int((~orders["match"]).sum()) if not orders.empty else 0,
+        "skip_mismatch_count": int((~skips["match"]).sum()) if not skips.empty else 0,
+        "candidate_skip_reason_counts": dict(
+            sorted(Counter(reason for snap in shadow.values() for reason in snap.skips.values()).items())
+        ),
         "order_mismatch_class_counts": {
             category: int((orders["classification"] == category).sum())
             for category in categories
@@ -538,7 +595,7 @@ def compare_snapshots(
         "shadow_annualized_return": shadow_nav_metrics["annualized_return"],
         "shadow_max_drawdown": shadow_nav_metrics["max_drawdown"],
     }
-    return ParityResult(daily, holdings, orders, summary)
+    return ParityResult(daily, holdings, orders, skips, summary)
 
 
 def _scores_on(pred: pd.Series, date: str) -> pd.Series:
@@ -622,6 +679,22 @@ def _receipt_statuses(state_dir: Path, exec_date: str) -> Dict[Tuple[str, str], 
             }
         )
     return statuses
+
+
+def _skip_reasons(state_dir: Path, exec_date: str) -> Dict[Tuple[str, str], str]:
+    reasons = {}
+    for stage in ("sell", "buy"):
+        path = state_dir / "skips" / f"{exec_date}_{stage}.csv"
+        if not path.exists():
+            continue
+        frame = pd.read_csv(path)
+        reasons.update(
+            {
+                (str(row.stage), str(row.code)): str(row.reason)
+                for row in frame.itertuples(index=False)
+            }
+        )
+    return reasons
 
 
 def run_shadow_replay(
@@ -708,6 +781,7 @@ def run_shadow_replay(
                 orders=[OrderSnapshot(order.code, order.side, int(order.shares)) for order in orders],
                 receipts=_receipt_statuses(state_dir, date),
                 signal_date=calendar_days[calendar_days.index(date) - 1],
+                skips=_skip_reasons(state_dir, date),
             )
     finally:
         C.STATE_DIR = original_state_dir

@@ -1,4 +1,5 @@
 import pandas as pd
+from qlib.backtest.decision import OrderDir
 
 from my.quant.qlib_adapter import (
     SharedPlannerStrategy,
@@ -61,12 +62,12 @@ class FakeExchange:
 
     def __init__(self, prices, factors=None, blocked_buys=()):
         self.prices = prices
-        self.factors = factors or {code: 1.0 for code in prices}
+        self.factors = {code: 1.0 for code in prices} if factors is None else factors
         self.blocked_buys = set(blocked_buys)
         self.simulated_sells = []
 
     def get_factor(self, stock_id, start_time, end_time):
-        return self.factors[stock_id]
+        return self.factors.get(stock_id)
 
     def get_close(self, stock_id, start_time, end_time):
         return self.prices[stock_id] * self.factors[stock_id]
@@ -92,7 +93,7 @@ class FakeExchange:
         return value, 5.0, adjusted_price
 
 
-def _strategy(position, exchange, scores, gate_on=True, topk=1, n_drop=1):
+def _strategy(position, exchange, scores, gate_on=True, topk=1, n_drop=1, factor_cache=None):
     signal_index = pd.MultiIndex.from_product(
         [[pd.Timestamp("2026-08-04")], scores.index],
         names=["datetime", "instrument"],
@@ -103,6 +104,7 @@ def _strategy(position, exchange, scores, gate_on=True, topk=1, n_drop=1):
         topk=topk,
         n_drop=n_drop,
         hold_thresh=1,
+        factor_cache=factor_cache,
     )
     strategy.signal = FakeSignal(scores)
     strategy.level_infra = {"trade_calendar": FakeCalendar()}
@@ -186,3 +188,60 @@ def test_sell_amount_never_exceeds_actual_qlib_position_after_factor_round_trip(
     order = strategy.generate_trade_decision().get_decision()[0]
 
     assert order.amount == actual_amount
+
+
+def test_full_lot_sell_uses_exact_qlib_position_when_factor_drift_would_leave_a_remainder():
+    actual_amount = 311.97640561208146
+    factor = 100 / 311.9520711532372
+    scores = pd.Series({"SH600246": 1.0})
+    position = FakePosition(cash=0.0, amounts={"SH600246": actual_amount})
+    exchange = FakeExchange({"SH600246": 10.0}, factors={"SH600246": factor})
+    strategy = _strategy(position, exchange, scores, gate_on=False)
+
+    order = strategy.generate_trade_decision().get_decision()[0]
+
+    assert order.amount == actual_amount
+
+
+def test_filled_planner_account_keeps_raw_shares_when_next_day_factor_drifts():
+    scores = pd.Series({"SZ300117": 1.0})
+    position = FakePosition(cash=2_000.0, amounts={})
+    exchange = FakeExchange({"SZ300117": 10.0}, factors={"SZ300117": 0.5})
+    strategy = _strategy(position, exchange, scores, gate_on=True)
+
+    order = strategy.generate_trade_decision().get_decision()[0]
+    assert order.direction == OrderDir.BUY
+    order.deal_amount = order.amount
+    order.factor = 0.5
+    strategy.post_exe_step([(order, 1_000.0, 5.0, 5.0)])
+
+    position.cash = 995.0
+    position.amounts["SZ300117"] = order.amount
+    position.counts["SZ300117"] = 1
+    exchange.factors["SZ300117"] = 0.489
+    account = strategy._account(pd.Timestamp("2026-08-05"), pd.Timestamp("2026-08-05 23:59:59"))
+
+    assert account.cash == 995.0
+    assert account.holdings["SZ300117"].shares == 100
+
+
+def test_held_stock_uses_last_cached_factor_when_execution_day_factor_is_missing():
+    class FactorCache:
+        def factors_on(self, date):
+            assert date == "2026-08-05"
+            return pd.Series({"SZ300117": 0.5})
+
+    scores = pd.Series({"SZ300117": 1.0})
+    position = FakePosition(cash=0.0, amounts={"SZ300117": 200})
+    exchange = FakeExchange({"SZ300117": 10.0}, factors={})
+    strategy = _strategy(
+        position,
+        exchange,
+        scores,
+        gate_on=False,
+        factor_cache=FactorCache(),
+    )
+
+    account = strategy._account(pd.Timestamp("2026-08-05"), pd.Timestamp("2026-08-05 23:59:59"))
+
+    assert account.holdings["SZ300117"].shares == 100

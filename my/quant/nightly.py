@@ -137,7 +137,7 @@ def _market_snapshot(exec_date: str) -> MarketSnapshot:
             if tradable and prev_close == prev_close and float(prev_close) > 0
             else raw_open
         )
-        change = float(open_adj) / float(prev_close) - 1 if tradable and raw_previous > 0 else 0.0
+        change = raw_open / raw_previous - 1 if tradable and raw_previous > 0 else 0.0
         if not tradable:
             status = "suspended"
         elif change > C.LIMIT_TH or change < -C.LIMIT_TH:
