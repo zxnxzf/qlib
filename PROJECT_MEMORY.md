@@ -108,11 +108,11 @@ Tushare 当前提供 A 股实时分钟接口 `rt_min`（1/5/15/30/60 分钟）�
 
 2026-08-04 同区间对账已完成并经审查修正：`my/quant/parity.py` + `my/scripts/compare_shadow_backtest.py` 使用同一 `candidate1_pred.pkl`、10万资金、SH000905门控、TopK50/N_DROP2 对2025-01-02~2026-07-28共379日做黑盒直比，2024-12-31预热。门控282个在场日/97个离场日完全一致；生产语义 Qlib期末144,631.46（区间+44.63%、年化+26.08%、MDD -16.29%），影子期末121,248.55（区间+21.25%、年化+12.86%、MDD -24.22%）。严格成本控制（双方价格冲击都设为0）Qlib期末144,630.01，影子期末126,959.83，说明成本语义约解释5,711元差异，但不是主要差异来源。首次分叉2025-01-15：影子当日6笔涨停禁买，Qlib `only_tradable=True` 会执行日过滤并补选，影子前夜锁定后不补选；股数还受“Qlib按执行日价格 vs 影子按前日收盘锁定”影响。生产语义影子回执 filled=1449、blocked_limit=97、suspended=229、no_data=230、insufficient_cash=6；只有 blocked/suspended/no_data 的556条被归为直接成交性证据，另有1382条单边差异保守归为 selection_or_path_dependency，不能声称全部由可交易性导致。复权股数只在距离100股整手不超过2股时吸附，保留真实零股；运行前硬校验完整交易日、T-1预测、门控和行情缓存，并显式记录信号日。`my/tests/test_shadow_core.py` + `my/tests/test_shadow_parity.py` 共45项通过。生产报告为 `my/artifacts/shadow_backtest_parity/full-20250102-20260728-v5/report.md`，严格成本子报告位于 `strict_cost_control/report.md`。
 
-2026-08-05 共享执行语义已完成 brainstorming 定案：Qlib回测、影子模式和未来QMT共用同一个纯执行规划器，适配器只提供账户、行情和成交事实。规则锁定为T-1 Top100、T日9:30~9:31、先卖后买、卖单等待30秒、实际现金重算、不可买时按排名补选、盘口限价0.3%保护、买单超时撤单留现金。验收以选股/补选/股数逻辑一致和差异可解释为主，不强求净值完全相同。正式设计为 `docs/superpowers/specs/2026-08-05-shared-execution-planner-design.md`，尚未开始实现。
+2026-08-05 共享执行语义已完成 brainstorming 定案：Qlib回测、影子模式和未来QMT共用同一个纯执行规划器，适配器只提供账户、行情和成交事实。规则锁定为T-1 Top100、T日9:30~9:31、先卖后买、卖单等待30秒、实际现金重算、不可买时按排名补选、盘口限价0.3%保护、买单超时撤单留现金。验收以选股/补选/股数逻辑一致和差异可解释为主，不强求净值完全相同。正式设计为 `docs/superpowers/specs/2026-08-05-shared-execution-planner-design.md`；用户已批准直接执行，实施计划为 `docs/superpowers/plans/2026-08-05-shared-execution-planner.md`，尚未修改实现代码。
 
 ## 下一步
-1. 用户审阅共享执行规划器设计文档；批准后用 writing-plans 编写实施计划。
-2. 按计划实现 SignalPackage、共享卖出/买入规划器、影子适配和379日历史对账。
+1. 按实施计划从纯规划器数据模型和卖出阶段开始，用TDD逐任务实现并提交。
+2. 完成 SignalPackage、共享买卖规划、影子两阶段适配和379日历史对账。
 3. 在QMT前完成ST/退市/长停过滤、异常持仓告警和真实模型回填。
 4. 影子新语义通过后再接QMT模拟适配、每日调度和Syncthing文件桥。
 5. 用户线下继续确认国金QMT权限、免5佣金与10万元资金；没有券商试用环境前不验证真实报单。
