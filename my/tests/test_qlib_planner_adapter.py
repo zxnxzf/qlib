@@ -173,3 +173,16 @@ def test_gate_off_liquidates_all_sellable_holdings_without_buys():
         ("SH600001", 0),
         ("SH600002", 0),
     ]
+
+
+def test_sell_amount_never_exceeds_actual_qlib_position_after_factor_round_trip():
+    actual_amount = 311.9520711532372
+    factor = 100 / 311.97640561208146
+    scores = pd.Series({"SH600246": 1.0})
+    position = FakePosition(cash=0.0, amounts={"SH600246": actual_amount})
+    exchange = FakeExchange({"SH600246": 10.0}, factors={"SH600246": factor})
+    strategy = _strategy(position, exchange, scores, gate_on=False)
+
+    order = strategy.generate_trade_decision().get_decision()[0]
+
+    assert order.amount == actual_amount

@@ -227,6 +227,7 @@ class MarketCache:
             raise ValueError(f"行情缓存索引名错误: {frame.index.names}")
         self.frame = frame.reorder_levels(["datetime", "instrument"]).sort_index()
         self._factors_by_date = None
+        self._raw_closes_by_date = None
 
     @classmethod
     def from_qlib(cls, start: str, end: str) -> "MarketCache":
@@ -267,6 +268,16 @@ class MarketCache:
         if timestamp not in self._factors_by_date.index:
             raise ValueError(f"行情缓存缺少日期: {date}")
         return self._factors_by_date.loc[timestamp]
+
+    def raw_closes_on(self, date: str) -> pd.Series:
+        """返回截至指定日最近有效的未复权收盘价，不读取未来行情。"""
+        if self._raw_closes_by_date is None:
+            raw = self.frame["close"] / self.frame["factor"]
+            self._raw_closes_by_date = raw.unstack("instrument").ffill()
+        timestamp = pd.Timestamp(date)
+        if timestamp not in self._raw_closes_by_date.index:
+            raise ValueError(f"行情缓存缺少日期: {date}")
+        return self._raw_closes_by_date.loc[timestamp]
 
     @property
     def latest_date(self) -> str:
@@ -643,6 +654,7 @@ def run_shadow_replay(
 
     original_state_dir = C.STATE_DIR
     original_day_bars = data.day_bars
+    original_raw_closes_asof = data.raw_closes_asof
     original_latest_data_date = data.latest_data_date
     original_scores_for = signal_.scores_for
     original_gate_for_next_day = gate.gate_for_next_day
@@ -660,12 +672,21 @@ def run_shadow_replay(
         value = bool(gate_series.loc[pd.Timestamp(exec_date)])
         return value, f"parity cached gate {exec_date}={'on' if value else 'off'}"
 
+    def cached_raw_closes_asof(codes, asof: str):
+        closes = cache.raw_closes_on(asof)
+        return {
+            str(code): float(closes.loc[str(code)])
+            for code in codes
+            if str(code) in closes.index and pd.notna(closes.loc[str(code)])
+        }
+
     snapshots: Dict[str, DailySnapshot] = {}
     try:
         C.STATE_DIR = state_dir
         if impact_cost is not None:
             C.IMPACT_COST = float(impact_cost)
         data.day_bars = cache.day_bars
+        data.raw_closes_asof = cached_raw_closes_asof
         data.latest_data_date = lambda: cache.latest_date
         signal_.scores_for = cached_scores
         gate.gate_for_next_day = cached_gate
@@ -691,6 +712,7 @@ def run_shadow_replay(
     finally:
         C.STATE_DIR = original_state_dir
         data.day_bars = original_day_bars
+        data.raw_closes_asof = original_raw_closes_asof
         data.latest_data_date = original_latest_data_date
         signal_.scores_for = original_scores_for
         gate.gate_for_next_day = original_gate_for_next_day

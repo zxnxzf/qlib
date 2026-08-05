@@ -116,6 +116,29 @@ def test_mark_to_market_persists_last_price_across_processes(monkeypatch):
     assert restarted_prices == {"SH600000": 10.0}
 
 
+def test_signal_reference_closes_use_last_known_price_for_suspended_top100(monkeypatch):
+    bars = pd.DataFrame(
+        {
+            "close": [10.0, float("nan")],
+            "factor": [1.0, 0.5],
+            "prev_close": [9.9, 5.0],
+        },
+        index=["SH600001", "SZ300307"],
+    )
+    monkeypatch.setattr(data, "day_bars", lambda *_args, **_kwargs: bars)
+    monkeypatch.setattr(
+        data,
+        "raw_closes_asof",
+        lambda codes, date: {"SZ300307": 9.8} if list(codes) == ["SZ300307"] else {},
+        raising=False,
+    )
+
+    closes = nightly._raw_closes("2026-08-04", required_codes=["SZ300307"])
+
+    assert closes["SH600001"] == 10.0
+    assert closes["SZ300307"] == 9.8
+
+
 def test_new_ledger_state_persists_last_prices(tmp_path, monkeypatch):
     monkeypatch.setattr(C, "STATE_DIR", tmp_path)
 

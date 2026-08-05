@@ -91,6 +91,23 @@ def day_bars(date: str, fields=("$open", "$close", "$volume", "$factor")) -> pd.
     return df.droplevel(1)  # 单日：去掉 datetime 层
 
 
+def raw_closes_asof(codes, date: str, lookback_days: int = 400) -> Dict[str, float]:
+    """返回不晚于指定日的最近有效未复权收盘价，只查询给定股票。"""
+    from qlib.data import D
+
+    requested = list(dict.fromkeys(str(code) for code in codes))
+    if not requested:
+        return {}
+    init_qlib()
+    start = (pd.Timestamp(date) - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    frame = D.features(requested, ["$close", "$factor"], start_time=start, end_time=date)
+    if frame.empty:
+        return {}
+    raw = frame["$close"] / frame["$factor"]
+    latest = raw.groupby(level="instrument").last().dropna()
+    return {str(code): float(price) for code, price in latest.items() if float(price) > 0}
+
+
 def index_closes(index_code: str, start: str, end: str) -> pd.Series:
     from qlib.data import D
 

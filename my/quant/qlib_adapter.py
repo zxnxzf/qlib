@@ -85,13 +85,8 @@ class SharedPlannerStrategy(BaseSignalStrategy):
     def _reference_closes(self, scores: pd.Series, signal_start, signal_end) -> Dict[str, float]:
         signal_date = pd.Timestamp(signal_start).strftime("%Y-%m-%d")
         if self.factor_cache is not None:
-            bars = self.factor_cache.day_bars(signal_date, fields=("$close", "$factor"))
-            closes = {}
-            for code, row in bars.iterrows():
-                close, factor = row["close"], row["factor"]
-                if close == close and factor == factor and float(factor) > 0:
-                    closes[str(code)] = float(close) / float(factor)
-            return closes
+            closes = self.factor_cache.raw_closes_on(signal_date).dropna()
+            return {str(code): float(close) for code, close in closes.items() if float(close) > 0}
 
         closes = {}
         for raw_code in scores.dropna().index:
@@ -153,9 +148,12 @@ class SharedPlannerStrategy(BaseSignalStrategy):
 
     def _qlib_order(self, planned, trade_start, trade_end):
         factor = self._factor(planned.code, trade_start, trade_end)
+        amount = qlib_amount_from_raw(planned.shares, factor)
+        if planned.side == "sell":
+            amount = min(amount, float(self.trade_position.get_stock_amount(planned.code)))
         return Order(
             stock_id=planned.code,
-            amount=qlib_amount_from_raw(planned.shares, factor),
+            amount=amount,
             start_time=trade_start,
             end_time=trade_end,
             direction=OrderDir.BUY if planned.side == "buy" else OrderDir.SELL,

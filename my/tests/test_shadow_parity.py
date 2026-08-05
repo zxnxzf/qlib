@@ -221,6 +221,30 @@ def test_market_cache_carries_last_factor_after_instrument_disappears():
     assert cache.factors_on("2025-01-03").loc["SZ300379"] == pytest.approx(0.2)
 
 
+def test_market_cache_carries_last_raw_close_through_suspension():
+    index = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2025-01-02"), "SZ300307"),
+            (pd.Timestamp("2025-01-03"), "SZ300307"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    cache = MarketCache(
+        pd.DataFrame(
+            {
+                "open": [0.74, float("nan")],
+                "close": [0.75, float("nan")],
+                "volume": [1_000.0, 0.0],
+                "factor": [0.075, 0.075],
+                "prev_close": [0.73, 0.75],
+            },
+            index=index,
+        )
+    )
+
+    assert cache.raw_closes_on("2025-01-03").loc["SZ300307"] == pytest.approx(10.0)
+
+
 def test_shadow_replay_uses_warmup_only_to_create_first_order(tmp_path):
     dates = [pd.Timestamp("2024-12-31"), pd.Timestamp("2025-01-02")]
     instruments = ["SH600000"]

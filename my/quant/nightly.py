@@ -86,7 +86,7 @@ def _planner_params() -> dict:
     }
 
 
-def _raw_closes(date: str) -> Dict[str, float]:
+def _raw_closes(date: str, required_codes=()) -> Dict[str, float]:
     bars = data.day_bars(date, fields=("$close", "$factor"))
     closes = {}
     for code, row in bars.iterrows():
@@ -96,7 +96,23 @@ def _raw_closes(date: str) -> Dict[str, float]:
         raw = float(close) / float(factor) if factor and factor == factor and factor > 0 else float(close)
         if raw > 0:
             closes[str(code)] = raw
+    missing = [str(code) for code in required_codes if str(code) not in closes]
+    if missing:
+        closes.update(data.raw_closes_asof(missing, date))
     return closes
+
+
+def _top_candidate_codes(scores: pd.Series) -> list:
+    frame = scores.rename("score").reset_index()
+    frame.columns = ["code", "score"]
+    frame["code"] = frame["code"].astype(str)
+    frame["score"] = pd.to_numeric(frame["score"], errors="coerce")
+    return (
+        frame.dropna(subset=["score"])
+        .sort_values(["score", "code"], ascending=[False, True], kind="mergesort")
+        .head(100)["code"]
+        .tolist()
+    )
 
 
 def _market_snapshot(exec_date: str) -> MarketSnapshot:
@@ -190,7 +206,7 @@ def prepare(asof: Optional[str] = None, skip_update: bool = False, log=print) ->
     gate_on, note = gate.gate_for_next_day(today)
     log(f"[nightly] 门控: {note}")
     scores = signal_.scores_for(today, log=log) if gate_on else pd.Series(dtype=float)
-    closes = _raw_closes(today) if gate_on else {}
+    closes = _raw_closes(today, required_codes=_top_candidate_codes(scores)) if gate_on else {}
     package = build_signal_package(
         scores=scores,
         signal_date=today,
