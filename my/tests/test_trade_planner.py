@@ -7,9 +7,14 @@ from my.quant.trade_planner import (
     HoldingSnapshot,
     MarketSnapshot,
     QuoteSnapshot,
+    SignalCandidate,
     SignalPackage,
+    apply_receipts,
+    plan_buys,
     plan_sells,
+    price_band,
 )
+from my.quant.execution import Receipt
 
 
 def _package(*, gate_on=True, scores=None, n_drop=2, hold_thresh=1):
@@ -142,3 +147,166 @@ def test_plan_sells_breaks_equal_score_ties_by_code():
     result = plan_sells(_package(scores=scores), account, _market(*scores))
 
     assert [order.code for order in result.orders] == ["SH600001", "SH600002"]
+
+
+def _buy_package(candidates, *, topk=2, risk_degree=0.95):
+    return SignalPackage(
+        batch_id="2026-08-04-v1",
+        signal_date="2026-08-04",
+        exec_date="2026-08-05",
+        gate_on=True,
+        candidates=tuple(
+            SignalCandidate(code, score, rank, reference_close)
+            for rank, (code, score, reference_close) in enumerate(candidates, start=1)
+        ),
+        holding_scores={},
+        params={
+            "topk": topk,
+            "n_drop": 2,
+            "risk_degree": risk_degree,
+            "lot": 100,
+            "open_cost": 0.0005,
+            "min_cost": 5.0,
+            "max_slippage": 0.003,
+        },
+    )
+
+
+def _quote(code, *, bid1=9.99, ask1=10.01, buyable=True, sellable=True, status="normal", risk=False):
+    return QuoteSnapshot(
+        code=code,
+        timestamp="2026-08-05T09:30:05",
+        bid1=bid1,
+        ask1=ask1,
+        last=10.0,
+        high_limit=11.0,
+        low_limit=9.0,
+        buyable=buyable,
+        sellable=sellable,
+        status=status,
+        risk_blocked=risk,
+        risk_reason="st_risk" if risk else "",
+    )
+
+
+def test_plan_buys_uses_actual_cash_after_completed_and_blocked_sells():
+    account = AccountSnapshot(
+        cash=0.0,
+        holdings={
+            "SH600001": HoldingSnapshot(100, 100, 2),
+            "SH600002": HoldingSnapshot(100, 100, 2),
+        },
+    )
+    updated = apply_receipts(
+        account,
+        [
+            Receipt("SH600001", "sell", 100, 10.0, 5.0, "filled"),
+            Receipt("SH600002", "sell", 0, 0.0, 0.0, "blocked_limit"),
+        ],
+    )
+    package = _buy_package([("SZ000001", 3.0, 9.0)])
+    market = MarketSnapshot("2026-08-05", {"SZ000001": _quote("SZ000001", ask1=9.0)})
+
+    result = plan_buys(package, updated, market)
+
+    assert updated.cash == 995.0
+    assert set(updated.holdings) == {"SH600002"}
+    assert [(order.code, order.shares) for order in result.orders] == [("SZ000001", 100)]
+
+
+def test_plan_buys_filters_held_and_blocked_candidates_then_uses_top100_backup():
+    account = AccountSnapshot(
+        cash=10_000.0,
+        holdings={"SH600001": HoldingSnapshot(100, 100, 2)},
+    )
+    package = _buy_package(
+        [
+            ("SH600002", 5.0, 10.0),
+            ("SH600001", 4.0, 10.0),
+            ("SH600003", 3.0, 10.0),
+        ],
+        topk=2,
+    )
+    market = MarketSnapshot(
+        "2026-08-05",
+        {
+            "SH600002": _quote("SH600002", buyable=False, status="blocked_limit"),
+            "SH600001": _quote("SH600001"),
+            "SH600003": _quote("SH600003"),
+        },
+    )
+
+    result = plan_buys(package, account, market)
+
+    assert [order.code for order in result.orders] == ["SH600003"]
+    assert result.orders[0].candidate_rank == 3
+    assert [(skip.code, skip.reason) for skip in result.skips] == [
+        ("SH600002", "blocked_limit"),
+        ("SH600001", "already_held"),
+    ]
+
+
+def test_plan_buys_leaves_cash_when_top_candidate_is_below_one_lot():
+    package = _buy_package(
+        [("SH600001", 2.0, 10.0), ("SH600002", 1.0, 1.0)],
+        topk=1,
+    )
+    market = MarketSnapshot(
+        "2026-08-05",
+        {
+            "SH600001": _quote("SH600001", ask1=10.0),
+            "SH600002": _quote("SH600002", ask1=1.0),
+        },
+    )
+
+    result = plan_buys(package, AccountSnapshot(500.0, {}), market)
+
+    assert result.orders == ()
+    assert [(skip.code, skip.reason) for skip in result.skips] == [
+        ("SH600001", "insufficient_for_one_lot")
+    ]
+
+
+def test_price_band_caps_one_reprice_to_point_three_percent_and_exchange_limits():
+    assert price_band(10.0, "buy", high_limit=10.02, low_limit=9.0, max_slippage=0.003) == (
+        10.0,
+        10.02,
+    )
+    assert price_band(10.0, "sell", high_limit=11.0, low_limit=9.98, max_slippage=0.003) == (
+        9.98,
+        10.0,
+    )
+
+
+def test_plan_buys_records_risk_blocked_candidate_before_backup():
+    package = _buy_package(
+        [("SH600001", 2.0, 10.0), ("SH600002", 1.0, 10.0)],
+        topk=1,
+    )
+    market = MarketSnapshot(
+        "2026-08-05",
+        {
+            "SH600001": _quote("SH600001", risk=True),
+            "SH600002": _quote("SH600002"),
+        },
+    )
+
+    result = plan_buys(package, AccountSnapshot(10_000.0, {}), market)
+
+    assert [order.code for order in result.orders] == ["SH600002"]
+    assert [(skip.code, skip.reason) for skip in result.skips] == [("SH600001", "st_risk")]
+
+
+def test_apply_receipts_keeps_unfilled_part_of_partial_sell():
+    account = AccountSnapshot(
+        100.0,
+        {"SH600001": HoldingSnapshot(shares=200, available_shares=200, held_days=2)},
+    )
+
+    updated = apply_receipts(
+        account,
+        [Receipt("SH600001", "sell", 100, 10.0, 5.0, "partial")],
+    )
+
+    assert updated.cash == 1_095.0
+    assert updated.holdings["SH600001"] == HoldingSnapshot(100, 100, 2)

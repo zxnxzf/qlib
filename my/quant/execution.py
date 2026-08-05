@@ -6,11 +6,12 @@
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Protocol
+from typing import Dict, List, Optional, Protocol, Sequence
 
 from . import config as C
 from . import data
 from .portfolio import Order
+from .trade_planner import AccountSnapshot, MarketSnapshot, PlannedOrder
 
 
 @dataclass
@@ -29,9 +30,36 @@ class Executor(Protocol):
     ) -> List[Receipt]: ...
 
 
+class ExecutionAdapter(Protocol):
+    def submit_and_wait(
+        self,
+        orders: Sequence[PlannedOrder],
+        exec_date: str,
+        account: AccountSnapshot,
+        market: MarketSnapshot,
+        wait_seconds: int,
+    ) -> List[Receipt]: ...
+
+
 class ShadowExecutor:
     """影子执行：按 exec_date 真实开盘价 ± 滑点虚拟成交；
     开盘涨停禁买、开盘跌停禁卖、停牌不成交。"""
+
+    def submit_and_wait(
+        self,
+        orders: Sequence[PlannedOrder],
+        exec_date: str,
+        account: AccountSnapshot,
+        market: MarketSnapshot,
+        wait_seconds: int,
+    ) -> List[Receipt]:
+        del market, wait_seconds
+        legacy_orders = [
+            Order(order.code, order.side, order.shares, order.limit_price, order.reason)
+            for order in orders
+        ]
+        holdings = {code: holding.shares for code, holding in account.holdings.items()}
+        return self.settle(legacy_orders, exec_date, account.cash, holdings)
 
     def settle(
         self,
