@@ -261,10 +261,30 @@ def test_two_day_shadow_flow_persists_orders_receipts_and_state(tmp_path, monkey
     second = nightly.run_evening(asof="2026-08-04", skip_update=True, log=lambda _msg: None)
     state = ledger.load_state()
 
-    assert first["orders"] == "buy2/sell0"
+    assert first["prepared"] == "2026-08-04"
     assert second["settled"] == "2/2"
     assert state["pending_exec_date"] == "2026-08-05"
     assert state["holdings"] == {"SH600000": 4700, "SZ000001": 4700}
-    assert (tmp_path / "orders" / "2026-08-04.csv").exists()
-    assert (tmp_path / "receipts" / "2026-08-04.csv").exists()
-    assert (tmp_path / "orders" / "2026-08-05.csv").exists()
+    assert (tmp_path / "signals" / "2026-08-04.json").exists()
+    assert (tmp_path / "orders" / "2026-08-04_buy.csv").exists()
+    assert (tmp_path / "receipts" / "2026-08-04_buy.csv").exists()
+    assert (tmp_path / "signals" / "2026-08-05.json").exists()
+    assert not (tmp_path / "orders" / "2026-08-05_buy.csv").exists()
+
+
+def test_shadow_run_prepare_command(monkeypatch):
+    calls = []
+    monkeypatch.setattr(shadow_run.sys, "argv", ["shadow_run.py", "prepare", "2026-08-04"])
+    monkeypatch.setattr(nightly, "prepare", lambda asof=None: calls.append(asof))
+
+    assert shadow_run.main() == 0
+    assert calls == ["2026-08-04"]
+
+
+def test_shadow_run_execute_command(monkeypatch):
+    calls = []
+    monkeypatch.setattr(shadow_run.sys, "argv", ["shadow_run.py", "execute", "2026-08-05"])
+    monkeypatch.setattr(nightly, "execute", lambda exec_date: calls.append(exec_date))
+
+    assert shadow_run.main() == 0
+    assert calls == ["2026-08-05"]

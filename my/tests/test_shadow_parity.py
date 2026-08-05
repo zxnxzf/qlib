@@ -261,9 +261,9 @@ def test_shadow_replay_uses_warmup_only_to_create_first_order(tmp_path):
     )
 
     assert list(snapshots) == ["2025-01-02"]
-    assert snapshots["2025-01-02"].holdings == {"SH600000": 9_500}
+    assert snapshots["2025-01-02"].holdings == {"SH600000": 9_400}
     assert snapshots["2025-01-02"].orders == [
-        OrderSnapshot("SH600000", "buy", 9_500)
+        OrderSnapshot("SH600000", "buy", 9_400)
     ]
     assert snapshots["2025-01-02"].receipts == {
         ("SH600000", "buy"): "filled"
@@ -302,7 +302,7 @@ def test_shadow_replay_can_disable_price_impact_for_cost_control(tmp_path):
         log=lambda _msg: None,
     )
 
-    receipt = pd.read_csv(tmp_path / "receipts" / "2025-01-02.csv")
+    receipt = pd.read_csv(tmp_path / "receipts" / "2025-01-02_buy.csv")
     assert receipt.loc[0, "price"] == pytest.approx(10.0)
 
 

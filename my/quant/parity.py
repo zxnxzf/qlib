@@ -644,16 +644,24 @@ def validate_replay_inputs(
 
 
 def _receipt_statuses(state_dir: Path, exec_date: str) -> Dict[Tuple[str, str], str]:
-    path = state_dir / "receipts" / f"{exec_date}.csv"
-    if not path.exists():
-        return {}
-    frame = pd.read_csv(path)
-    if frame.empty:
-        return {}
-    return {
-        (str(row.code), str(row.side)): str(row.status)
-        for row in frame.itertuples(index=False)
-    }
+    paths = [
+        state_dir / "receipts" / f"{exec_date}_sell.csv",
+        state_dir / "receipts" / f"{exec_date}_buy.csv",
+    ]
+    if not any(path.exists() for path in paths):
+        paths = [state_dir / "receipts" / f"{exec_date}.csv"]
+    statuses = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        frame = pd.read_csv(path)
+        statuses.update(
+            {
+                (str(row.code), str(row.side)): str(row.status)
+                for row in frame.itertuples(index=False)
+            }
+        )
+    return statuses
 
 
 def run_shadow_replay(
@@ -718,7 +726,9 @@ def run_shadow_replay(
             if date < start:
                 continue
             state = ledger.load_state()
-            orders = ledger.load_orders(date)
+            orders = ledger.load_planned_orders(date, "sell") + ledger.load_planned_orders(date, "buy")
+            if not orders:
+                orders = ledger.load_orders(date)
             snapshots[date] = DailySnapshot(
                 date=date,
                 nav=float(summary["nav"]),

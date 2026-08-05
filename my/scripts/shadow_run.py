@@ -2,7 +2,9 @@
 """影子模式入口（薄壳）。
 
 用法:
-  shadow_run.py nightly                 # 每晚正式运行（更新数据→结算→出单）
+  shadow_run.py prepare [T-1]           # 盘后锁定下一交易日信号包
+  shadow_run.py execute YYYY-MM-DD      # 开盘先卖后买，默认等待30秒
+  shadow_run.py nightly                 # 历史兼容：执行今日批次并准备下一批次
   shadow_run.py backfill A B            # 历史回填验证：对 [A,B] 区间逐个交易日跑（不更新数据）
   shadow_run.py status                  # 打印账户状态与最近净值
 """
@@ -29,6 +31,13 @@ def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "nightly"
     if cmd == "nightly":
         nightly.run_evening()
+    elif cmd == "prepare":
+        nightly.prepare(asof=sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "execute":
+        if len(sys.argv) < 3:
+            print("execute 需要 YYYY-MM-DD 执行日")
+            return 1
+        nightly.execute(sys.argv[2])
     elif cmd == "backfill":
         a, b = sys.argv[2], sys.argv[3]
         state_dir = _configure_backfill_state(a, b)
