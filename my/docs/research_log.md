@@ -2,15 +2,16 @@
 
 由 strategy-research skill 维护。规程见 `.claude/skills/strategy-research/SKILL.md`。
 
-## 当前排行榜（截至 2026-08-01）
+## 当前排行榜（截至 2026-08-04）
 
 | 排名 | 策略 | 毛超额/年 | 净超额/年 | IR(净) | 走到哪关 | 仪表板 |
 |---|---|---|---|---|---|---|
 | 1 | **开盘执行+n_drop2**+5日label+滚动+all_no_bj（含0.1%滑点口径） | +17.8% | **+13.4%** | +0.72 | **决赛候选**：长窗大考通过（2021-22干净段净+29.5%，窗口拟合嫌疑洗清；5.5年净+19.4%/IR1.00/绝对年化+17.7%/绝对回撤-37.2%）；仍未过：IR(1.00/1.5)、长窗2负年、5万不兼容、绝对回撤与用户偏好冲突 | my/artifacts/faux_recorders/candidate_ndrop2_open_exec/recorder_dashboard.html |
-| 2 | 5日label+滚动+全市场过滤入组 | +6.5% | -2.9% | -0.12 | 卡复赛 | my/artifacts/faux_recorders/filtered_rolling/recorder_dashboard.html |
-| 3 | 5日label+滚动+csi300 | +5.9% | -3.1% | -0.36 | 卡复赛 | my/artifacts/faux_recorders/csi300_rolling/recorder_dashboard.html |
-| 4 | 5日label+滚动+all_no_bj（收盘执行） | +5.8% | -3.9% | -0.21 | 卡复赛 | my/artifacts/faux_recorders/all_no_bj_rolling/recorder_dashboard.html |
-| 5 | 5日label+滚动+csi500 | -2.0% | -11.2% | -0.90 | 海选灭 | my/artifacts/faux_recorders/csi500_rolling/recorder_dashboard.html |
+| 2 | 榜首候选+门控V2（中证500温度计，10万） | +17.7% | +12.5% | +0.68 | 部署候选：替代断更的中证全指；邻域稳健，引擎级优于旧985版（净+11.8%/IR0.64/回撤-24.1%） | my/artifacts/faux_recorders/gate905_100k/recorder_dashboard.html |
+| 3 | 5日label+滚动+全市场过滤入组 | +6.5% | -2.9% | -0.12 | 卡复赛 | my/artifacts/faux_recorders/filtered_rolling/recorder_dashboard.html |
+| 4 | 5日label+滚动+csi300 | +5.9% | -3.1% | -0.36 | 卡复赛 | my/artifacts/faux_recorders/csi300_rolling/recorder_dashboard.html |
+| 5 | 5日label+滚动+all_no_bj（收盘执行） | +5.8% | -3.9% | -0.21 | 卡复赛 | my/artifacts/faux_recorders/all_no_bj_rolling/recorder_dashboard.html |
+| 6 | 5日label+滚动+csi500 | -2.0% | -11.2% | -0.90 | 海选灭 | my/artifacts/faux_recorders/csi500_rolling/recorder_dashboard.html |
 | 基准 | 躺平买沪深300ETF | 0 | 0 | — | — | — |
 
 **榜首距验收线**：净 +13.4% 已过净线（含 0.1% 滑点）；IR 0.72 距 1.5 尚远；决赛其余科目与长窗加测进行中。口径升级拍板请求仍待用户。
@@ -75,3 +76,5 @@
 | 08-03 | 修正版集成ensemble3b(严格单变量) | 集成降方差提IR | 毛-3.7pp 净-3.7pp IR0.72→0.51：平均磨掉尖端押注=磨掉alpha | 集成路线淘汰；IR病根=策略经济本性非模型方差；仅剩#12风格约束，若再败则IR 1.5适用性上升为方向级拍板 |
 | 08-03 | 仓位系数全谱扫描(门控V2引擎账本+货基计息+压力口径×1.3) | 定起步仓位 | 40%：历史回撤-10.1%正合上限、压力-13.1%属稍超、年化+8.2%、最惨季度-8.8% | 推荐起步40%（30%保守/50%上限），升级与IR仓位闸门咬合；待用户确认 |
 | 08-03 | 仓位引擎级修正版(子账户4/7/8万) | 正确实现仓位打折 | 断崖惩罚=收益减半回撤不减(4万档8.6%/-24.6%)；账户级40%仓达标-9.9%但年化仅4.3%；risk_degree路线证伪(非仓位控制)；算术近似高估40%档收益近一倍 | 结论：10万下回撤≤10%与不变形不可兼得；可行解=总资金≥20万×50%仓，或满仓+外部资金定尺寸；三选一待用户 |
+| 08-04 | 数据源可靠性审计(100个release/4月) | 用户提醒数据包迟发 | 已发布者0/100超次日8:30；但缺发≈15/83工作日（含7月上旬连续5天断供）→缺发次日=强制停摆日 | 影子模式增加停摆统计；备选保险=Tushare 200元/年；停摆期间持仓裸奔+门控失明为主要风险 |
+| 08-04 | 门控温度计替换（SH000905） | SH000985 断更后需可持续替代 | 邻域 MA15/20/30、确认2/3/4天、回场2/2.5/3% 全为正；10万引擎净+12.52%/IR0.68/回撤-21.7%，均优于旧985版 | 采用 SH000905；报告、MLflow(run 4258b7df…)和仪表板已落档；仍未达到IR 1.5 |
