@@ -55,9 +55,17 @@ def _write_valid_release(package: Path, date: str = "2026-08-14"):
         "rolling_window": workflow.rolling_window(date).as_dict(),
         "validation": {
             "approved": True,
+            "method": "archived_score_reconstruction",
             "report_path": f"releases/{rid}-validation.md",
             "report_sha256": _sha256(report),
             "approved_at": "2026-08-14T23:30:00+08:00",
+            "archive_score_sha256": workflow.APPROVED_ARCHIVE_REFERENCES[rid]["sha256"],
+            "overlap": workflow.APPROVED_ARCHIVE_REFERENCES[rid]["overlap"],
+            "max_abs_diff": 0.0,
+            "top_n": workflow.APPROVED_ARCHIVE_REFERENCES[rid]["top_n"],
+            "min_daily_top_overlap": 1.0,
+            "extra_in_rebuilt": 0,
+            "min_daily_production_top_overlap": 1.0,
         },
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -134,6 +142,147 @@ def test_training_and_scoring_feature_schema_share_one_canonical_shape():
     assert workflow.feature_columns_sha256(training_columns) == workflow.feature_columns_sha256(
         [["F0"], ["F1"]]
     )
+
+
+def test_candidate_must_reproduce_archived_scores_before_promotion(tmp_path, monkeypatch):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    candidate_model = candidate / "model.txt"
+    candidate_model.write_text("native model", encoding="utf-8")
+    index = pd.MultiIndex.from_product(
+        [pd.to_datetime(["2026-07-01", "2026-07-02"]), ["SH600000", "SZ000001", "SZ000002"]],
+        names=["datetime", "instrument"],
+    )
+    features = pd.DataFrame({"F0": [0.6, 0.4, 0.2, 0.1, 0.3, 0.5]}, index=index)
+    archive = features.rename(columns={"F0": "score"})
+    archive_path = tmp_path / "archive.pkl"
+    archive.to_pickle(archive_path)
+    monkeypatch.setitem(
+        workflow.APPROVED_ARCHIVE_REFERENCES,
+        "2026Q3",
+        {
+            "path": str(archive_path),
+            "sha256": _sha256(archive_path),
+            "overlap": {"start": "2026-07-01", "end": "2026-07-02", "rows": 6, "days": 2},
+            "top_n": 2,
+            "absolute_tolerance": 1e-12,
+        },
+    )
+    metadata = {
+        "release_id": "2026Q3",
+        "model": {"sha256": _sha256(candidate_model)},
+        "feature_schema": {"columns": [["F0"]]},
+    }
+
+    class Booster:
+        def predict(self, values):
+            return values[:, 0]
+
+    class Handler:
+        def fetch(self, **_kwargs):
+            return features
+
+    monkeypatch.setattr(
+        workflow,
+        "_load_candidate",
+        lambda *_args, **_kwargs: (candidate, metadata, candidate_model, Booster()),
+    )
+    monkeypatch.setattr(workflow, "_build_handler", lambda *_args: Handler())
+
+    evidence_path = workflow.validate_candidate_against_archive(
+        "2026-08-14", archive_path, output_dir=candidate, log=lambda _message: None
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+
+    assert evidence["status"] == "passed"
+    assert evidence["overlap"] == {
+        "start": "2026-07-01",
+        "end": "2026-07-02",
+        "rows": 6,
+        "days": 2,
+    }
+    assert evidence["comparison"]["max_abs_diff"] == 0.0
+    assert evidence["comparison"]["min_daily_top_overlap"] == 1.0
+
+
+def test_promote_candidate_requires_passed_evidence_and_writes_manifest(tmp_path, monkeypatch):
+    candidate = tmp_path / "candidate"
+    package = tmp_path / "package"
+    candidate.mkdir()
+    (package / "releases").mkdir(parents=True)
+    candidate_model = candidate / "model.txt"
+    candidate_model.write_text("native model", encoding="utf-8")
+    model_hash = _sha256(candidate_model)
+    metadata = {
+        "strategy_id": C.STRATEGY_ID,
+        "release_id": "2026Q3",
+        "config_sha256": "1" * 64,
+        "runtime_code_sha256": "2" * 64,
+        "source_git_commit": _git_head(),
+        "model": {"sha256": model_hash, "best_iteration": 17},
+        "feature_schema": {"columns": [["F0"]], "count": 1, "sha256": "3" * 64},
+        "rolling_window": workflow.rolling_window("2026-08-14").as_dict(),
+        "row_counts": {"train": 100, "validation": 20},
+    }
+    evidence = {
+        "schema_version": 1,
+        "status": "passed",
+        "strategy_id": C.STRATEGY_ID,
+        "release_id": "2026Q3",
+        "candidate_model_sha256": model_hash,
+        "archive_path": str(tmp_path / "archive.pkl"),
+        "archive_sha256": "4" * 64,
+        "overlap": {"start": "2026-07-01", "end": "2026-07-28", "rows": 20, "days": 20},
+        "comparison": {
+            "missing_in_rebuilt": 0,
+            "extra_in_rebuilt": 0,
+            "max_abs_diff": 0.0,
+            "top_n": 100,
+            "min_daily_top_overlap": 1.0,
+            "daily_top_overlap": {f"day-{index}": 1.0 for index in range(20)},
+            "min_daily_production_top_overlap": 1.0,
+            "daily_production_top_overlap": {f"day-{index}": 1.0 for index in range(20)},
+        },
+    }
+    (candidate / "validation.json").write_text(json.dumps(evidence), encoding="utf-8")
+    report = package / "releases" / "2026Q3-validation.md"
+    report.write_text("approved\n", encoding="utf-8")
+    monkeypatch.setattr(
+        workflow,
+        "_load_candidate",
+        lambda *_args, **_kwargs: (candidate, metadata, candidate_model, object()),
+    )
+    monkeypatch.setitem(
+        workflow.APPROVED_ARCHIVE_REFERENCES,
+        "2026Q3",
+        {
+            "path": str(tmp_path / "archive.pkl"),
+            "sha256": "4" * 64,
+            "overlap": {"start": "2026-07-01", "end": "2026-07-28", "rows": 20, "days": 20},
+            "top_n": 100,
+            "absolute_tolerance": 1e-12,
+        },
+    )
+    monkeypatch.setattr(
+        workflow,
+        "validate_candidate_against_archive",
+        lambda *_args, **_kwargs: candidate / "validation.json",
+    )
+
+    manifest_path = workflow.promote_candidate(
+        "2026-08-14",
+        output_dir=candidate,
+        package_dir=package,
+        approved_at="2026-08-14T20:00:00+08:00",
+        log=lambda _message: None,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert (package / "models" / "2026Q3.txt").read_bytes() == candidate_model.read_bytes()
+    assert manifest["status"] == "published"
+    assert manifest["model"]["sha256"] == model_hash
+    assert manifest["validation"]["archive_score_sha256"] == "4" * 64
+    assert manifest["validation"]["report_sha256"] == _sha256(report)
 
 
 @pytest.mark.parametrize(

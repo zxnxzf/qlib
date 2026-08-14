@@ -6,10 +6,13 @@ never runs as a fallback from production.
 """
 
 import argparse
+import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +56,26 @@ class PublishedRelease:
     manifest_path: Path
     manifest: dict
     booster: Optional[object] = None
+
+
+# The first production release reconstructs a model that originally existed
+# only in memory.  Pin the accepted archive here so an arbitrary/small pickle
+# cannot be substituted at promotion time.  Future releases need their own
+# reviewed validation method instead of silently reusing this reference.
+APPROVED_ARCHIVE_REFERENCES = {
+    "2026Q3": {
+        "path": "my/artifacts/candidate1_pred.pkl",
+        "sha256": "b9a0d99b2dfbb5e1ee3db8ba5f91f99897a06ecf927cc06eaa0adf986203145f",
+        "overlap": {
+            "start": "2026-07-01",
+            "end": "2026-07-28",
+            "rows": 104113,
+            "days": 20,
+        },
+        "top_n": 100,
+        "absolute_tolerance": 1e-12,
+    }
+}
 
 
 def quarter_start(date: str) -> pd.Timestamp:
@@ -178,7 +201,10 @@ def split_learning_data(
         (dates >= pd.Timestamp(window.validation_start))
         & (dates < pd.Timestamp(window.validation_end_exclusive))
     ]
-    return train[train[label_column].notna()], validation[validation[label_column].notna()]
+    return (
+        train[train[label_column].notna()].sort_index(),
+        validation[validation[label_column].notna()].sort_index(),
+    )
 
 
 def _inside_package(package: Path, relative_path: str) -> Path:
@@ -242,7 +268,9 @@ def _clean_source_commit() -> str:
         text=True,
     )
     if status.stdout.strip():
-        raise RuntimeError("候选训练前必须先提交策略包和运行代码，禁止从未提交源码训练正式候选")
+        raise RuntimeError(
+            "候选训练前必须先提交策略包和运行代码，禁止从未提交源码训练正式候选"
+        )
     return subprocess.run(
         ["git", "-C", str(C.REPO), "rev-parse", "HEAD"],
         check=True,
@@ -345,6 +373,7 @@ def validate_release(for_date: str, package_dir: Optional[Path] = None) -> Publi
     validation = _required(manifest, "validation")
     if validation.get("approved") is not True:
         raise ReleaseValidationError(f"{expected_release} 没有通过回测批准")
+    _validate_release_reconstruction(validation, expected_release)
     report_relative = validation.get("report_path")
     if report_relative != f"releases/{expected_release}-validation.md":
         raise ReleaseValidationError("发布验证报告必须使用约定的Markdown路径")
@@ -427,7 +456,7 @@ def scores_for(date: str, log=print, published: Optional[PublishedRelease] = Non
     handler = _build_handler(start, date)
     infer = handler.fetch(col_set="feature", data_key=DataHandlerLP.DK_I)
     dates = infer.index.get_level_values("datetime")
-    day = infer[dates == pd.Timestamp(date)]
+    day = infer[dates == pd.Timestamp(date)].sort_index()
     if day.empty:
         raise RuntimeError(f"{date} 无特征数据")
 
@@ -462,6 +491,387 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_copy(source: Path, target: Path, expected_sha256: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    with source.open("rb") as source_stream, temporary.open("wb") as target_stream:
+        shutil.copyfileobj(source_stream, target_stream)
+        target_stream.flush()
+        os.fsync(target_stream.fileno())
+    if _file_sha256(temporary) != expected_sha256:
+        temporary.unlink(missing_ok=True)
+        raise ReleaseValidationError("候选模型复制期间发生变化")
+    os.replace(temporary, target)
+
+
+def candidate_dir(for_date: str, output_dir: Optional[Path] = None) -> Path:
+    window = rolling_window(for_date)
+    if output_dir is not None:
+        return Path(output_dir)
+    return C.ARTIFACTS / "strategy_candidates" / C.STRATEGY_ID / window.release_id
+
+
+def _load_candidate(for_date: str, output_dir: Optional[Path] = None):
+    """Load and validate an ignored research candidate before comparison/promotion."""
+    window = rolling_window(for_date)
+    target = candidate_dir(for_date, output_dir)
+    metadata_path = target / "candidate.json"
+    if not metadata_path.is_file():
+        raise ReleaseValidationError(f"候选元数据不存在: {metadata_path}")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseValidationError(f"候选元数据不可读: {metadata_path}") from exc
+
+    if metadata.get("schema_version") != 1 or metadata.get("status") != "candidate":
+        raise ReleaseValidationError("候选元数据版本或状态无效")
+    if metadata.get("strategy_id") != C.STRATEGY_ID or metadata.get("release_id") != window.release_id:
+        raise ReleaseValidationError("候选策略或季度与当前请求不一致")
+    if metadata.get("config_sha256") != config_sha256():
+        raise ReleaseValidationError("候选训练后策略配置已变化")
+    if metadata.get("runtime_code_sha256") != runtime_code_sha256():
+        raise ReleaseValidationError("候选训练后评分/规划代码已变化")
+    if metadata.get("rolling_window") != window.as_dict():
+        raise ReleaseValidationError("候选训练窗口与当前 rolling.yaml 不一致")
+    source_git_commit = metadata.get("source_git_commit")
+    if not isinstance(source_git_commit, str):
+        raise ReleaseValidationError("候选缺少有效来源提交")
+    _validate_source_commit(source_git_commit)
+
+    model = _required(metadata, "model")
+    if model.get("path") != "model.txt" or model.get("format") != "lightgbm_native_booster":
+        raise ReleaseValidationError("候选模型路径或格式无效")
+    candidate_model = target / "model.txt"
+    if not candidate_model.is_file() or _file_sha256(candidate_model) != model.get("sha256"):
+        raise ReleaseValidationError("候选模型缺失或SHA-256校验失败")
+
+    feature_schema = _required(metadata, "feature_schema")
+    columns = _required(feature_schema, "columns")
+    if normalize_feature_columns(columns) != columns:
+        raise ReleaseValidationError("候选特征列不是标准评分格式")
+    if feature_schema.get("count") != len(columns):
+        raise ReleaseValidationError("候选特征列数不一致")
+    if feature_columns_sha256(columns) != feature_schema.get("sha256"):
+        raise ReleaseValidationError("候选特征顺序哈希不一致")
+
+    try:
+        import lightgbm as lgb
+
+        booster = lgb.Booster(model_file=str(candidate_model))
+    except Exception as exc:
+        raise ReleaseValidationError("候选不是可加载的LightGBM原生Booster") from exc
+    if booster.num_feature() != len(columns):
+        raise ReleaseValidationError("候选模型特征数与元数据不一致")
+    return target, metadata, candidate_model, booster
+
+
+def _score_series(value, source: str) -> pd.Series:
+    if isinstance(value, pd.DataFrame):
+        if "score" not in value.columns:
+            raise ReleaseValidationError(f"{source}缺少score列")
+        value = value["score"]
+    if not isinstance(value, pd.Series):
+        raise ReleaseValidationError(f"{source}必须是Series或含score列的DataFrame")
+    if not isinstance(value.index, pd.MultiIndex) or set(value.index.names) != {"datetime", "instrument"}:
+        raise ReleaseValidationError(f"{source}索引必须为datetime/instrument")
+    if value.index.names != ["datetime", "instrument"]:
+        value = value.reorder_levels(["datetime", "instrument"])
+    value = pd.to_numeric(value, errors="coerce").rename("score").sort_index()
+    if not value.index.is_unique:
+        raise ReleaseValidationError(f"{source}存在重复日期/股票")
+    return value
+
+
+def _top_codes(scores: pd.Series, limit: int) -> set:
+    frame = scores.rename("score").reset_index()
+    frame["instrument"] = frame["instrument"].astype(str)
+    frame = frame.dropna(subset=["score"]).sort_values(
+        ["score", "instrument"], ascending=[False, True], kind="mergesort"
+    )
+    return set(frame.head(limit)["instrument"])
+
+
+def _archive_reference(for_date: str) -> dict:
+    value = str(for_date)
+    rid = value if value in APPROVED_ARCHIVE_REFERENCES else release_id(value)
+    reference = APPROVED_ARCHIVE_REFERENCES.get(rid)
+    if reference is None:
+        raise ReleaseValidationError(f"{rid}没有锁定的归档重建基线，不能使用旧模型重建流程")
+    return reference
+
+
+def _validate_reconstruction_evidence(evidence: dict, metadata: dict) -> None:
+    reference = _archive_reference(metadata["release_id"])
+    comparison = _required(evidence, "comparison")
+    expected_path = reference["path"]
+    expected_overlap = reference["overlap"]
+    if evidence.get("schema_version") != 1 or evidence.get("status") != "passed":
+        raise ReleaseValidationError("候选归档评分校验未通过")
+    if evidence.get("strategy_id") != C.STRATEGY_ID or evidence.get("release_id") != metadata["release_id"]:
+        raise ReleaseValidationError("候选归档校验证据的策略或季度不一致")
+    if evidence.get("candidate_model_sha256") != metadata["model"]["sha256"]:
+        raise ReleaseValidationError("候选模型与归档校验证据不一致")
+    if evidence.get("archive_path") != expected_path or evidence.get("archive_sha256") != reference["sha256"]:
+        raise ReleaseValidationError("归档评分路径或SHA-256不是已批准基线")
+    if evidence.get("overlap") != expected_overlap:
+        raise ReleaseValidationError("归档评分覆盖区间或行数不是已批准基线")
+    if comparison.get("missing_in_rebuilt") != 0:
+        raise ReleaseValidationError("重建评分缺少归档股票/日期")
+    if not isinstance(comparison.get("extra_in_rebuilt"), int) or comparison["extra_in_rebuilt"] < 0:
+        raise ReleaseValidationError("重建评分新增数据行证据无效")
+    max_abs_diff = comparison.get("max_abs_diff")
+    if not isinstance(max_abs_diff, (int, float)) or max_abs_diff > reference["absolute_tolerance"]:
+        raise ReleaseValidationError("重建评分数值误差超过批准阈值")
+    if comparison.get("top_n") != reference["top_n"]:
+        raise ReleaseValidationError("重建评分排名口径不一致")
+    if comparison.get("min_daily_top_overlap") != 1.0:
+        raise ReleaseValidationError("重建评分每日Top队列未完全一致")
+    daily = comparison.get("daily_top_overlap")
+    if not isinstance(daily, dict) or len(daily) != expected_overlap["days"] or set(daily.values()) != {1.0}:
+        raise ReleaseValidationError("重建评分逐日Top队列证据不完整")
+
+
+def _validate_release_reconstruction(validation: dict, rid: str) -> None:
+    reference = _archive_reference(rid)
+    if validation.get("method") != "archived_score_reconstruction":
+        raise ReleaseValidationError("正式发布未声明归档评分重建校验")
+    if validation.get("archive_score_sha256") != reference["sha256"]:
+        raise ReleaseValidationError("正式发布的归档评分SHA-256不一致")
+    if validation.get("overlap") != reference["overlap"]:
+        raise ReleaseValidationError("正式发布的归档重叠覆盖不一致")
+    if validation.get("top_n") != reference["top_n"]:
+        raise ReleaseValidationError("正式发布的排名校验口径不一致")
+    max_abs_diff = validation.get("max_abs_diff")
+    if not isinstance(max_abs_diff, (int, float)) or max_abs_diff > reference["absolute_tolerance"]:
+        raise ReleaseValidationError("正式发布的评分重建误差超过阈值")
+    if validation.get("min_daily_top_overlap") != 1.0:
+        raise ReleaseValidationError("正式发布的每日Top队列没有完全重合")
+    if not isinstance(validation.get("extra_in_rebuilt"), int) or validation["extra_in_rebuilt"] < 0:
+        raise ReleaseValidationError("正式发布缺少新增数据行证据")
+    production_overlap = validation.get("min_daily_production_top_overlap")
+    if not isinstance(production_overlap, (int, float)) or not 0.0 <= production_overlap <= 1.0:
+        raise ReleaseValidationError("正式发布的当前数据Top队列证据无效")
+
+
+def validate_candidate_against_archive(
+    for_date: str,
+    archive_path: Path,
+    output_dir: Optional[Path] = None,
+    log=print,
+) -> Path:
+    """Re-score the archived overlap and require exact model reconstruction."""
+    target, metadata, candidate_model, booster = _load_candidate(for_date, output_dir)
+    reference = _archive_reference(for_date)
+    archive_path = Path(archive_path)
+    if not archive_path.is_file():
+        raise FileNotFoundError(archive_path)
+    expected_archive = (C.REPO / reference["path"]).resolve()
+    if archive_path.resolve() != expected_archive:
+        raise ReleaseValidationError(f"只允许使用已锁定归档评分: {reference['path']}")
+    if _file_sha256(archive_path) != reference["sha256"]:
+        raise ReleaseValidationError("已锁定归档评分SHA-256不一致，禁止反序列化")
+    top_n = int(reference["top_n"])
+    atol = float(reference["absolute_tolerance"])
+    archived = _score_series(pd.read_pickle(archive_path), "归档评分")
+    window = rolling_window(for_date)
+    dates = archived.index.get_level_values("datetime")
+    archived = archived[
+        (dates >= pd.Timestamp(window.prediction_start))
+        & (dates < pd.Timestamp(window.prediction_end_exclusive))
+    ]
+    if archived.empty:
+        raise ReleaseValidationError(f"归档评分不包含{window.release_id}重叠区间")
+    actual_overlap = {
+        "start": archived.index.get_level_values("datetime").min().strftime("%Y-%m-%d"),
+        "end": archived.index.get_level_values("datetime").max().strftime("%Y-%m-%d"),
+        "rows": int(len(archived)),
+        "days": int(archived.index.get_level_values("datetime").nunique()),
+    }
+    if actual_overlap != reference["overlap"]:
+        raise ReleaseValidationError("已锁定归档评分覆盖区间或行数不一致")
+
+    last_date = archived.index.get_level_values("datetime").max().strftime("%Y-%m-%d")
+    handler = _build_handler(window.prediction_start, last_date)
+    from qlib.data.dataset.handler import DataHandlerLP
+
+    features = handler.fetch(col_set="feature", data_key=DataHandlerLP.DK_I)
+    feature_dates = features.index.get_level_values("datetime")
+    features = features[
+        (feature_dates >= pd.Timestamp(window.prediction_start))
+        & (feature_dates <= pd.Timestamp(last_date))
+    ].sort_index()
+    actual_columns = normalize_feature_columns(features.columns)
+    if actual_columns != metadata["feature_schema"]["columns"]:
+        raise ReleaseValidationError("候选重评分的Alpha158特征列或顺序不一致")
+    rebuilt = _score_series(
+        pd.Series(booster.predict(features.values), index=features.index, name="score"),
+        "重建评分",
+    )
+
+    missing_in_rebuilt = archived.index.difference(rebuilt.index)
+    extra_in_rebuilt = rebuilt.index.difference(archived.index)
+    common = archived.index.intersection(rebuilt.index)
+    archived_common = archived.loc[common]
+    rebuilt_common = rebuilt.loc[common]
+    both_missing = rebuilt_common.isna() & archived_common.isna()
+    difference = (rebuilt_common - archived_common).abs()[~both_missing]
+    max_abs_diff = float(difference.max()) if len(difference) else None
+    mean_abs_diff = float(difference.mean()) if len(difference) else None
+    values_equal = bool(
+        len(common)
+        and (difference.fillna(float("inf")) <= atol).all()
+        and rebuilt_common.isna().equals(archived_common.isna())
+    )
+    pearson = float(rebuilt_common.corr(archived_common)) if len(common) > 1 else None
+    if pearson is not None and not math.isfinite(pearson):
+        pearson = None
+
+    overlaps = {}
+    production_overlaps = {}
+    rebuilt_dates = set(rebuilt.index.get_level_values("datetime"))
+    for date in sorted(set(archived.index.get_level_values("datetime"))):
+        old_day = archived.xs(date, level="datetime")
+        new_day = (
+            rebuilt.xs(date, level="datetime")
+            if date in rebuilt_dates
+            else pd.Series(dtype=float)
+        )
+        old_codes = set(old_day.index.astype(str))
+        new_on_archive = new_day[new_day.index.astype(str).isin(old_codes)]
+        denominator = min(top_n, len(old_day), len(new_on_archive))
+        overlap = (
+            len(_top_codes(old_day, top_n) & _top_codes(new_on_archive, top_n)) / denominator
+            if denominator
+            else 0.0
+        )
+        production_denominator = min(top_n, len(old_day), len(new_day))
+        production_overlap = (
+            len(_top_codes(old_day, top_n) & _top_codes(new_day, top_n)) / production_denominator
+            if production_denominator
+            else 0.0
+        )
+        overlaps[date.strftime("%Y-%m-%d")] = overlap
+        production_overlaps[date.strftime("%Y-%m-%d")] = production_overlap
+    min_top_overlap = min(overlaps.values()) if overlaps else 0.0
+    min_production_top_overlap = min(production_overlaps.values()) if production_overlaps else 0.0
+    passed = bool(
+        not len(missing_in_rebuilt)
+        and values_equal
+        and min_top_overlap == 1.0
+    )
+    try:
+        archive_display_path = archive_path.resolve().relative_to(C.REPO.resolve()).as_posix()
+    except ValueError:
+        archive_display_path = str(archive_path.resolve())
+    evidence = {
+        "schema_version": 1,
+        "status": "passed" if passed else "failed",
+        "strategy_id": C.STRATEGY_ID,
+        "release_id": window.release_id,
+        "candidate_model_sha256": _file_sha256(candidate_model),
+        "archive_path": archive_display_path,
+        "archive_sha256": _file_sha256(archive_path),
+        "overlap": actual_overlap,
+        "comparison": {
+            "missing_in_rebuilt": int(len(missing_in_rebuilt)),
+            "extra_in_rebuilt": int(len(extra_in_rebuilt)),
+            "max_abs_diff": max_abs_diff,
+            "mean_abs_diff": mean_abs_diff,
+            "pearson": pearson,
+            "top_n": int(top_n),
+            "min_daily_top_overlap": float(min_top_overlap),
+            "daily_top_overlap": overlaps,
+            "min_daily_production_top_overlap": float(min_production_top_overlap),
+            "daily_production_top_overlap": production_overlaps,
+            "absolute_tolerance": float(atol),
+        },
+    }
+    evidence_path = target / "validation.json"
+    _atomic_write_json(evidence_path, evidence)
+    log(
+        f"[candidate] {window.release_id}归档校验: rows={len(archived):,} "
+        f"max_abs_diff={max_abs_diff} Top{top_n}归档域最低重合={min_top_overlap:.2%} "
+        f"新增数据行={len(extra_in_rebuilt)}"
+    )
+    if not passed:
+        raise ReleaseValidationError(f"{window.release_id}未能精确重建归档评分，证据见 {evidence_path}")
+    _validate_reconstruction_evidence(evidence, metadata)
+    return evidence_path
+
+
+def promote_candidate(
+    for_date: str,
+    output_dir: Optional[Path] = None,
+    package_dir: Optional[Path] = None,
+    approved_at: Optional[str] = None,
+    log=print,
+) -> Path:
+    """Promote only an archive-validated candidate into the tracked package."""
+    target, metadata, candidate_model, _booster = _load_candidate(for_date, output_dir)
+    reference = _archive_reference(for_date)
+    evidence_path = validate_candidate_against_archive(
+        for_date,
+        C.REPO / reference["path"],
+        output_dir=target,
+        log=log,
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    _validate_reconstruction_evidence(evidence, metadata)
+
+    package = Path(package_dir) if package_dir is not None else C.STRATEGY_DIR
+    rid = metadata["release_id"]
+    promoted_model = model_path(for_date, package)
+    promoted_manifest = manifest_path(for_date, package)
+    report_path = package / "releases" / f"{rid}-validation.md"
+    if not report_path.is_file():
+        raise ReleaseValidationError(f"请先评审并写入验证报告: {report_path}")
+    if promoted_manifest.exists():
+        raise FileExistsError(f"{rid}正式发布清单已存在，发布不可覆盖")
+    if promoted_model.exists() and _file_sha256(promoted_model) != metadata["model"]["sha256"]:
+        raise FileExistsError(f"{rid}正式模型已存在且内容不同，拒绝覆盖")
+
+    approved_at = approved_at or dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    comparison = evidence["comparison"]
+    manifest = {
+        "schema_version": 1,
+        "strategy_id": C.STRATEGY_ID,
+        "release_id": rid,
+        "status": "published",
+        "config_sha256": metadata["config_sha256"],
+        "runtime_code_sha256": metadata["runtime_code_sha256"],
+        "source_git_commit": metadata["source_git_commit"],
+        "model": {
+            "path": f"models/{rid}.txt",
+            "format": "lightgbm_native_booster",
+            "sha256": metadata["model"]["sha256"],
+            "best_iteration": metadata["model"]["best_iteration"],
+        },
+        "feature_schema": metadata["feature_schema"],
+        "rolling_window": metadata["rolling_window"],
+        "row_counts": metadata["row_counts"],
+        "validation": {
+            "approved": True,
+            "approved_at": approved_at,
+            "method": "archived_score_reconstruction",
+            "report_path": f"releases/{rid}-validation.md",
+            "report_sha256": _file_sha256(report_path),
+            "archive_score_sha256": evidence["archive_sha256"],
+            "overlap": evidence["overlap"],
+            "max_abs_diff": comparison["max_abs_diff"],
+            "top_n": comparison["top_n"],
+            "min_daily_top_overlap": comparison["min_daily_top_overlap"],
+            "extra_in_rebuilt": comparison["extra_in_rebuilt"],
+            "min_daily_production_top_overlap": comparison["min_daily_production_top_overlap"],
+        },
+    }
+    _validate_release_reconstruction(manifest["validation"], rid)
+    if not promoted_model.exists():
+        _atomic_copy(candidate_model, promoted_model, metadata["model"]["sha256"])
+    _atomic_write_json(promoted_manifest, manifest)
+    log(f"[candidate] {rid}已生成正式发布文件；提交Git后再运行verify")
+    return promoted_manifest
+
+
 def train_candidate(
     for_date: str,
     output_dir: Optional[Path] = None,
@@ -470,11 +880,7 @@ def train_candidate(
 ) -> Path:
     """Explicitly train an unapproved native Booster under my/artifacts/."""
     window = rolling_window(for_date)
-    target = (
-        Path(output_dir)
-        if output_dir is not None
-        else C.ARTIFACTS / "strategy_candidates" / C.STRATEGY_ID / window.release_id
-    )
+    target = candidate_dir(for_date, output_dir)
     candidate_model = target / "model.txt"
     candidate_metadata = target / "candidate.json"
     if not overwrite and (candidate_model.exists() or candidate_metadata.exists()):
@@ -555,13 +961,29 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     train.add_argument("date")
     train.add_argument("--output-dir", type=Path)
     train.add_argument("--overwrite", action="store_true")
+    compare = subparsers.add_parser("compare-candidate", help="与归档评分精确比对候选")
+    compare.add_argument("date")
+    compare.add_argument("--archive", type=Path, required=True)
+    compare.add_argument("--output-dir", type=Path)
+    promote = subparsers.add_parser("promote-candidate", help="提升已校验候选为待提交正式发布")
+    promote.add_argument("date")
+    promote.add_argument("--output-dir", type=Path)
+    promote.add_argument("--approved-at")
     args = parser.parse_args(argv)
 
     if args.command == "verify":
         published = validate_release(args.date)
         print(f"{published.release_id}: {published.model_path}")
-    else:
+    elif args.command == "train-candidate":
         train_candidate(args.date, output_dir=args.output_dir, overwrite=args.overwrite)
+    elif args.command == "compare-candidate":
+        validate_candidate_against_archive(args.date, args.archive, output_dir=args.output_dir)
+    else:
+        promote_candidate(
+            args.date,
+            output_dir=args.output_dir,
+            approved_at=args.approved_at,
+        )
     return 0
 
 

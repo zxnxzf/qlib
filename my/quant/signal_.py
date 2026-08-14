@@ -9,9 +9,11 @@ from pathlib import Path
 
 from my.strategies.lgb_alpha158_gate905_v1.workflow import (
     ReleaseValidationError,
+    candidate_dir,
     config_sha256,
     manifest_path,
     model_path,
+    promote_candidate,
     quarter_start,
     release_provenance,
     release_id,
@@ -19,6 +21,7 @@ from my.strategies.lgb_alpha158_gate905_v1.workflow import (
     runtime_code_sha256,
     scores_for,
     train_candidate,
+    validate_candidate_against_archive,
     validate_release,
 )
 
@@ -32,10 +35,12 @@ def ensure_model(for_date: str, log=print) -> Path:
 
 __all__ = [
     "ReleaseValidationError",
+    "candidate_dir",
     "config_sha256",
     "ensure_model",
     "manifest_path",
     "model_path",
+    "promote_candidate",
     "quarter_start",
     "release_provenance",
     "release_id",
@@ -43,5 +48,6 @@ __all__ = [
     "runtime_code_sha256",
     "scores_for",
     "train_candidate",
+    "validate_candidate_against_archive",
     "validate_release",
 ]

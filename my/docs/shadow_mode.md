@@ -44,11 +44,18 @@
 # 仅在允许的重训时段显式训练候选；产物仍在my/artifacts，不会自动发布
 .venv/bin/python -m my.strategies.lgb_alpha158_gate905_v1.workflow train-candidate 2026-08-14
 
+# 候选必须与已验收归档评分逐值一致，并且每日Top100完全重合
+.venv/bin/python -m my.strategies.lgb_alpha158_gate905_v1.workflow compare-candidate 2026-08-14 \
+  --archive my/artifacts/candidate1_pred.pkl
+
+# 先人工评审并写入releases/2026Q3-validation.md，再生成待提交的正式模型和清单
+.venv/bin/python -m my.strategies.lgb_alpha158_gate905_v1.workflow promote-candidate 2026-08-14
+
 # 发布后校验某个信号日应使用的季度模型
 .venv/bin/python -m my.strategies.lgb_alpha158_gate905_v1.workflow verify 2026-08-14
 ```
 
-工作日重训只在 23:00 后启动。候选模型必须先完成回测、生成验证报告和发布清单，才能复制为 `models/YYYYQn.txt`。回填账本写入 `my/quant_state/backfills/`，正式账本写入 `my/quant_state/`；两者不得混用，整个账本目录不会提交 Git。
+工作日重训只在 23:00 后启动。候选必须先与已验收归档评分完成索引、逐值和每日Top100校验，再生成验证报告；`promote-candidate` 只提升通过校验的候选。回填账本写入 `my/quant_state/backfills/`，正式账本写入 `my/quant_state/`；两者不得混用，整个账本目录不会提交 Git。
 
 `compare_shadow_backtest.py` 是受控的历史对账工具：它显式注入 `candidate1_pred.pkl` 归档评分并绕过正式模型加载，只用于验证交易逻辑；普通 `prepare/nightly/backfill` 不享受这个例外。
 
