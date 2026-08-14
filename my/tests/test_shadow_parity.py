@@ -276,7 +276,7 @@ def test_market_cache_carries_last_raw_close_through_suspension():
     assert cache.raw_closes_on("2025-01-03").loc["SZ300307"] == pytest.approx(10.0)
 
 
-def test_shadow_replay_uses_warmup_only_to_create_first_order(tmp_path):
+def test_shadow_replay_uses_warmup_only_to_create_first_order(tmp_path, monkeypatch):
     dates = [pd.Timestamp("2024-12-31"), pd.Timestamp("2025-01-02")]
     instruments = ["SH600000"]
     index = pd.MultiIndex.from_product(
@@ -302,6 +302,11 @@ def test_shadow_replay_uses_warmup_only_to_create_first_order(tmp_path):
     gates = pd.Series(
         [True, True],
         index=[pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03")],
+    )
+    monkeypatch.setattr(
+        parity.signal_,
+        "validate_release",
+        lambda _date: (_ for _ in ()).throw(AssertionError("archived replay must not load a model")),
     )
 
     snapshots = run_shadow_replay(

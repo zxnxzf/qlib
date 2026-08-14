@@ -290,8 +290,23 @@ def test_two_day_shadow_flow_persists_orders_receipts_and_state(tmp_path, monkey
     )
     monkeypatch.setattr(data, "day_bars", lambda *_args, **_kwargs: bars)
     monkeypatch.setattr(gate, "gate_for_next_day", lambda _date: (True, "test gate on"))
+    monkeypatch.setattr(signal_, "validate_release", lambda _date: None)
+    monkeypatch.setattr(
+        signal_,
+        "release_provenance",
+        lambda _published: {
+            "source_type": "published_model",
+            "strategy_id": C.STRATEGY_ID,
+            "release_id": "2026Q3",
+            "model_sha256": "1" * 64,
+            "config_sha256": "2" * 64,
+            "runtime_code_sha256": "3" * 64,
+            "source_git_commit": "4" * 40,
+        },
+    )
 
-    def scores_for(date, log=print):
+    def scores_for(date, log=print, published=None):
+        del published
         values = {
             "2026-08-03": [3.0, 2.0, 1.0],
             "2026-08-04": [1.0, 2.0, 3.0],

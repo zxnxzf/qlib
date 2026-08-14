@@ -45,7 +45,7 @@ class SharedPlannerStrategy(BaseSignalStrategy):
         gate: pd.Series,
         topk: int = C.TOPK,
         n_drop: int = C.N_DROP,
-        hold_thresh: int = 1,
+        hold_thresh: int = C.HOLD_THRESH,
         factor_cache=None,
         **kwargs,
     ):
@@ -56,7 +56,7 @@ class SharedPlannerStrategy(BaseSignalStrategy):
         self.n_drop = int(n_drop)
         self.hold_thresh = int(hold_thresh)
         self.factor_cache = factor_cache
-        self.only_tradable = True
+        self.only_tradable = C.ONLY_TRADABLE
         self.recorded_orders: Dict[pd.Timestamp, list] = {}
         self.recorded_signal_dates: Dict[pd.Timestamp, str] = {}
         self.recorded_packages: Dict[pd.Timestamp, object] = {}
@@ -162,7 +162,7 @@ class SharedPlannerStrategy(BaseSignalStrategy):
     def _params(self) -> dict:
         return {
             "topk": self.topk,
-            "candidate_limit": 100,
+            "candidate_limit": C.CANDIDATE_LIMIT,
             "n_drop": self.n_drop,
             "hold_thresh": self.hold_thresh,
             "risk_degree": self.risk_degree,
@@ -170,7 +170,7 @@ class SharedPlannerStrategy(BaseSignalStrategy):
             "open_cost": float(getattr(self.trade_exchange, "open_cost", C.OPEN_COST)),
             "close_cost": float(getattr(self.trade_exchange, "close_cost", C.CLOSE_COST)),
             "min_cost": float(getattr(self.trade_exchange, "min_cost", C.MIN_COST)),
-            "max_slippage": 0.003,
+            "max_slippage": C.MAX_SLIPPAGE,
         }
 
     def _qlib_order(self, planned, trade_start, trade_end):
@@ -315,7 +315,7 @@ def run_qlib_shared_planner_backtest(
         signal=pred,
         topk=C.TOPK,
         n_drop=C.N_DROP,
-        hold_thresh=1,
+        hold_thresh=C.HOLD_THRESH,
         factor_cache=factor_cache,
         risk_degree=C.RISK_DEGREE,
     )
@@ -326,7 +326,7 @@ def run_qlib_shared_planner_backtest(
         account=C.SHADOW_INIT_CASH,
         benchmark=C.BENCH,
         exchange_kwargs={
-            "deal_price": "open",
+            "deal_price": C.DEAL_PRICE,
             "limit_threshold": (
                 f"$open/Ref($close,1)-1 > {C.LIMIT_TH}",
                 f"$open/Ref($close,1)-1 < {-C.LIMIT_TH}",

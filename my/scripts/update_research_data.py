@@ -3,7 +3,7 @@
 （manifest 前置校验 + curl 断点续传 + sha256 + 日历硬闸 + 更新后复查）。
 
 用法：
-  /Users/bytedance/code/qlib/.venv/bin/python /Users/bytedance/code/qlib/my/artifacts/update_research_data.py
+  .venv/bin/python my/scripts/update_research_data.py
 """
 
 import shutil
@@ -11,15 +11,15 @@ import sys
 from datetime import date
 from pathlib import Path
 
-sys.path.insert(0, "/Users/bytedance/code/qlib/my/trading")
-sys.path.insert(0, "/Users/bytedance/code/qlib/my/trading")
-sys.path.insert(0, "/Users/bytedance/code/qlib")
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "my" / "trading"))
+sys.path.insert(0, str(REPO))
 
 import pandas as pd  # noqa: E402
 from pandas.tseries.offsets import BDay  # noqa: E402
 import manual_daily_trade as mdt  # noqa: E402
 
-DATA_DIR = Path("/Users/bytedance/code/qlib/my/data")
+DATA_DIR = REPO / "my" / "data"
 CN_DATA = DATA_DIR / "cn_data"
 BACKUP = DATA_DIR / "cn_data_sample2020.bak"
 

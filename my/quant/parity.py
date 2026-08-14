@@ -1,5 +1,6 @@
 """影子回放与 Qlib 普通回测的同口径对账工具。"""
 
+import hashlib
 import json
 from collections import Counter
 from dataclasses import dataclass, field
@@ -730,10 +731,14 @@ def run_shadow_replay(
     original_raw_closes_asof = data.raw_closes_asof
     original_latest_data_date = data.latest_data_date
     original_scores_for = signal_.scores_for
+    original_validate_release = signal_.validate_release
+    original_release_provenance = signal_.release_provenance
     original_gate_for_next_day = gate.gate_for_next_day
     original_impact_cost = C.IMPACT_COST
+    score_sha256 = hashlib.sha256(pd.util.hash_pandas_object(pred, index=True).values.tobytes()).hexdigest()
 
-    def cached_scores(date: str, log=print) -> pd.Series:
+    def cached_scores(date: str, log=print, published=None) -> pd.Series:
+        del published
         scores = _scores_on(pred, date)
         log(f"[parity] {date} 使用归档预测 {len(scores)} 只")
         return scores
@@ -761,6 +766,17 @@ def run_shadow_replay(
         data.day_bars = cache.day_bars
         data.raw_closes_asof = cached_raw_closes_asof
         data.latest_data_date = lambda: cache.latest_date
+        # Historical parity consumes an already archived prediction artifact;
+        # it must not pretend that artifact is a model or touch production releases.
+        signal_.validate_release = lambda _date: object()
+        signal_.release_provenance = lambda _published: {
+            "source_type": "archived_scores",
+            "strategy_id": C.STRATEGY_ID,
+            "release_id": "archived-parity",
+            "score_sha256": score_sha256,
+            "config_sha256": signal_.config_sha256(),
+            "runtime_code_sha256": signal_.runtime_code_sha256(),
+        }
         signal_.scores_for = cached_scores
         gate.gate_for_next_day = cached_gate
 
@@ -788,6 +804,8 @@ def run_shadow_replay(
         data.day_bars = original_day_bars
         data.raw_closes_asof = original_raw_closes_asof
         data.latest_data_date = original_latest_data_date
+        signal_.validate_release = original_validate_release
+        signal_.release_provenance = original_release_provenance
         signal_.scores_for = original_scores_for
         gate.gate_for_next_day = original_gate_for_next_day
         C.IMPACT_COST = original_impact_cost

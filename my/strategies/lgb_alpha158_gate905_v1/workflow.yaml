@@ -1,0 +1,31 @@
+schema_version: 1
+strategy_id: lgb_alpha158_gate905_v1
+
+data:
+  provider_uri: my/data/cn_data
+  pool: all_no_bj
+  benchmark: SH000300
+  frequency: day
+
+handler:
+  class: Alpha158
+  module_path: qlib.contrib.data.handler
+  feature_set: Alpha158
+  label_expr: "Ref($close, -6) / Ref($close, -1) - 1"
+
+model:
+  library: lightgbm
+  format: lightgbm_native_booster
+  params:
+    objective: mse
+    colsample_bytree: 0.8879
+    learning_rate: 0.0421
+    subsample: 0.8789
+    lambda_l1: 205.6999
+    lambda_l2: 580.9768
+    max_depth: 8
+    num_leaves: 210
+    num_threads: 8
+    verbosity: -1
+  num_boost_round: 2000
+  early_stopping_rounds: 100

@@ -1,0 +1,6 @@
+# Strategy releases are byte-hashed and must checkout identically on Windows.
+my/strategies/**/*.py text eol=lf
+my/strategies/**/*.yaml text eol=lf
+my/strategies/**/*.json text eol=lf
+my/strategies/**/*.md text eol=lf
+my/strategies/**/models/*.txt -text

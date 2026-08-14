@@ -4,6 +4,7 @@ from dataclasses import replace
 import pandas as pd
 import pytest
 
+from my.quant import signal_package
 from my.quant.signal_package import (
     build_signal_package,
     load_signal_package,
@@ -17,6 +18,15 @@ PARAMS = {
     "n_drop": 2,
     "risk_degree": 0.95,
     "lot": 100,
+}
+PROVENANCE = {
+    "source_type": "published_model",
+    "strategy_id": "lgb_alpha158_gate905_v1",
+    "release_id": "2026Q3",
+    "model_sha256": "1" * 64,
+    "config_sha256": "2" * 64,
+    "runtime_code_sha256": "3" * 64,
+    "source_git_commit": "4" * 40,
 }
 
 
@@ -35,6 +45,7 @@ def _build(scores=None, holding_codes=None, batch_id="2026-08-05-v1"):
         params=PARAMS,
         batch_id=batch_id,
         reference_closes=closes,
+        provenance=PROVENANCE,
     )
 
 
@@ -83,6 +94,8 @@ def test_signal_package_json_round_trip_and_atomic_rename(tmp_path):
     assert not path.with_suffix(".json.tmp").exists()
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["checksum"]
+    assert payload["schema_version"] == 2
+    assert payload["content"]["provenance"] == PROVENANCE
     assert payload["content"]["candidates"][0]["reference_close"] == 11.0
 
 
@@ -95,6 +108,28 @@ def test_load_signal_package_rejects_requested_date_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="执行日不一致"):
         load_signal_package("2026-08-06", tmp_path)
+
+
+def test_load_signal_package_keeps_schema_v1_backward_compatibility(tmp_path):
+    package = _build()
+    content = signal_package._package_content(package)
+    content.pop("provenance")
+    signals_dir = tmp_path / "signals"
+    signals_dir.mkdir()
+    (signals_dir / "2026-08-05.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "checksum": signal_package._checksum(content),
+                "content": content,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = load_signal_package("2026-08-05", tmp_path)
+
+    assert restored.provenance == {}
 
 
 def test_load_signal_package_rejects_checksum_tampering(tmp_path):
@@ -127,3 +162,10 @@ def test_build_signal_package_requires_reference_close_for_each_candidate():
             batch_id="2026-08-05-v1",
             reference_closes={},
         )
+
+
+def test_save_signal_package_rejects_missing_release_provenance(tmp_path):
+    package = replace(_build(), provenance={})
+
+    with pytest.raises(ValueError, match="来源类型"):
+        save_signal_package(package, tmp_path)

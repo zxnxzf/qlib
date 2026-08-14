@@ -24,6 +24,15 @@ PARAMS = {
     "min_cost": 5.0,
     "max_slippage": 0.003,
 }
+PROVENANCE = {
+    "source_type": "published_model",
+    "strategy_id": "lgb_alpha158_gate905_v1",
+    "release_id": "2026Q3",
+    "model_sha256": "1" * 64,
+    "config_sha256": "2" * 64,
+    "runtime_code_sha256": "3" * 64,
+    "source_git_commit": "4" * 40,
+}
 
 
 def _quote(code, price=10.0):
@@ -60,6 +69,7 @@ def _seed_batch(tmp_path, *, holdings, cash, topk=2, phase="signal_ready"):
         params=params,
         batch_id="2026-08-05-v1",
         reference_closes={code: 10.0 for code in scores.index},
+        provenance=PROVENANCE,
     )
     save_signal_package(package, tmp_path)
     ledger.save_state(

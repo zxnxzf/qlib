@@ -74,15 +74,15 @@ def _ensure_fresh(asof: Optional[str], skip_update: bool, log) -> Tuple[str, Opt
 def _planner_params() -> dict:
     return {
         "topk": C.TOPK,
-        "candidate_limit": 100,
+        "candidate_limit": C.CANDIDATE_LIMIT,
         "n_drop": C.N_DROP,
-        "hold_thresh": 1,
+        "hold_thresh": C.HOLD_THRESH,
         "risk_degree": C.RISK_DEGREE,
         "lot": C.LOT,
         "open_cost": C.OPEN_COST,
         "close_cost": C.CLOSE_COST,
         "min_cost": C.MIN_COST,
-        "max_slippage": 0.003,
+        "max_slippage": C.MAX_SLIPPAGE,
     }
 
 
@@ -110,7 +110,7 @@ def _top_candidate_codes(scores: pd.Series) -> list:
     return (
         frame.dropna(subset=["score"])
         .sort_values(["score", "code"], ascending=[False, True], kind="mergesort")
-        .head(100)["code"]
+        .head(C.CANDIDATE_LIMIT)["code"]
         .tolist()
     )
 
@@ -203,9 +203,16 @@ def prepare(asof: Optional[str] = None, skip_update: bool = False, log=print) ->
     next_day = data.next_trade_date(today)
     if next_day is None:
         return {"date": today, "no_next_day": True}
+    # Validate before the gate branch so a missing/corrupt release can never
+    # produce even a gate-off signal package or mutate the account state.
+    published = signal_.validate_release(today)
     gate_on, note = gate.gate_for_next_day(today)
     log(f"[nightly] 门控: {note}")
-    scores = signal_.scores_for(today, log=log) if gate_on else pd.Series(dtype=float)
+    scores = (
+        signal_.scores_for(today, log=log, published=published)
+        if gate_on
+        else pd.Series(dtype=float)
+    )
     closes = _raw_closes(today, required_codes=_top_candidate_codes(scores)) if gate_on else {}
     package = build_signal_package(
         scores=scores,
@@ -216,6 +223,7 @@ def prepare(asof: Optional[str] = None, skip_update: bool = False, log=print) ->
         params=_planner_params(),
         batch_id=f"{today}_{next_day}",
         reference_closes=closes,
+        provenance=signal_.release_provenance(published),
     )
     save_signal_package(package, C.STATE_DIR)
     state.update(
@@ -238,7 +246,7 @@ def prepare(asof: Optional[str] = None, skip_update: bool = False, log=print) ->
 
 def execute(
     exec_date: str,
-    wait_seconds: int = 30,
+    wait_seconds: int = C.EXECUTION_WAIT_SECONDS,
     adapter: Optional[ExecutionAdapter] = None,
     market: Optional[MarketSnapshot] = None,
     log=print,

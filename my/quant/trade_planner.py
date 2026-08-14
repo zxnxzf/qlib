@@ -1,6 +1,6 @@
 """共享交易规划器的纯数据模型和卖出阶段。"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -24,6 +24,7 @@ class SignalPackage:
     candidates: Tuple[SignalCandidate, ...]
     holding_scores: Dict[str, Optional[float]]
     params: Dict[str, float]
+    provenance: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

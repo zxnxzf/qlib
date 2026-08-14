@@ -1,0 +1,37 @@
+schema_version: 1
+strategy_id: lgb_alpha158_gate905_v1
+
+portfolio:
+  topk: 50
+  candidate_limit: 100
+  n_drop: 2
+  hold_thresh: 1
+  only_tradable: true
+  risk_degree: 0.95
+  lot_size: 100
+
+gate:
+  index: SH000905
+  index_name: 中证500
+  ma_window: 20
+  confirm_days: 3
+  surge_reentry: 0.025
+
+execution:
+  deal_price: open
+  order_sequence: sell_then_buy
+  wait_seconds: 30
+  limit_threshold: 0.095
+  max_slippage: 0.003
+
+costs:
+  open_cost: 0.0005
+  close_cost: 0.0015
+  min_cost: 5.0
+  impact_cost: 0.001
+
+account:
+  shadow_initial_cash: 100000.0
+
+performance:
+  annualization_days: 238

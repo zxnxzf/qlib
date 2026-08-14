@@ -1,0 +1,16 @@
+schema_version: 1
+strategy_id: lgb_alpha158_gate905_v1
+
+schedule:
+  frequency: quarterly
+  total_lookback_months: 42
+  validation_months: 6
+  validation_gap_calendar_days: 7
+
+boundaries:
+  train_start: inclusive
+  train_end: exclusive
+  validation_start: inclusive
+  validation_end: exclusive
+  prediction_start: inclusive
+  prediction_end: exclusive

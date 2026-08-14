@@ -13,7 +13,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, "/Users/bytedance/code/qlib")
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
 
 from my.quant import config as C  # noqa: E402
 from my.quant import data, ledger, nightly  # noqa: E402

@@ -12,7 +12,7 @@
 公司 Mac（研究）
 Qlib 回测、策略实验、确认发布版本
                   │
-                  │ Git：代码、配置、模型版本清单
+                  │ Git：代码、策略配置、正式模型和发布清单
                   │ Windows只拉取确认过的commit/tag
                   ▼
 个人 Windows（生产）
@@ -35,9 +35,10 @@ QMT先独立运行几天或半个月 → 集中回放同一观察窗口 → 批�
 ### 1.1 Mac → Windows版本发布
 
 - Git是Mac与Windows之间唯一的代码同步方式；不使用Syncthing、网盘或共享目录持续同步运行文件。
-- Mac完成研究和验证后提交代码、配置及模型版本清单，并创建可识别的commit或tag。
+- Mac完成研究和验证后提交代码、策略配置、正式模型及发布清单，并创建可识别的commit或tag。
 - Windows生产环境只拉取明确确认过的commit或tag；拉取后先校验规划器版本、配置和模型版本，再生成下一交易日信号。
-- 模型文件若因体积不进入Git，则通过单次人工复制部署，但其文件哈希和版本清单必须提交Git；运行时不得自动从公司Mac同步。
+- 正式季度模型使用LightGBM原生文本格式，与Workflow、滚动规则、Strategy和哈希清单一起放在`my/strategies/<strategy_id>/`并进入Git；研究评分、候选模型、报告缓存和MLflow产物不进入Git。
+- Windows只允许加载`status=published`且模型、配置、特征顺序和验证报告哈希全部通过的季度发布；缺失或不一致时不生成信号，也不在生产流程临时训练。
 - `signal.json`、`result.json`、账户、持仓、行情快照和日志只在个人Windows本地流转，不进入Git。
 
 ## 2. 复用范围与隔离边界
@@ -75,7 +76,13 @@ Windows不再单独创建`D:\qlib-prod`。直接把Windows上的Qlib Git仓库�
 D:\code\qlib\                 # Git仓库根目录，实际路径可不同
 └── my\
     ├── data\                 # 生产Qlib数据
-    ├── models\               # 已发布模型文件
+    ├── strategies\
+    │   └── lgb_alpha158_gate905_v1\
+    │       ├── workflow.yaml # 模型与特征口径
+    │       ├── rolling.yaml  # 季度滚动规则
+    │       ├── strategy.yaml # 门控与交易口径
+    │       ├── models\       # 正式季度模型（进入Git）
+    │       └── releases\     # 哈希清单/验证报告（进入Git）
     ├── quant_state\          # 影子模式现有独立账本
     └── runtime\
         ├── qmt_inbox\        # Qlib写、QMT读
@@ -85,7 +92,7 @@ D:\code\qlib\                 # Git仓库根目录，实际路径可不同
         └── logs\             # QMT与生产Qlib运行日志
 ```
 
-这些目录位于Git工作区内，但`my/data/`、`my/models/`、`my/quant_state/`和`my/runtime/`全部由`.gitignore`排除。Git只同步代码、配置和模型版本清单，不同步模型大文件、账户、订单、成交、绩效或日志。
+这些目录位于Git工作区内。`my/data/`、`my/artifacts/`、`my/mlruns/`、`my/quant_state/`和`my/runtime/`由`.gitignore`排除；`my/strategies/`中的三份配置、正式模型、发布清单和验证报告进入Git。账户、订单、成交、绩效和日志永不进入Git。
 
 ## 3. Qlib → QMT：`signal.json`
 
@@ -95,7 +102,7 @@ T-1 收盘数据发布后，Windows生产Qlib执行：
 
 1. 检查GitHub manifest、压缩包校验值和Qlib交易日历末日。
 2. 确认本地数据确实覆盖T-1；不满足则不出信号。
-3. 计算MA20门控和模型评分。
+3. 校验策略包的季度发布清单、模型/配置哈希和Alpha158特征顺序，再计算MA20门控和模型评分。
 4. 生成T日不可变信号包。
 5. 先写 `signal.json.tmp`，刷新并关闭后再原子改名为 `signal.json`。
 
@@ -117,7 +124,7 @@ my/runtime/qmt_inbox/<执行日>/signal.json
 | `expires_at` | 最晚有效时间，默认T日09:31 |
 | `account_alias` | 本地配置中的模拟账户别名，不写真实账号 |
 | `data_asof` | Qlib数据实际覆盖的最后交易日，必须等于`signal_date` |
-| `model_version` | 季度模型版本，例如`2026Q3` |
+| `provenance` | 策略ID、季度发布号、模型/配置/运行代码SHA-256和来源Git提交 |
 | `planner_version` | 共享规划器版本，用于拒绝错误代码版本 |
 | `gate` | MA20门控结果和可读说明 |
 | `params` | TopK、Top100、Drop2、整手、成本预算和价格保护参数 |
@@ -139,7 +146,15 @@ my/runtime/qmt_inbox/<执行日>/signal.json
   "expires_at": "2026-08-17T09:31:00+08:00",
   "account_alias": "qmt_sim",
   "data_asof": "2026-08-14",
-  "model_version": "2026Q3",
+  "provenance": {
+    "source_type": "published_model",
+    "strategy_id": "lgb_alpha158_gate905_v1",
+    "release_id": "2026Q3",
+    "model_sha256": "<64位SHA-256>",
+    "config_sha256": "<64位SHA-256>",
+    "runtime_code_sha256": "<64位SHA-256>",
+    "source_git_commit": "<Git提交>"
+  },
   "planner_version": "shared-planner-v1",
   "gate": {
     "on": true,
@@ -460,7 +475,7 @@ daily_return = (今日总资产 - 今日外部净流入) / 昨日总资产 - 1
 
 ### 阶段C：Windows生产Qlib信号入口
 
-- 使用生产数据、模型和配置生成当日信号包。
+- 使用生产数据和已发布策略包生成当日信号包；QMT模式与影子模式读取同一Workflow、滚动规则、Strategy和季度模型。
 - 缺数据、缺模型、日期错误和重复生成全部硬失败或幂等跳过。
 - 与影子模式使用独立状态目录。
 
