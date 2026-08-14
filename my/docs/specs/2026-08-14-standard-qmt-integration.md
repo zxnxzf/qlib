@@ -285,12 +285,12 @@ runtime/qmt_outbox/<执行日>/result.json
 | `started_at` / `finished_at` | 执行起止时间 |
 | `status` | `completed`、`partial`或`aborted` |
 | `reason` | 部分完成或中止的原因；完成时为空 |
-| `account_before` | 执行前券商现金、持仓和可卖数量 |
+| `account_before` | 执行前券商现金、持仓、可卖数量、证券市值和总资产 |
 | `market_snapshot` | 规划时实际使用的盘口和涨跌停信息 |
 | `sell_stage` | 卖出规划、跳过原因、委托、成交和撤单 |
-| `account_after_sell` | 卖单终态后的券商账户 |
+| `account_after_sell` | 卖单终态后的券商现金、持仓、证券市值和总资产 |
 | `buy_stage` | 买入规划、跳过原因、委托、成交和撤单 |
-| `account_after` | 最终券商账户，作为当日最终事实 |
+| `account_after` | 交易阶段结束时的券商现金、持仓、证券市值和总资产 |
 | `errors` | 接口异常、拒单和人工检查事项 |
 | `checksum` | 结果内容校验码 |
 
@@ -309,8 +309,15 @@ runtime/qmt_outbox/<执行日>/result.json
   "reason": "one_buy_order_timed_out_and_cancelled",
   "account_before": {
     "cash": 5200.0,
+    "market_value": 11250.0,
+    "total_asset": 16450.0,
     "holdings": [
-      {"code": "SH600000", "shares": 1000, "available_shares": 1000}
+      {
+        "code": "SH600000",
+        "shares": 1000,
+        "available_shares": 1000,
+        "market_value": 11250.0
+      }
     ]
   },
   "market_snapshot": {
@@ -331,7 +338,12 @@ runtime/qmt_outbox/<执行日>/result.json
     "fills": [],
     "cancelled": []
   },
-  "account_after_sell": {"cash": 5200.0, "holdings": []},
+  "account_after_sell": {
+    "cash": 5200.0,
+    "market_value": 0.0,
+    "total_asset": 5200.0,
+    "holdings": []
+  },
   "buy_stage": {
     "planned": [],
     "skipped": [],
@@ -339,13 +351,73 @@ runtime/qmt_outbox/<执行日>/result.json
     "fills": [],
     "cancelled": []
   },
-  "account_after": {"cash": 5200.0, "holdings": []},
+  "account_after": {
+    "cash": 5200.0,
+    "market_value": 0.0,
+    "total_asset": 5200.0,
+    "holdings": []
+  },
   "errors": [],
   "checksum": "sha256:<计算结果>"
 }
 ```
 
-`account_after`以券商查询为准。规划器根据成交回报计算的账户只用于一致性检查，二者不一致时报警并保留券商结果。
+`account_after`以券商查询为准。规划器根据成交回报计算的账户只用于一致性检查，二者不一致时报警并保留券商结果。该快照通常发生在9:31左右，只表示交易阶段结束状态，不能直接当作当日收盘净值。
+
+### 5.4 收盘账户快照：`eod_snapshot.json`
+
+为计算QMT真实收益，QMT在T日最后一个实时bar或收盘后再次查询券商账户，单独写入：
+
+```text
+runtime/qmt_outbox/<执行日>/eod_snapshot.json
+```
+
+至少包含：
+
+| 字段 | 含义 |
+|---|---|
+| `schema_version` | 收盘快照协议版本 |
+| `batch_id` / `exec_date` | 对应执行批次和交易日 |
+| `snapshot_at` | 券商账户查询时间 |
+| `cash` / `frozen_cash` | 可用及冻结资金 |
+| `market_value` | 券商返回的证券总市值 |
+| `total_asset` | 券商返回的账户总资产，作为净值事实来源 |
+| `holdings` | 每只股票数量、可卖数量、收盘/最新价和市值 |
+| `external_cash_flow` | 券商可查询时记录当日净入金减净出金；不可查询时为`null` |
+| `source` | 固定为`broker_qmt`，禁止写成影子或本地推算值 |
+| `checksum` | 快照内容校验码 |
+
+缺少可靠`total_asset`时，当日绩效标记为`missing`并报警，不允许用影子账户、T-1价格或本地成交推算值冒充真实净值。能力探针必须确认国金QMT的总资产、市值、手续费字段及收盘后查询时机。
+
+### 5.5 Windows Qlib侧QMT真实绩效账本
+
+Windows生产Qlib读取`result.json`和`eod_snapshot.json`，生成与影子模式风格一致、但数据源完全独立的真实绩效账本：
+
+```text
+runtime/qmt_performance/
+├── qmt_nav.csv             # 每日真实净值与收益指标
+├── qmt_trades.csv          # 计划、委托、成交、费用与滑点
+├── qmt_cash_flows.csv      # 券商无法返回时登记入金/出金
+└── qmt_report.html         # QMT真实、影子回放和基准对比
+```
+
+`qmt_nav.csv`至少记录：交易日、批次号、现金、证券市值、总资产、外部现金流、日收益、累计收益、当前回撤、最大回撤、基准日收益、基准累计收益和累计超额收益。真实日收益按资金流调整：
+
+```text
+daily_return = (今日总资产 - 今日外部净流入) / 昨日总资产 - 1
+```
+
+`qmt_trades.csv`按`batch_id + order_id + fill_id`幂等记录计划价、委托价、真实成交价、成交数量、佣金/税费、撤单和相对计划价的滑点。券商没有提供的费用字段必须标记为未知，不得填模拟费率。
+
+外部资金流优先使用券商字段；券商不提供时读取`qmt_cash_flows.csv`。第一版要求该账户只运行本策略且观察期内不随意转入转出；发生资金划转必须登记，未登记的异常资产跳变要报警。
+
+复用影子模式的范围：
+
+- 复用按日期幂等追加、收益率、累计收益、回撤、基准/超额和HTML展示代码。
+- QMT与影子资金不同，比较图统一从各自首日归一化为1.0。
+- 不复用影子的模拟账户、模拟成交、估值价格和`nav.csv`文件；QMT使用独立目录和文件名。
+- 券商`total_asset`、真实成交及费用是唯一事实，Qlib只做统计和展示。
+- 第一版要求模拟/实盘账户只运行这一套策略；发现无本系统`order_id`的人工委托或其他策略成交时，当日标记异常，避免把别的交易算成该策略收益。
 
 ## 6. 影子模式如何配合
 
@@ -368,11 +440,12 @@ runtime/qmt_outbox/<执行日>/result.json
 ### 阶段A：QMT能力探针
 
 - 基于 `iquant_qlib.py` 新建国金QMT探针脚本。
-- 只读检查Python、文件、账户、持仓和行情接口。
+- 只读检查Python、文件、账户、持仓、总资产、市值、费用和行情接口。
 - 模拟账户中显式开启一笔最小报单，验证委托回调、成交查询和撤单。
+- 验证最后实时bar或收盘后仍能查询账户并写出`eod_snapshot.json`。
 - 保存国金QMT真实对象字段，替代本设计中的待确认项。
 
-验收：能够可靠查询账户/持仓/行情，并确认报单、查单、查成交和撤单的准确接口。
+验收：能够可靠查询账户/持仓/总资产/行情，并确认报单、查单、查成交、费用、撤单和收盘快照的准确接口。
 
 ### 阶段B：共享协议和规划器兼容
 
@@ -389,11 +462,20 @@ runtime/qmt_outbox/<执行日>/result.json
 
 ### 阶段D：QMT执行脚本
 
-- 实现预检、卖单、等待/撤单、账户刷新、买单、结果归档和崩溃恢复。
+- 实现预检、卖单、等待/撤单、账户刷新、买单、结果归档、收盘账户快照和崩溃恢复。
 - 先接假券商适配器跑自动测试，再接国金QMT模拟账户。
 - 原 `iquant_qlib.py` 保留作参考，不直接修改为生产脚本。
 
-### 阶段E：模拟盘验收
+### 阶段E：QMT真实绩效账本
+
+- 复用影子模式的净值指标和报告展示代码，新增QMT结果读取适配器。
+- 以券商`eod_snapshot.json`为准生成`qmt_nav.csv`，以真实成交生成`qmt_trades.csv`。
+- 处理外部入金/出金登记、重复导入、缺失收盘快照和非本策略委托。
+- 生成QMT真实收益、影子回放和基准归一化对比报告。
+
+验收：连续样例可稳定生成收益、累计收益、回撤和超额指标；重复运行不重复记账，缺少真实账户事实时硬失败或明确标记缺失。
+
+### 阶段F：模拟盘验收
 
 - QMT先运行只读模式，核对账户和规划结果，不报单。
 - 再运行模拟账户至少20个交易日。
@@ -410,6 +492,11 @@ runtime/qmt_outbox/<执行日>/result.json
 - 买单全成、部分成交、拒单和超时撤单后保留现金。
 - QMT在卖单或买单阶段崩溃后恢复，不重复报单。
 - QMT账户快照与本地成交推算不一致时，以券商为准并报警。
+- 收盘快照正常、缺失、重复、总资产缺失和日期错位。
+- 外部入金/出金调整后的日收益，首日净值初始化和跨日累计收益。
+- 真实成交费用/滑点汇总，未知费用不使用模拟值填充。
+- 出现人工委托或其他策略成交时，绩效当日标记异常。
+- QMT绩效重复导入幂等，QMT/影子/基准归一化对比曲线正确。
 - 影子账本、QMT状态和对账程序互不写入。
 - 现有影子测试、共享规划器测试和379日严格对账全部继续通过。
 
