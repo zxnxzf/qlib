@@ -1,8 +1,8 @@
 # 项目记忆
 <!--
-更新: 2026-08-14 17:05
+更新: 2026-08-14 17:07
 核对基线:
-- qlib | branch codex/shadow-backtest-parity | HEAD 为本文件所在QMT绩效设计补充提交（父提交 6a4f3e5c）| 提交后工作区 clean；当前分支比 main ahead 20
+- qlib | branch codex/shadow-backtest-parity | HEAD 为本文件所在Windows目录约定提交（父提交 6faeffa0）| 提交后工作区 clean；当前分支比 main ahead 21
 代码与 Git 用于判断实现现状；用户最后确认的需求用于判断目标。
 -->
 
@@ -37,9 +37,10 @@
 - “在调整一下方案，就是我想到时候，把mac上的数据传到windows上，然后都在一个windows上面去跑，mac只用来研究这样？”、“主要是考虑到合规的问题，就是一直这么传文件，毕竟是公司的电脑。那就定那个方案吧”（2026-08-14：公司Mac只用于Qlib研究、回测和策略验证；个人Windows独立承担生产数据更新、Qlib信号、影子模式、标准QMT模拟/实盘和本地对账，不在公司Mac与交易电脑之间持续同步账户、委托或成交数据；策略定版后只做不含账户信息的人工发布）
 - “mac和windows之间我理解代码同步可以用git，然后影子模式没有必要和qmt同步跑，qmt跑了一段时间之后，影子模式跑一把就行了，先修改一下计划”（2026-08-14：Git作为Mac到Windows的代码发布方式；不做运行文件持续同步；QMT每日独立执行，影子模式在QMT运行几天或半个月后按观察窗口集中回放和对账，不配置每日影子陪跑）
 - “OK 那这个得补啊，这个我理解就参考影子模式这种就行吧？”（2026-08-14：QMT模式必须有独立真实绩效账本；复用影子模式的收益、回撤、基准对比和报告展示，但账户、成交、费用和总资产只认QMT券商事实）
+- “这个是啥玩意？我理解就在Windows的qlib git仓库目录下面弄就行了吧”（2026-08-14：Windows不另建`D:\qlib-prod`生产根目录；生产数据、模型、QMT运行目录和影子账本统一放在Windows的Qlib Git仓库`my/`下，运行数据由`.gitignore`排除）
 
 ## 现在做到哪
-仓库根目录为 `/Users/bytedance/code/qlib`，当前分支 `codex/shadow-backtest-parity`；本轮QMT绩效设计补充的父提交为 `6a4f3e5c`。局部 Python 环境仍使用 `/Users/bytedance/code/qlib/.venv`；个人量化工作已统一迁移到 `my/` 目录，旧 `.data`、`run-configs`、`runs/mlruns` 口径只作为早期跑通记录保留，不再代表当前主线状态。本轮只补充QMT真实绩效账本设计，未修改交易代码。
+仓库根目录为 `/Users/bytedance/code/qlib`，当前分支 `codex/shadow-backtest-parity`；本轮Windows目录约定的父提交为 `6faeffa0`。局部 Python 环境仍使用 `/Users/bytedance/code/qlib/.venv`；个人量化工作已统一迁移到`my/`目录。QMT设计不再使用独立`D:\qlib-prod`，Windows生产文件改放Qlib Git仓库的`my/`下；`.gitignore`已补充排除`my/models/`和`my/runtime/`。未修改交易代码。
 
 已完成自动交易方向的第一轮代码与资料核查：Qlib 官方 OnlineManager 负责滚动模型、预测和信号生命周期，不直接承担券商委托、成交与撤单管理；仓库现有 `examples/live_daily_predict.py` 与 `examples/iquant_qlib.py` 已形成持仓、行情、订单的文件握手及 `passorder` 下单原型。当前原型把委托请求发送后立即写成 `exec_done`，订单和成交回调只输出日志，尚未形成部分成交、拒单、撤单、重试及券商账户对账闭环，不能直接按无人值守实盘标准使用。
 
@@ -115,7 +116,7 @@ Tushare 当前提供 A 股实时分钟接口 `rt_min`（1/5/15/30/60 分钟）�
 
 2026-08-14 QMT部署边界已讨论定案，尚未开始实现：不使用MiniQMT或外部XtQuant，只使用国金标准QMT内置Python策略。公司Mac保留为研究环境；个人Windows运行独立的生产Qlib环境和标准QMT内置执行脚本。Windows普通Python负责数据新鲜度检查、模型、MA20门控和信号包，QMT内置脚本负责实时账户/行情、共享规划器、报撤单和真实成交回报；影子与QMT运行、状态和账本相互隔离，仅复用无第三方依赖的纯规划逻辑。账户、委托和成交数据只留在个人Windows，本地完成影子延迟补跑与QMT对账。
 
-2026-08-14 标准QMT接入设计已落到 `my/docs/specs/2026-08-14-standard-qmt-integration.md`：定义了Windows本地 `signal.json`、`result.json`和收盘`eod_snapshot.json`协议，基于现有 `iquant_qlib.py` 的QMT接口映射、T日先卖后买状态机、批次幂等与恢复、影子复用/隔离边界，以及能力探针→协议/规划器→生产信号→QMT执行→真实绩效账本→20日模拟盘的开发和验收顺序。QMT绩效复用影子的指标与HTML展示，但以券商收盘总资产、真实成交和费用为唯一事实，并单独生成`qmt_nav.csv`、`qmt_trades.csv`和`qmt_report.html`。部署节奏为Git发布代码到Windows、QMT每日独立执行、影子按5至10个交易日或半个月观察窗口集中回放；不使用Syncthing等持续文件同步。尚未修改交易代码。
+2026-08-14 标准QMT接入设计已落到 `my/docs/specs/2026-08-14-standard-qmt-integration.md`：定义了Windows本地 `signal.json`、`result.json`和收盘`eod_snapshot.json`协议，基于现有 `iquant_qlib.py` 的QMT接口映射、T日先卖后买状态机、批次幂等与恢复、影子复用/隔离边界，以及能力探针→协议/规划器→生产信号→QMT执行→真实绩效账本→20日模拟盘的开发和验收顺序。Windows直接以Qlib Git仓库为生产根目录，数据、模型、QMT运行文件和影子账本均位于仓库`my/`下并按类型忽略。QMT绩效复用影子的指标与HTML展示，但以券商收盘总资产、真实成交和费用为唯一事实，并单独生成`qmt_nav.csv`、`qmt_trades.csv`和`qmt_report.html`。部署节奏为Git发布代码到Windows、QMT每日独立执行、影子按5至10个交易日或半个月观察窗口集中回放；不使用Syncthing等持续文件同步。尚未修改交易代码。
 
 ## 下一步
 1. 按 `my/docs/specs/2026-08-14-standard-qmt-integration.md` 先实现国金标准QMT能力探针，确认Python、文件、账户、持仓、总资产、市值、费用、盘口、报单、查成交、撤单和收盘快照接口。
@@ -153,5 +154,6 @@ Tushare 当前提供 A 股实时分钟接口 `rt_min`（1/5/15/30/60 分钟）�
 - 标准QMT内置脚本与Windows普通Python是两套独立运行程序：前者只承接实时券商接口与执行生命周期，后者承接Qlib和信号生产；影子与QMT使用独立状态/账本，只共享无第三方依赖的纯规划器版本。
 - QMT按交易日独立执行；影子模式不每日同步陪跑，只在QMT积累几天或半个月结果后，于Windows按观察窗口集中回放和对账。
 - QMT真实绩效在Windows使用独立账本：只复用影子的收益、回撤、基准对比和报告代码，不复用模拟账户；券商收盘总资产、真实成交和费用是唯一事实，外部资金流必须调整后再计算日收益。
+- Windows直接使用Qlib Git仓库作为生产根目录，不另建`D:\qlib-prod`；生产数据和运行状态放在仓库`my/`下并由`.gitignore`排除，Git只同步代码、配置和版本清单。
 - 对账分类只把明确 blocked/suspended/no_data 回执归为 execution_tradability；双方均有股数差归为 rounding_or_cost；无直接回执的单边差异归为 selection_or_path_dependency，避免把路径依赖伪装成因果结论。
 - 复权股数只吸收不超过2股的 factor 浮点漂移，合法零股不强制整手化；每次对账必须记录预测哈希、成本模式和 T-1 信号日期。

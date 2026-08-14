@@ -61,7 +61,7 @@ QMT先独立运行几天或半个月 → 集中回放同一观察窗口 → 批�
 
 ### 2.3 必须隔离
 
-- 影子模式使用 `shadow_state`，QMT 使用 `qmt_state`，两边不得读写对方账本。
+- 影子模式使用仓库内现有的`my/quant_state`，QMT使用`my/runtime/qmt_state`，两边不得读写对方账本。
 - QMT现金和持仓只认券商查询结果，不使用影子账本推算。
 - QMT实际成交不得回写影子账户。
 - 影子故障不能阻止QMT执行；QMT故障也不能破坏影子历史。
@@ -69,19 +69,23 @@ QMT先独立运行几天或半个月 → 集中回放同一观察窗口 → 批�
 - 账户、资金、委托、成交和QMT日志只保留在个人Windows。
 - 不建立Mac与Windows之间的运行目录双向同步；Git仓库中也不得提交任何账户或交易运行文件。
 
-建议的Windows目录如下，根目录可配置：
+Windows不再单独创建`D:\qlib-prod`。直接把Windows上的Qlib Git仓库作为根目录，生产文件统一放在仓库的`my/`下。例如仓库克隆在`D:\code\qlib`时：
 
 ```text
-D:\qlib-prod\
-├── data\                    # 生产Qlib数据
-├── models\                  # 已发布模型
-├── runtime\
-│   ├── qmt_inbox\           # Qlib写、QMT读
-│   ├── qmt_outbox\          # QMT写、Qlib只读
-│   ├── qmt_state\           # QMT独立状态
-│   └── shadow_state\        # 影子独立账本
-└── logs\
+D:\code\qlib\                 # Git仓库根目录，实际路径可不同
+└── my\
+    ├── data\                 # 生产Qlib数据
+    ├── models\               # 已发布模型文件
+    ├── quant_state\          # 影子模式现有独立账本
+    └── runtime\
+        ├── qmt_inbox\        # Qlib写、QMT读
+        ├── qmt_outbox\       # QMT写、Qlib只读
+        ├── qmt_state\        # QMT独立状态
+        ├── qmt_performance\  # QMT真实绩效账本
+        └── logs\             # QMT与生产Qlib运行日志
 ```
+
+这些目录位于Git工作区内，但`my/data/`、`my/models/`、`my/quant_state/`和`my/runtime/`全部由`.gitignore`排除。Git只同步代码、配置和模型版本清单，不同步模型大文件、账户、订单、成交、绩效或日志。
 
 ## 3. Qlib → QMT：`signal.json`
 
@@ -98,7 +102,7 @@ T-1 收盘数据发布后，Windows生产Qlib执行：
 文件路径：
 
 ```text
-runtime/qmt_inbox/<执行日>/signal.json
+my/runtime/qmt_inbox/<执行日>/signal.json
 ```
 
 ### 3.2 字段
@@ -269,7 +273,7 @@ ready
 文件路径：
 
 ```text
-runtime/qmt_outbox/<执行日>/result.json
+my/runtime/qmt_outbox/<执行日>/result.json
 ```
 
 同样先写 `.tmp`，完成后原子替换正式文件。
@@ -369,7 +373,7 @@ runtime/qmt_outbox/<执行日>/result.json
 为计算QMT真实收益，QMT在T日最后一个实时bar或收盘后再次查询券商账户，单独写入：
 
 ```text
-runtime/qmt_outbox/<执行日>/eod_snapshot.json
+my/runtime/qmt_outbox/<执行日>/eod_snapshot.json
 ```
 
 至少包含：
@@ -394,7 +398,7 @@ runtime/qmt_outbox/<执行日>/eod_snapshot.json
 Windows生产Qlib读取`result.json`和`eod_snapshot.json`，生成与影子模式风格一致、但数据源完全独立的真实绩效账本：
 
 ```text
-runtime/qmt_performance/
+my/runtime/qmt_performance/
 ├── qmt_nav.csv             # 每日真实净值与收益指标
 ├── qmt_trades.csv          # 计划、委托、成交、费用与滑点
 ├── qmt_cash_flows.csv      # 券商无法返回时登记入金/出金

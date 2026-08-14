@@ -68,3 +68,5 @@ my/data/
 my/artifacts/
 my/mlruns/
 my/quant_state/
+my/models/
+my/runtime/
