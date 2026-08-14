@@ -76,6 +76,7 @@ Windows不再单独创建`D:\qlib-prod`。直接把Windows上的Qlib Git仓库�
 D:\code\qlib\                 # Git仓库根目录，实际路径可不同
 └── my\
     ├── data\                 # 生产Qlib数据
+    ├── quant\                # 影子/QMT共用的纯规划逻辑（进入Git）
     ├── strategies\
     │   └── lgb_alpha158_gate905_v1\
     │       ├── workflow.yaml # 模型与特征口径
@@ -83,16 +84,34 @@ D:\code\qlib\                 # Git仓库根目录，实际路径可不同
     │       ├── strategy.yaml # 门控与交易口径
     │       ├── models\       # 正式季度模型（进入Git）
     │       └── releases\     # 哈希清单/验证报告（进入Git）
+    ├── qmt\                  # QMT模式代码（进入Git）
+    │   ├── protocol.py       # signal/result协议、校验码和原子文件IO
+    │   ├── producer.py       # Windows普通Python：生成signal.json
+    │   ├── qmt_probe.py      # QMT内运行：探测国金真实API和字段
+    │   ├── qmt_strategy.py   # QMT内运行：账户、行情、报撤单和结果回写
+    │   ├── performance.py    # 真实收益、累计收益、回撤和报告
+    │   └── reconcile.py      # QMT结果与共享规划器/影子回放对账
     ├── quant_state\          # 影子模式现有独立账本
     └── runtime\
         ├── qmt_inbox\        # Qlib写、QMT读
+        │   └── <执行日>\
+        │       └── signal.json
         ├── qmt_outbox\       # QMT写、Qlib只读
-        ├── qmt_state\        # QMT独立状态
+        │   └── <执行日>\
+        │       ├── result.json
+        │       └── eod_snapshot.json
+        ├── qmt_state\        # QMT批次、委托、成交和恢复状态
         ├── qmt_performance\  # QMT真实绩效账本
+        │   ├── qmt_nav.csv
+        │   ├── qmt_trades.csv
+        │   ├── qmt_cash_flows.csv
+        │   └── qmt_report.html
         └── logs\             # QMT与生产Qlib运行日志
 ```
 
-这些目录位于Git工作区内。`my/data/`、`my/artifacts/`、`my/mlruns/`、`my/quant_state/`和`my/runtime/`由`.gitignore`排除；`my/strategies/`中的三份配置、正式模型、发布清单和验证报告进入Git。账户、订单、成交、绩效和日志永不进入Git。
+这些目录位于Git工作区内。`my/data/`、`my/artifacts/`、`my/mlruns/`、`my/quant_state/`和`my/runtime/`由`.gitignore`排除；`my/quant/`、`my/qmt/`和`my/strategies/`中的代码、配置、正式模型、发布清单及验证报告进入Git。账户、订单、成交、绩效和日志永不进入Git。
+
+`producer.py`运行在Windows仓库的`.venv`中；`qmt_strategy.py`和`qmt_probe.py`运行在标准QMT内置Python中。若国金QMT必须把脚本复制到客户端自己的策略目录，仓库中的`my/qmt/`仍是唯一源码，部署时只生成副本，不在QMT目录维护第二套逻辑。
 
 ## 3. Qlib → QMT：`signal.json`
 
