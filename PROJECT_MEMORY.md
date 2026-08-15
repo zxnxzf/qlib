@@ -1,8 +1,8 @@
 # 项目记忆
 <!--
-更新: 2026-08-15 13:35
+更新: 2026-08-15 13:55
 核对基线:
-- qlib | branch codex/shadow-backtest-parity | HEAD为本文件所在的推送状态更新提交（父提交cac597f6）| 提交后工作区clean；当前分支比main ahead 27，远端同名分支尚未创建
+- qlib | branch codex/shadow-backtest-parity | HEAD为本文件所在的远端同步状态提交（父提交daa171cf）| 提交后工作区clean；当前分支比main ahead 28，并与origin/codex/shadow-backtest-parity同步
 代码与 Git 用于判断实现现状；用户最后确认的需求用于判断目标。
 -->
 
@@ -127,7 +127,7 @@ Tushare 当前提供 A 股实时分钟接口 `rt_min`（1/5/15/30/60 分钟）�
 2026-08-15 标准QMT第一版代码提交为`cac597f6`。最终回归通过：完整`my/tests`266项、QMT/协议/绩效/共享规划器专项166项通过，`py_compile`与`git diff --check`通过；提交后`workflow.validate_release("2026-08-15")`成功加载正式2026Q3发布包。379日严格零价格冲击对账位于`my/artifacts/shadow-backtest-parity/qmt-planner-safety-final-20260815/strict_cost_control/`：订单和持仓明细/整日匹配率均100%，共享规划器订单差异0、跳过原因差异0、首次分叉为空，逻辑现金最大差0.067642元。Qlib期末136,552.41元、影子133,176.60元，剩余净值差来自残留不可卖持仓估值口径，不是交易逻辑分叉。2026Q3发布清单已绑定最新运行代码与验证报告哈希。
 
 ## 下一步
-1. 在Mac完成GitHub认证后运行`git push -u origin codex/shadow-backtest-parity`；Windows核对拉取到包含`cac597f6`的提交，再按`my/docs/qmt_windows_trial.md`运行脱敏探针和`read_only`预演。
+1. Windows拉取`origin/codex/shadow-backtest-parity`并核对历史包含`cac597f6`，再按`my/docs/qmt_windows_trial.md`运行脱敏探针和`read_only`预演。
 2. 根据脱敏探针结果补齐国金模拟账户的报单、查单、成交、30秒撤单与收盘快照适配，并保持真实交易入口继续关闭。
 3. 在独立模拟账户完成最小报单测试和恢复测试，通过后再开启连续20个交易日模拟运行；每5至10日集中跑一次影子回放与对账。
 4. 用正式发布模型完成隔离影子回填，核对评分、订单、回执、状态和净值。
@@ -145,7 +145,6 @@ Tushare 当前提供 A 股实时分钟接口 `rt_min`（1/5/15/30/60 分钟）�
 - 生产语义下 Qlib `impact_cost` 是按成交额/市场成交量平方调整的成本，影子是成交价固定±0.1%；已增加双方价格冲击均为0的严格成本控制报告，但生产语义仍不应被称为同成本。
 - 国金标准QMT内置Python的实际版本、第三方库限制、文件访问路径、模拟账户查询、盘口字段、报单返回值、委托/成交查询和撤单接口尚需在用户Windows客户端实测；MiniQMT与外部XtQuant已排除。
 - 国金QMT能否在最后实时bar或收盘后稳定返回总资产、市值、逐笔费用和资金划转信息尚需能力探针确认；字段缺失时绩效账本必须标记缺失，不能用影子模拟值代替。
-- 当前本地代码已提交，但远端推送未完成：`origin`使用HTTPS且终端无GitHub凭据，`gh`未安装，SSH主机密钥也未建立；Windows暂时拉不到`codex/shadow-backtest-parity`，需先由用户完成GitHub认证并推送。
 
 ## 技术决策
 - 所有 Python 依赖优先安装到仓库局部虚拟环境，不进行全局 `pip install`，以避免影响其他项目。
