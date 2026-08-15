@@ -1,5 +1,6 @@
 """共享交易规划器的纯数据模型和卖出阶段。"""
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 
@@ -88,19 +89,53 @@ class PlanResult:
     skips: Tuple[PlanSkip, ...]
 
 
-def _sell_skip_reason(holding: HoldingSnapshot, quote: Optional[QuoteSnapshot], hold_thresh: int) -> str:
+def _finite_float(value, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} 必须是有限数值")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} 必须是有限数值") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} 必须是有限数值")
+    return number
+
+
+def _positive_finite(value) -> bool:
+    try:
+        return not isinstance(value, bool) and math.isfinite(float(value)) and float(value) > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _quote_is_current(timestamp: str, exec_date: str) -> bool:
+    return isinstance(timestamp, str) and timestamp.startswith(exec_date + "T")
+
+
+def _sell_skip_reason(
+    holding: HoldingSnapshot,
+    quote: Optional[QuoteSnapshot],
+    hold_thresh: int,
+    exec_date: str,
+) -> str:
     if holding.held_days < hold_thresh:
         return "hold_day_protection"
     if holding.available_shares <= 0:
         return "no_available_shares"
     if quote is None:
         return "no_quote"
+    if not _quote_is_current(quote.timestamp, exec_date):
+        return "stale_quote"
     if quote.risk_blocked:
         return quote.risk_reason or "risk_blocked"
     if not quote.sellable:
         return quote.status or "not_sellable"
-    if quote.bid1 <= 0:
+    if not _positive_finite(quote.bid1):
         return "invalid_bid1"
+    if not _positive_finite(quote.high_limit) or not _positive_finite(quote.low_limit):
+        return "invalid_limit_price"
+    if float(quote.bid1) < float(quote.low_limit) or float(quote.bid1) > float(quote.high_limit):
+        return "invalid_price_band"
     return ""
 
 
@@ -135,7 +170,10 @@ def plan_sells(package: SignalPackage, account: AccountSnapshot, market: MarketS
         if len(orders) >= limit:
             break
         holding = account.holdings[code]
-        skip_reason = _sell_skip_reason(holding, market.quotes.get(code), hold_thresh)
+        if package.gate_on and package.holding_scores.get(code) is None:
+            skips.append(PlanSkip(code=code, side="sell", reason="missing_score"))
+            continue
+        skip_reason = _sell_skip_reason(holding, market.quotes.get(code), hold_thresh, package.exec_date)
         if skip_reason:
             skips.append(PlanSkip(code=code, side="sell", reason=skip_reason))
             continue
@@ -170,33 +208,52 @@ def price_band(
     max_slippage: float,
 ) -> Tuple[float, float]:
     """返回以首次盘口为基准的一次改价保护区间。"""
-    reference = float(reference)
-    max_slippage = float(max_slippage)
-    if reference <= 0 or not 0 <= max_slippage <= 1:
+    reference = _finite_float(reference, "参考价格")
+    high_limit = _finite_float(high_limit, "涨停价")
+    low_limit = _finite_float(low_limit, "跌停价")
+    max_slippage = _finite_float(max_slippage, "最大偏离比例")
+    if (
+        reference <= 0
+        or high_limit <= 0
+        or low_limit <= 0
+        or low_limit > high_limit
+        or not low_limit <= reference <= high_limit
+        or not 0 <= max_slippage <= 1
+    ):
         raise ValueError("价格或最大偏离比例无效")
     if side == "buy":
-        return reference, min(reference * (1 + max_slippage), float(high_limit))
+        return reference, min(reference * (1 + max_slippage), high_limit)
     if side == "sell":
-        return max(reference * (1 - max_slippage), float(low_limit)), reference
+        return max(reference * (1 - max_slippage), low_limit), reference
     raise ValueError(f"未知交易方向: {side}")
 
 
 def apply_receipts(account: AccountSnapshot, receipts: Sequence["Receipt"]) -> AccountSnapshot:
     """只按真实成交股数、价格和费用生成新的账户快照。"""
-    cash = float(account.cash)
+    cash = _finite_float(account.cash, "账户现金")
+    if cash < 0:
+        raise ValueError("账户现金不能为负")
     holdings = dict(account.holdings)
     filled_statuses = {"filled", "partial", "partially_filled", "partial_cancelled"}
     for receipt in receipts:
-        shares = int(receipt.shares)
+        raw_shares = _finite_float(receipt.shares, f"成交股数 {receipt.code}")
+        shares = int(raw_shares)
+        if raw_shares != shares:
+            raise ValueError(f"成交股数必须是整数: {receipt.code}")
         if shares < 0:
             raise ValueError(f"成交股数不能为负: {receipt.code}")
+        price = _finite_float(receipt.price, f"成交价格 {receipt.code}")
+        cost = _finite_float(receipt.cost, f"成交费用 {receipt.code}")
+        if price < 0 or cost < 0:
+            raise ValueError(f"成交价格或费用无效: {receipt.code}")
         if shares == 0:
             continue
         if receipt.status not in filled_statuses:
             raise ValueError(f"非成交状态包含成交股数: {receipt.code} {receipt.status}")
-        value = shares * float(receipt.price)
-        cost = float(receipt.cost)
-        if value < 0 or cost < 0:
+        if price <= 0:
+            raise ValueError(f"有成交股数但成交价格无效: {receipt.code}")
+        value = shares * price
+        if not math.isfinite(value):
             raise ValueError(f"成交金额或费用无效: {receipt.code}")
 
         if receipt.side == "sell":
@@ -226,26 +283,38 @@ def apply_receipts(account: AccountSnapshot, receipts: Sequence["Receipt"]) -> A
             cash -= spend
         else:
             raise ValueError(f"未知成交方向: {receipt.side}")
+        if not math.isfinite(cash):
+            raise ValueError(f"成交回执导致账户现金无效: {receipt.code}")
     return AccountSnapshot(cash=cash, holdings=holdings)
 
 
 def _buy_skip_reason(quote: Optional[QuoteSnapshot], exec_date: str) -> str:
     if quote is None:
         return "no_quote"
-    if not quote.timestamp.startswith(exec_date):
+    if not _quote_is_current(quote.timestamp, exec_date):
         return "stale_quote"
     if quote.risk_blocked:
         return quote.risk_reason or "risk_blocked"
     if not quote.buyable:
         return quote.status or "not_buyable"
-    if quote.ask1 <= 0:
+    if not _positive_finite(quote.ask1):
         return "invalid_ask1"
-    if quote.high_limit > 0 and quote.ask1 >= quote.high_limit:
+    if not _positive_finite(quote.high_limit) or not _positive_finite(quote.low_limit):
+        return "invalid_limit_price"
+    if float(quote.ask1) < float(quote.low_limit) or float(quote.ask1) > float(quote.high_limit):
+        return "invalid_price_band"
+    if float(quote.ask1) >= float(quote.high_limit):
         return "blocked_limit"
     return ""
 
 
 def _affordable_lot_shares(budget: float, price: float, lot: int, open_cost: float, min_cost: float) -> int:
+    budget = _finite_float(budget, "单票预算")
+    price = _finite_float(price, "委托保护价")
+    open_cost = _finite_float(open_cost, "买入费率")
+    min_cost = _finite_float(min_cost, "最低费用")
+    if budget < 0 or price <= 0 or lot <= 0 or open_cost < 0 or min_cost < 0:
+        raise ValueError("买入预算、价格、整手或费用参数无效")
     shares = int(budget // (price * lot)) * lot
     while shares >= lot:
         value = shares * price
@@ -267,35 +336,43 @@ def plan_buys(package: SignalPackage, account_after_sells: AccountSnapshot, mark
     if slots == 0:
         return PlanResult(orders=(), skips=())
 
-    selected = []
-    skips = []
+    candidate_states = []
     for candidate in package.candidates:
-        if len(selected) >= slots:
-            break
         if candidate.code in holdings:
-            skips.append(PlanSkip(candidate.code, "buy", "already_held"))
-            continue
-        skip_reason = _buy_skip_reason(market.quotes.get(candidate.code), package.exec_date)
+            candidate_states.append((candidate, "already_held"))
+        else:
+            candidate_states.append(
+                (candidate, _buy_skip_reason(market.quotes.get(candidate.code), package.exec_date))
+            )
+
+    eligible_count = sum(not skip_reason for _, skip_reason in candidate_states)
+    target_count = min(slots, eligible_count)
+    if target_count == 0:
+        skips = tuple(
+            PlanSkip(candidate.code, "buy", skip_reason)
+            for candidate, skip_reason in candidate_states
+            if skip_reason
+        )
+        return PlanResult(orders=(), skips=skips)
+
+    cash = _finite_float(account_after_sells.cash, "卖后现金")
+    risk_degree = _finite_float(package.params.get("risk_degree", 0.95), "风险资金比例")
+    if cash < 0 or not 0 < risk_degree <= 1:
+        raise ValueError("卖后现金或风险资金比例无效")
+    budget = cash * risk_degree / target_count
+    lot = int(package.params.get("lot", 100))
+    open_cost = _finite_float(package.params.get("open_cost", 0.0), "买入费率")
+    min_cost = _finite_float(package.params.get("min_cost", 0.0), "最低费用")
+    max_slippage = _finite_float(package.params.get("max_slippage", 0.003), "最大偏离比例")
+    orders = []
+    skips = []
+    for candidate, skip_reason in candidate_states:
+        if len(orders) >= target_count:
+            break
         if skip_reason:
             skips.append(PlanSkip(candidate.code, "buy", skip_reason))
             continue
-        selected.append(candidate)
-
-    if not selected:
-        return PlanResult(orders=(), skips=tuple(skips))
-
-    budget = float(account_after_sells.cash) * float(package.params.get("risk_degree", 0.95)) / len(selected)
-    lot = int(package.params.get("lot", 100))
-    open_cost = float(package.params.get("open_cost", 0.0))
-    min_cost = float(package.params.get("min_cost", 0.0))
-    max_slippage = float(package.params.get("max_slippage", 0.003))
-    orders = []
-    for candidate in selected:
         quote = market.quotes[candidate.code]
-        shares = _affordable_lot_shares(budget, quote.ask1, lot, open_cost, min_cost)
-        if shares < lot:
-            skips.append(PlanSkip(candidate.code, "buy", "insufficient_for_one_lot"))
-            continue
         floor, ceiling = price_band(
             quote.ask1,
             "buy",
@@ -303,6 +380,10 @@ def plan_buys(package: SignalPackage, account_after_sells: AccountSnapshot, mark
             quote.low_limit,
             max_slippage,
         )
+        shares = _affordable_lot_shares(budget, ceiling, lot, open_cost, min_cost)
+        if shares < lot:
+            skips.append(PlanSkip(candidate.code, "buy", "insufficient_for_one_lot"))
+            continue
         orders.append(
             PlannedOrder(
                 code=candidate.code,

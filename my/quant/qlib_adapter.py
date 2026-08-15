@@ -126,7 +126,50 @@ class SharedPlannerStrategy(BaseSignalStrategy):
 
     def _market(self, codes, exec_date: str, trade_start, trade_end) -> MarketSnapshot:
         quotes = {}
+        cached_bars = self.factor_cache.day_bars(exec_date) if self.factor_cache is not None else None
         for code in sorted(set(codes)):
+            if cached_bars is not None:
+                if code not in cached_bars.index:
+                    continue
+                row = cached_bars.loc[code]
+                open_adj = row["open"]
+                prev_close = row["prev_close"]
+                volume = row["volume"]
+                factor = row["factor"]
+                tradable = (
+                    pd.notna(open_adj)
+                    and pd.notna(volume)
+                    and float(volume) > 0
+                    and pd.notna(factor)
+                    and float(factor) > 0
+                )
+                raw_open = float(open_adj) / float(factor) if tradable else 0.0
+                raw_previous = (
+                    float(prev_close) / float(factor)
+                    if tradable and pd.notna(prev_close) and float(prev_close) > 0
+                    else raw_open
+                )
+                change = raw_open / raw_previous - 1 if tradable and raw_previous > 0 else 0.0
+                status = (
+                    "suspended"
+                    if not tradable
+                    else "blocked_limit"
+                    if change > C.LIMIT_TH or change < -C.LIMIT_TH
+                    else "normal"
+                )
+                quotes[code] = QuoteSnapshot(
+                    code=code,
+                    timestamp=f"{exec_date}T09:30:00",
+                    bid1=raw_open,
+                    ask1=raw_open,
+                    last=raw_open,
+                    high_limit=raw_previous * 1.1,
+                    low_limit=raw_previous * 0.9,
+                    buyable=tradable and change <= C.LIMIT_TH,
+                    sellable=tradable and change >= -C.LIMIT_TH,
+                    status=status,
+                )
+                continue
             factor = self._factor(code, trade_start, trade_end)
             buy_price = self.trade_exchange.get_deal_price(
                 code, trade_start, trade_end, direction=OrderDir.BUY

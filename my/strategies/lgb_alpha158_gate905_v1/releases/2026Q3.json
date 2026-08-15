@@ -499,14 +499,14 @@
     "train": 3690030,
     "validation": 574980
   },
-  "runtime_code_sha256": "9fddd60190e429758a917b1c534eacf2c22b126f6dc62f03cc76ea5157396d63",
+  "runtime_code_sha256": "7844fde079f70e8e2f6769b53468f510f8478fbe2bb8d17eb272cb537e1e2fd6",
   "schema_version": 1,
   "source_git_commit": "d67205ea0ec812c046214742d40bb4832c86a0d7",
   "status": "published",
   "strategy_id": "lgb_alpha158_gate905_v1",
   "validation": {
     "approved": true,
-    "approved_at": "2026-08-14T19:57:53+08:00",
+    "approved_at": "2026-08-15T13:15:17+08:00",
     "archive_score_sha256": "b9a0d99b2dfbb5e1ee3db8ba5f91f99897a06ecf927cc06eaa0adf986203145f",
     "extra_in_rebuilt": 26,
     "max_abs_diff": 0.0,
@@ -519,8 +519,21 @@
       "rows": 104113,
       "start": "2026-07-01"
     },
+    "planner_parity": {
+      "cost_mode": "strict_zero_impact_control",
+      "days": 379,
+      "end": "2026-07-28",
+      "first_holding_mismatch_date": null,
+      "first_order_mismatch_date": null,
+      "holding_match_rate": 1.0,
+      "max_abs_cash_delta": 0.0676419073570286,
+      "order_match_rate": 1.0,
+      "planner_mismatch_count": 0,
+      "skip_mismatch_count": 0,
+      "start": "2025-01-02"
+    },
     "report_path": "releases/2026Q3-validation.md",
-    "report_sha256": "010598bbfb13a76f4225c5534482f28c5f0393883462911b40becb7feeaddb76",
+    "report_sha256": "28e346991a52ca427c3be0c94f42fb5c70d36567f28f44db0b5fe1a7aad1a9e4",
     "top_n": 100
   }
 }

@@ -93,6 +93,19 @@ class FakeExchange:
         return value, 5.0, adjusted_price
 
 
+class FakeFactorCache:
+    def __init__(self, bars):
+        self.bars = bars
+
+    def day_bars(self, date):
+        assert date == "2026-08-05"
+        return self.bars
+
+    def raw_closes_on(self, date):
+        assert date == "2026-08-04"
+        return pd.Series({code: 10.0 for code in self.bars.index})
+
+
 def _strategy(position, exchange, scores, gate_on=True, topk=1, n_drop=1, factor_cache=None):
     signal_index = pd.MultiIndex.from_product(
         [[pd.Timestamp("2026-08-04")], scores.index],
@@ -145,6 +158,37 @@ def test_shared_strategy_uses_t_minus_one_package_and_sell_cash_before_buying():
         "SH600001",
     ]
     assert strategy.recorded_orders[pd.Timestamp("2026-08-05")][1].code == "SZ000001"
+
+
+def test_cached_parity_market_uses_same_raw_limit_bands_as_shadow():
+    bars = pd.DataFrame(
+        {
+            "open": [9.05],
+            "close": [9.10],
+            "volume": [1000.0],
+            "factor": [1.0],
+            "prev_close": [10.0],
+        },
+        index=["SH600001"],
+    )
+    strategy = _strategy(
+        FakePosition(cash=0.0, amounts={"SH600001": 100}),
+        FakeExchange({"SH600001": 20.0}),
+        pd.Series({"SH600001": 1.0}),
+        factor_cache=FakeFactorCache(bars),
+    )
+
+    market = strategy._market(
+        ["SH600001"],
+        "2026-08-05",
+        pd.Timestamp("2026-08-05"),
+        pd.Timestamp("2026-08-05 23:59:59"),
+    )
+
+    quote = market.quotes["SH600001"]
+    assert quote.bid1 == 9.05
+    assert quote.low_limit == 9.0
+    assert quote.high_limit == 11.0
 
 
 def test_shared_strategy_converts_raw_plans_back_to_adjusted_qlib_amounts():

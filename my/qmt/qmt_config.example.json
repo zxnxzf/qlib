@@ -1,0 +1,10 @@
+{
+  "repo_root": "D:\\code\\qlib",
+  "account_alias": "qmt_sim",
+  "account_id": "REPLACE_WITH_LOCAL_SIMULATION_ACCOUNT",
+  "account_type": "STOCK",
+  "strategy_name": "",
+  "mode": "read_only",
+  "bridge_module": "my.qmt.guojin_bridge",
+  "bridge_class": "GuojinQmtBridge"
+}
