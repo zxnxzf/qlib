@@ -2,7 +2,7 @@
 <!--
 更新: 2026-08-29
 核对基线:
-- qlib | branch codex/shadow-backtest-parity | 本次归档前HEAD eb845050；工作区存在用户未提交的AGENTS.md修改，本次不纳入提交
+- qlib | branch codex/shadow-backtest-parity | 本次PKL归档前HEAD 755a6ce5，已与origin同步；工作区存在用户未提交的AGENTS.md修改，本次不纳入提交
 代码与 Git 用于判断实现现状；用户最后确认的需求用于判断目标。
 -->
 
@@ -45,7 +45,7 @@
 - “可以开始实行了吗？代码写完之后我弄到Windows上去试试”（2026-08-14：开始实现标准QMT接入；Mac侧先完成可自动测试的协议、生产信号、QMT脚本、绩效与对账代码，用户随后复制/拉取到Windows国金QMT模拟环境做真实接口验证）
 
 ## 现在做到哪
-用户已确认“被认可的结果需要提交”。Gate905 10万元部署参考回测HTML已从被Git忽略的 `my/artifacts/faux_recorders/gate905_100k/` 归档到策略发布目录 `my/strategies/lgb_alpha158_gate905_v1/releases/`；归档前后SHA-256均为 `e7e1aff85fd505a0263bd13e39ea0f1a8674d284171a9dbb0bbfbe21e6bcaafb`，与2026Q3验证报告记录一致。未验收的实验产物继续留在 `my/artifacts/`。
+用户已确认“被认可的结果需要提交”。Gate905 10万元部署参考回测HTML和67 KB的机器可读report PKL已从被Git忽略的 `my/artifacts/` 归档到策略发布目录 `my/strategies/lgb_alpha158_gate905_v1/releases/`；两者SHA-256分别为 `e7e1aff85fd505a0263bd13e39ea0f1a8674d284171a9dbb0bbfbe21e6bcaafb` 和 `b38d3057e5ec54dc7d08f534c3228618aeb5fe24679c14329bba7f3024d14158`，与2026Q3验证报告记录一致。该回测使用 `candidate1_pred.pkl` 的季度滚动Alpha158选股评分，再应用SH000905门控、TopK50/Drop2、开盘执行和10万资金；正式策略包已固化同一套Workflow/Rolling/Strategy参数。未验收的实验产物继续留在 `my/artifacts/`。
 
 仓库根目录为 `/Users/bytedance/code/qlib`，当前分支 `codex/shadow-backtest-parity`；本轮标准QMT第一版提交的父提交为`129a792f`。局部 Python 环境仍使用仓库根目录`.venv`；影子入口、数据更新脚本和运行路径已改为从仓库位置动态计算，可在Windows克隆目录运行。运行数据仍放`my/data`、`my/quant_state`和`my/runtime`并忽略；正式策略配置和模型放在受Git管理的`my/strategies/`。
 
